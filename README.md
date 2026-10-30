@@ -1,14 +1,8 @@
-# Birder
+# AMAZED BY WILDLIFE
 
 This repository contains a 0.9.0 extension of [upstream Birder](https://gitlab.com/birder/birder), with the original authorship and licenses retained. It adds the wildlife pipeline, Unicode path fixes, and the accompanying research and validation reports.
 
 For this repository's 0.9.0 features, install from the downloaded or cloned source folder:
-
-```sh
-python -m pip install -e .
-# Include the optional Ultralytics detector backend:
-python -m pip install -e '.[yolo]'
-```
 
 See the [wildlife pipeline guide](docs/wildlife_pipeline.md) for usage. The upstream PyPI installation instructions below refer to the separately published `birder` package.
 

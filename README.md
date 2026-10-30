@@ -1,0 +1,219 @@
+# Birder
+
+This repository contains a 0.9.0 extension of [upstream Birder](https://gitlab.com/birder/birder), with the original authorship and licenses retained. It adds the wildlife pipeline, Unicode path fixes, and the accompanying research and validation reports.
+
+For this repository's 0.9.0 features, install from the downloaded or cloned source folder:
+
+```sh
+python -m pip install -e .
+# Include the optional Ultralytics detector backend:
+python -m pip install -e '.[yolo]'
+```
+
+See the [wildlife pipeline guide](docs/wildlife_pipeline.md) for usage. The upstream PyPI installation instructions below refer to the separately published `birder` package.
+
+An open-source computer vision framework for wildlife image analysis, featuring state-of-the-art models for species classification and detection.
+
+- [Introduction](#introduction)
+- [Setup](#setup)
+- [Getting Started](#getting-started)
+- [Pretrained Models](#pretrained-models)
+- [Detection](#detection)
+- [Evaluation](#evaluation)
+- [Project Status and Contributions](#project-status-and-contributions)
+- [Licenses](#licenses)
+- [Acknowledgments](#acknowledgments)
+
+## Introduction
+
+Birder is an open-source computer vision framework designed for wildlife imagery analysis, offering robust classification and detection capabilities for various species. While initially developed with a focus on avian species, the framework's architecture and methodologies are applicable to a wide range of wildlife computer vision tasks. This project leverages deep neural networks to provide models that can handle real-world data challenges in natural environments.
+
+For comprehensive documentation and tutorials, see [docs/README.md](docs/README.md).
+
+The project features:
+
+- A diverse collection of classification and detection models
+- Support for self-supervised pretraining
+- Knowledge distillation training (teacher-student)
+- Custom utilities and data augmentation techniques
+- Comprehensive training scripts
+- Advanced error analysis tools
+- Documentation and tutorials
+
+Unlike projects that aim to reproduce ImageNet training results from common papers, Birder is tailored specifically for practical applications in wildlife monitoring, conservation efforts, ecological research and nature photography.
+
+As Ross Wightman eloquently stated in the [timm README](https://github.com/huggingface/pytorch-image-models#introduction):
+
+> The work of many others is present here. I've tried to make sure all source material is acknowledged via links to github, arXiv papers, etc. in the README, documentation, and code docstrings. Please let me know if I missed anything.
+
+The same principle applies to Birder. We stand on the shoulders of giants in the fields of computer vision, machine learning and ecology. We've made every effort to acknowledge and credit the work that has influenced and contributed to this project. If you believe we've missed any attributions, please let us know by opening an issue.
+
+## Setup
+
+1. Ensure your environment meets the minimum requirements:
+   - Python 3.11 or newer
+   - PyTorch 2.10 or newer (installed for your hardware/driver stack)
+
+1. Install the latest Birder version:
+
+```sh
+pip install birder
+```
+
+For detailed installation options, including source installation, refer to our [Setup Guide](docs/getting_started.md#setup).
+
+## Getting Started
+
+![Example](docs/img/example.jpeg)
+
+Check out the Birder Colab notebook for an interactive tutorial.
+
+[![Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/birder-project/birder/blob/main/notebooks/getting_started.ipynb)
+[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Project-blue)](https://huggingface.co/birder-project)
+
+Once Birder is installed, you can start exploring its capabilities.
+
+Birder provides pretrained models that you can download using the `download-model` tool.
+To download a model, use the following command:
+
+```sh
+python -m birder.tools download-model mvit_v2_t_il-all
+```
+
+Create a data directory and download an example image:
+
+```sh
+mkdir data
+wget https://huggingface.co/spaces/birder-project/birder-image-classification/resolve/main/Eurasian%20teal.jpeg -O data/img_001.jpeg
+```
+
+For a quick first run after installing from PyPI, use the `birder-predict` convenience command:
+
+```sh
+birder-predict -n mvit_v2_t -t il-all --show data/img_001.jpeg
+```
+
+For more options and detailed usage of the prediction tool, run the canonical module command:
+
+```sh
+python -m birder.scripts.predict --help
+```
+
+For more detailed usage instructions and examples, see [docs/README.md](docs/README.md).
+
+### Detect and classify individual animals (0.9.0)
+
+Use the new [wildlife pipeline](docs/wildlife_pipeline.md) to detect animals,
+classify their padded crops, and export uncertain identifications for review.
+It supports native Birder detectors and optional Ultralytics YOLO models,
+overlapping detection tiles, and UTF-8 JSON Lines output. Non-English filenames
+and folders are preserved without renaming.
+
+The [algorithm research report](docs/research/birder-0.9.0.md) compares YOLOv5u,
+YOLO26, existing transformer detectors, and biological feature encoders, and
+defines the field evaluation needed to establish accuracy improvements.
+
+## Pretrained Models
+
+Birder provides a comprehensive suite of pretrained models for wildlife species classification, with current models specialized for avian species recognition.
+
+To explore the full range of available pretrained models, use the `list-models` tool:
+
+```sh
+python -m birder.tools list-models --pretrained
+```
+
+This command displays a catalog of models ready for download.
+
+### Model Nomenclature
+
+The naming convention for Birder models encapsulates key information about their architecture and training approach.
+
+Architecture: The first part of the model name indicates the core neural network structure (e.g., MobileNet, ResNet).
+
+Training indicators:
+
+- intermediate: Signifies models that underwent a two-stage training process, beginning with a large-scale weakly labeled dataset before fine-tuning on the primary dataset
+- mim: Indicates models that leveraged self-supervised pretraining techniques, primarily Masked Autoencoder (MAE), prior to supervised training
+
+Other tags:
+
+- quantized: Model that has been quantized to reduce the computational and memory costs of running inference
+- reparameterized: Model that has been restructured to simplify its architecture for optimized inference performance
+
+Epoch Number (optional): The last part of the model name may include an underscore followed by a number (e.g., `0`, `200`), which represents the epoch.
+
+For instance, *mnasnet_1_0_intermediate_300* represents a MnasNet model with an alpha value of 1.0 that underwent intermediate training and is from epoch 300.
+
+### Self-supervised Image Pretraining
+
+Our pretraining process utilizes a diverse collection of image datasets, combining general imagery with wildlife-specific content.
+This approach allows our models to learn rich, general-purpose visual representations before fine-tuning on specific classification tasks.
+
+The pretraining dataset is composed of a mix of general images and bird-specific imagery to improve downstream performance on the bird classification tasks.
+
+For detailed information about these datasets, including descriptions, citations and licensing details, please refer to [docs/public_datasets.md](docs/public_datasets.md).
+
+## Detection
+
+Detection training and inference are available, see [docs/training_scripts.md](docs/training_scripts.md) and
+[docs/inference.md](docs/inference.md#object-detection-inference). APIs and model coverage may evolve as detection support matures.
+
+## Evaluation
+
+Evaluation workflows are documented in [docs/evaluation.md](docs/evaluation.md).
+
+## Project Status and Contributions
+
+Birder is currently a personal project in active development. As the sole developer, I am focused on building and refining the core functionalities of the framework. At this time, I am not actively seeking external contributors.
+
+However, I greatly appreciate the interest and support from the community. If you have suggestions, find bugs, or want to provide feedback, please feel free to:
+
+- Open an issue in the project's issue tracker
+- Use the project and share your experiences
+- Star the repository if you find it useful
+
+While I may not be able to incorporate external contributions at this stage, your input is valuable and helps shape the direction of Birder. I'll update this section if the contribution policy changes in the future.
+
+Thank you for your understanding and interest in Birder!
+
+## Licenses
+
+### Code
+
+The code in this project is primarily licensed under Apache 2.0. See [LICENSE](LICENSE) for details.
+
+**Important:** Some model implementations are derivative works of code under less permissive licenses, such as CC-BY-NC (Creative Commons Attribution-NonCommercial) or similar restrictions. These components may prohibit commercial use or impose other conditions.
+
+Files subject to additional license restrictions are marked in their headers. Some code is also adapted from other projects with various licenses. References and license information are provided at the top of affected files or at specific classes/functions.
+
+**You are responsible for ensuring compliance with all licenses and conditions of any dependent licenses.**
+
+If you think we've missed a reference or a license, please create an issue.
+
+### Pretrained Weights
+
+Some of the pretrained weights available here are pretrained on ImageNet. ImageNet was released for non-commercial research purposes only (<https://image-net.org/download>). It's not clear what the implications are for the use of pretrained weights from that dataset. It's best to seek legal advice if you intend to use the pretrained weights in a commercial product.
+
+### Disclaimer
+
+If you intend to use Birder, its pretrained weights, or any associated datasets in a commercial product, we strongly recommend seeking legal advice to ensure compliance with all relevant licenses and terms of use.
+
+It's the user's responsibility to ensure that their use of this project, including any pretrained weights or datasets, complies with all applicable licenses and legal requirements.
+
+## Acknowledgments
+
+Birder owes much to the work of others in computer vision, machine learning and ornithology.
+
+Special thanks to:
+
+- **Ross Wightman**: His work on [PyTorch Image Models (timm)](https://github.com/huggingface/pytorch-image-models) greatly inspired the design and approach of Birder.
+
+- **Image Contributors**:
+    - Yaron Schmid - from [YS Wildlife](https://www.yswildlifephotography.com/who-we-are)
+
+  for their generous donations of bird photographs.
+
+This project also benefits from numerous open-source libraries and ornithological resources.
+
+If any attribution is missing, please open an issue to let us know.

@@ -1,0 +1,701 @@
+"""
+ViTDet backbone / ViT SAM, adapted from
+https://github.com/facebookresearch/segment-anything/blob/main/segment_anything/modeling/image_encoder.py
+
+Paper "Exploring Plain Vision Transformer Backbones for Object Detection",
+https://arxiv.org/abs/2203.16527
+
+and as used as an image encoder at the paper "Segment Anything", https://arxiv.org/abs/2304.02643
+"""
+
+# Reference license: Apache-2.0
+
+import logging
+from collections.abc import Callable
+from functools import partial
+from typing import Any
+from typing import Optional
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.utils.checkpoint import checkpoint_sequential
+from torchvision.ops import StochasticDepth
+
+from birder.layers import FFN
+from birder.layers import LayerNorm2d
+from birder.layers import LayerScale
+from birder.layers import SwiGLU_FFN
+from birder.model_registry import registry
+from birder.net._vit_configs import BASE
+from birder.net._vit_configs import HUGE
+from birder.net._vit_configs import LARGE
+from birder.net._vit_configs import MEDIUM
+from birder.net._vit_configs import SMALL
+from birder.net.base import DetectorBackbone
+from birder.net.base import normalize_out_indices
+from birder.net.base import stochastic_depth_rates
+from birder.net.vit import EncoderBlock as MAEDecoderBlock
+from birder.net.vit_windowed import window_partition
+from birder.net.vit_windowed import window_unpartition
+
+logger = logging.getLogger(__name__)
+
+
+def get_rel_pos(q_size: int, k_size: int, rel_pos: torch.Tensor) -> torch.Tensor:
+    max_rel_dist = int(2 * max(q_size, k_size) - 1)
+
+    # Interpolate rel pos if needed
+    if rel_pos.size(0) != max_rel_dist:
+        # Only reached in dynamic-size mode (rel-pos table resized on the fly)
+        rel_pos_resized = F.interpolate(
+            rel_pos.reshape(1, rel_pos.size(0), -1).permute(0, 2, 1), size=max_rel_dist, mode="linear"
+        )
+        rel_pos_resized = rel_pos_resized.reshape(-1, max_rel_dist).permute(1, 0)
+    else:
+        rel_pos_resized = rel_pos
+
+    # Scale the coords with short length if shapes for q and k are different
+    q_coords = torch.arange(q_size)[:, None] * max(k_size / q_size, 1.0)
+    k_coords = torch.arange(k_size)[None, :] * max(q_size / k_size, 1.0)
+    relative_coords = (q_coords - k_coords) + (k_size - 1) * max(q_size / k_size, 1.0)
+
+    return rel_pos_resized[relative_coords.long()]
+
+
+def get_decomposed_rel_pos_bias(
+    q: torch.Tensor, rel_pos_h: torch.Tensor, rel_pos_w: torch.Tensor, q_size: tuple[int, int], k_size: tuple[int, int]
+) -> torch.Tensor:
+    q_h, q_w = q_size
+    k_h, k_w = k_size
+    Rh = get_rel_pos(q_h, k_h, rel_pos_h)
+    Rw = get_rel_pos(q_w, k_w, rel_pos_w)
+
+    B, _, dim = q.shape
+    r_q = q.reshape(B, q_h, q_w, dim)
+    rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
+    rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
+
+    attn_bias = rel_h[:, :, :, :, None] + rel_w[:, :, :, None, :]
+    attn_bias = attn_bias.reshape(-1, q_h * q_w, k_h * k_w)
+
+    return attn_bias
+
+
+class PatchEmbed(nn.Module):
+    def __init__(self, in_channels: int, embed_dim: int, kernel_size: tuple[int, int], stride: tuple[int, int]) -> None:
+        super().__init__()
+        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=kernel_size, stride=stride, padding=(0, 0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.proj(x)
+
+        # B C H W -> B H W C
+        return x.permute(0, 2, 3, 1)
+
+
+class Attention(nn.Module):
+    def __init__(
+        self, dim: int, num_heads: int, qkv_bias: bool, use_rel_pos: bool, input_size: Optional[tuple[int, int]] = None
+    ) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim**-0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.proj = nn.Linear(dim, dim)
+
+        self.use_rel_pos = use_rel_pos
+        if self.use_rel_pos is True:
+            assert input_size is not None, "Input size must be provided if using relative positional encoding."
+            self.rel_pos_h = nn.Parameter(torch.zeros(2 * input_size[0] - 1, head_dim))
+            self.rel_pos_w = nn.Parameter(torch.zeros(2 * input_size[1] - 1, head_dim))
+
+    def forward(self, x: torch.Tensor, is_causal: bool = False) -> torch.Tensor:
+        B, H, W, _ = x.shape
+        qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
+
+        if self.use_rel_pos is True:
+            attn_bias = get_decomposed_rel_pos_bias(q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
+        else:
+            attn_bias = None
+
+        if is_causal is True:
+            seq_len = H * W
+            causal_bias = torch.full((seq_len, seq_len), float("-inf"), dtype=q.dtype, device=q.device).triu_(
+                diagonal=1
+            )
+            if attn_bias is not None:
+                attn_bias = attn_bias + causal_bias
+            else:
+                attn_bias = causal_bias
+
+        x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias, scale=self.scale)
+
+        x = x.view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
+        x = self.proj(x)
+
+        return x
+
+
+class EncoderBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_dim: int,
+        qkv_bias: bool,
+        drop_path: float,
+        use_rel_pos: bool,
+        window_size: tuple[int, int],
+        input_size: Optional[tuple[int, int]] = None,
+        activation_layer: Callable[..., nn.Module] = nn.GELU,
+        layer_scale_init_value: Optional[float] = None,
+        norm_layer: Callable[..., nn.Module] = nn.LayerNorm,
+        norm_layer_eps: float = 1e-6,
+        mlp_layer: Callable[..., nn.Module] = FFN,
+    ) -> None:
+        super().__init__()
+        self.window_size = window_size
+
+        # Attention block
+        self.norm1 = norm_layer(dim, eps=norm_layer_eps)
+        self.attn = Attention(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            use_rel_pos=use_rel_pos,
+            input_size=input_size if window_size == (0, 0) else window_size,
+        )
+
+        self.drop_path1 = StochasticDepth(drop_path, mode="row")
+        if layer_scale_init_value is not None:
+            self.layer_scale_1 = LayerScale(dim, layer_scale_init_value)
+        else:
+            self.layer_scale_1 = nn.Identity()
+
+        # MLP block
+        self.norm2 = norm_layer(dim, eps=norm_layer_eps)
+        self.mlp = mlp_layer(dim, mlp_dim, act_layer=activation_layer, dropout=0.0)
+        self.drop_path2 = StochasticDepth(drop_path, mode="row")
+        if layer_scale_init_value is not None:
+            self.layer_scale_2 = LayerScale(dim, layer_scale_init_value)
+        else:
+            self.layer_scale_2 = nn.Identity()
+
+    def forward(self, x: torch.Tensor, is_causal: bool = False) -> torch.Tensor:
+        _, H, W, _ = x.shape
+        shortcut = x
+
+        x = self.norm1(x)
+        pad_hw = (0, 0)
+        if self.window_size[0] > 0 or self.window_size[1] > 0:
+            x, pad_hw = window_partition(x, self.window_size)
+
+        x = self.attn(x, is_causal=is_causal)
+        if self.window_size[0] > 0 or self.window_size[1] > 0:
+            x = window_unpartition(x, self.window_size, pad_hw, (H, W))
+
+        x = self.layer_scale_1(x)
+        x = self.drop_path1(x) + shortcut
+        x = x + self.drop_path2(self.layer_scale_2(self.mlp(self.norm2(x))))
+
+        return x
+
+
+class ViT_SAM(DetectorBackbone):
+    block_group_regex = r"body\.(\d+)"
+
+    def __init__(
+        self,
+        input_channels: int,
+        num_classes: int,
+        *,
+        config: Optional[dict[str, Any]] = None,
+        size: Optional[tuple[int, int]] = None,
+    ) -> None:
+        super().__init__(input_channels, num_classes, config=config, size=size)
+        assert self.config is not None, "must set config"
+
+        image_size = self.size
+        use_rel_pos = True
+        pos_embed_antialias: bool = self.config.get("pos_embed_antialias", False)  # Controls forward pass only
+        patch_size: int = self.config["patch_size"]
+        num_layers: int = self.config["num_layers"]
+        num_heads: int = self.config["num_heads"]
+        hidden_dim: int = self.config["hidden_dim"]
+        mlp_dim: int = self.config["mlp_dim"]
+        layer_scale_init_value: Optional[float] = self.config.get("layer_scale_init_value", None)
+        post_norm: bool = self.config.get("post_norm", False)
+        norm_layer_type: str = self.config.get("norm_layer_type", "LayerNorm")
+        norm_layer_eps: float = self.config.get("norm_layer_eps", 1e-6)
+        mlp_layer_type: str = self.config.get("mlp_layer_type", "FFN")
+        window_size: tuple[int, int] = self.config["window_size"]
+        global_attn_indexes: list[int] = self.config["global_attn_indexes"]
+        neck_channels: Optional[int] = self.config.get("neck_channels", None)
+        out_indices: Optional[list[int]] = self.config.get("out_indices", None)
+        drop_path_rate: float = self.config["drop_path_rate"]
+        drop_path_uniform: bool = self.config.get("drop_path_uniform", False)
+
+        if norm_layer_type == "LayerNorm":
+            norm_layer = nn.LayerNorm
+        elif norm_layer_type == "RMSNorm":
+            norm_layer = nn.RMSNorm
+        else:
+            raise ValueError(f"Unknown norm_layer_type '{norm_layer_type}'")
+
+        if mlp_layer_type == "FFN":
+            mlp_layer = FFN
+            act_layer = nn.GELU
+        elif mlp_layer_type == "SwiGLU_FFN":
+            mlp_layer = SwiGLU_FFN
+            act_layer = nn.SiLU
+        else:
+            raise ValueError(f"Unknown mlp_layer_type '{mlp_layer_type}'")
+
+        torch._assert(image_size[0] % patch_size == 0, "Input shape indivisible by patch size!")
+        torch._assert(image_size[1] % patch_size == 0, "Input shape indivisible by patch size!")
+        torch._assert(hidden_dim % num_heads == 0, "Hidden dim indivisible by num heads!")
+        self.pos_embed_antialias = pos_embed_antialias
+        self.patch_size = patch_size
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self.global_attn_indexes = global_attn_indexes
+        self.num_special_tokens = 0
+        self.out_indices = normalize_out_indices(out_indices, num_layers)
+        self.is_causal = False
+        self.grad_checkpointing = False
+        self.grad_checkpointing_segments: Optional[int] = None
+        self.grad_checkpointing_preserve_rng_state = True
+        self.grad_checkpointing_use_reentrant = False
+        dpr = stochastic_depth_rates(drop_path_rate, num_layers, constant=drop_path_uniform)
+
+        self.patch_embed = PatchEmbed(
+            in_channels=self.input_channels,
+            embed_dim=hidden_dim,
+            kernel_size=(patch_size, patch_size),
+            stride=(patch_size, patch_size),
+        )
+
+        # Absolute position embedding
+        self.pos_embedding = nn.Parameter(
+            torch.zeros(1, image_size[0] // patch_size, image_size[1] // patch_size, hidden_dim)
+        )
+
+        layers = []
+        for i in range(num_layers):
+            layers.append(
+                EncoderBlock(
+                    dim=hidden_dim,
+                    num_heads=num_heads,
+                    mlp_dim=mlp_dim,
+                    qkv_bias=True,
+                    drop_path=dpr[i],
+                    use_rel_pos=use_rel_pos,
+                    window_size=window_size if i not in global_attn_indexes else (0, 0),
+                    input_size=(image_size[0] // patch_size, image_size[1] // patch_size),
+                    activation_layer=act_layer,
+                    layer_scale_init_value=layer_scale_init_value,
+                    norm_layer=norm_layer,
+                    norm_layer_eps=norm_layer_eps,
+                    mlp_layer=mlp_layer,
+                )
+            )
+
+        self.body = nn.Sequential(*layers)
+        if neck_channels is not None:
+            self.neck = nn.Sequential(
+                nn.Conv2d(
+                    hidden_dim,
+                    neck_channels,
+                    kernel_size=(1, 1),
+                    stride=(1, 1),
+                    padding=(0, 0),
+                    bias=False,
+                ),
+                LayerNorm2d(neck_channels, eps=norm_layer_eps),
+                nn.Conv2d(
+                    neck_channels,
+                    neck_channels,
+                    kernel_size=(3, 3),
+                    stride=(1, 1),
+                    padding=(1, 1),
+                    bias=False,
+                ),
+                LayerNorm2d(neck_channels, eps=norm_layer_eps),
+            )
+        else:
+            neck_channels = hidden_dim
+            if post_norm is True:
+                self.neck = LayerNorm2d(neck_channels, eps=norm_layer_eps)
+            else:
+                self.neck = nn.Identity()
+
+        self.features = nn.Sequential(
+            nn.AdaptiveAvgPool2d(output_size=(1, 1)),
+            nn.Flatten(1),
+        )
+
+        num_return_stages = len(self.out_indices) if self.out_indices is not None else 1
+        self.return_stages = [f"stage{stage_idx + 1}" for stage_idx in range(num_return_stages)]
+        self.return_channels = [hidden_dim] * num_return_stages
+        self.return_channels[-1] = neck_channels
+        self.embedding_size = neck_channels
+        self.classifier = self.create_classifier()
+
+        self.max_stride = patch_size
+        self.stem_stride = patch_size
+        self.stem_width = hidden_dim
+        self.feature_dim = neck_channels
+
+        self.decoder_block = partial(
+            MAEDecoderBlock,
+            16,
+            mlp_dim=None,
+            dropout=0,
+            attention_dropout=0,
+            drop_path=0,
+            activation_layer=nn.GELU,
+        )
+
+    def _get_pos_embed(self, H: int, W: int) -> torch.Tensor:
+        if self.dynamic_size is False:
+            return self.pos_embedding
+
+        if H == self.size[0] and W == self.size[1]:
+            return self.pos_embedding
+
+        base_h = H // self.patch_size
+        base_w = W // self.patch_size
+        orig_dtype = self.pos_embedding.dtype
+        pos_embedding = self.pos_embedding.float()
+        pos_embedding = pos_embedding.permute(0, 3, 1, 2)
+        pos_embedding = F.interpolate(
+            pos_embedding, size=(base_h, base_w), mode="bicubic", antialias=self.pos_embed_antialias
+        )
+        pos_embedding = pos_embedding.permute(0, 2, 3, 1)
+
+        return pos_embedding.to(orig_dtype)
+
+    def freeze(self, freeze_classifier: bool = True, unfreeze_features: bool = False) -> None:
+        for param in self.parameters():
+            param.requires_grad_(False)
+
+        if freeze_classifier is False:
+            for param in self.classifier.parameters():
+                param.requires_grad_(True)
+
+        if unfreeze_features is True:
+            for param in self.neck.parameters():
+                param.requires_grad_(True)
+            for param in self.features.parameters():
+                param.requires_grad_(True)
+
+    def set_grad_checkpointing(
+        self,
+        enable: bool = True,
+        *,
+        segments: Optional[int] = None,
+        preserve_rng_state: bool = True,
+        use_reentrant: bool = False,
+    ) -> None:
+        if enable is True:
+            logger.debug(
+                f"Enabling gradient checkpointing: segments={segments}, "
+                f"preserve_rng_state={preserve_rng_state}, use_reentrant={use_reentrant}"
+            )
+        else:
+            logger.debug("Disabling gradient checkpointing")
+
+        self.grad_checkpointing = enable
+        self.grad_checkpointing_segments = segments
+        self.grad_checkpointing_preserve_rng_state = preserve_rng_state
+        self.grad_checkpointing_use_reentrant = use_reentrant
+
+    def set_causal_attention(self, is_causal: bool = True) -> None:
+        self.is_causal = is_causal
+
+    def detection_features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        H, W = x.shape[-2:]
+        x = self.patch_embed(x)
+        x = x + self._get_pos_embed(H, W)
+
+        if self.out_indices is None:
+            if self.is_causal is False:
+                x = self.body(x)
+            else:
+                for blk in self.body:
+                    x = blk(x, is_causal=True)
+
+            x = self.neck(x.permute(0, 3, 1, 2))
+            return {self.return_stages[0]: x}
+
+        out_indices_set = set(self.out_indices)
+        last_out_idx = max(out_indices_set)
+        out: dict[str, torch.Tensor] = {}
+        stage_idx = 0
+        for idx, blk in enumerate(self.body):
+            x = blk(x, is_causal=self.is_causal)
+            if idx not in out_indices_set:
+                continue
+
+            stage_x = x.permute(0, 3, 1, 2)
+            if idx == last_out_idx:
+                stage_x = self.neck(stage_x)
+
+            out[self.return_stages[stage_idx]] = stage_x
+            stage_idx += 1
+
+        return out
+
+    def freeze_stages(self, up_to_stage: int) -> None:
+        for param in self.patch_embed.parameters():
+            param.requires_grad_(False)
+
+        self.pos_embedding.requires_grad_(False)
+
+        if up_to_stage <= 0:
+            return
+
+        if self.out_indices is None:
+            stage_boundaries = [self.num_layers - 1]
+        else:
+            stage_boundaries = sorted(set(self.out_indices))
+
+        last_block = stage_boundaries[min(up_to_stage, len(stage_boundaries)) - 1]
+        for block in self.body[: last_block + 1]:
+            for param in block.parameters():
+                param.requires_grad_(False)
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        H, W = x.shape[-2:]
+        x = self.patch_embed(x)
+        x = x + self._get_pos_embed(H, W)
+
+        if self.grad_checkpointing is True and torch.is_grad_enabled() is True and not torch.jit.is_scripting():
+            if self.grad_checkpointing_segments is None:
+                segments = len(self.body)
+            else:
+                segments = min(self.grad_checkpointing_segments, len(self.body))
+
+            if self.is_causal is True:
+                blocks = tuple(partial(block, is_causal=True) for block in self.body)
+            else:
+                blocks = self.body
+
+            x = checkpoint_sequential(
+                blocks,
+                segments,
+                x,
+                use_reentrant=self.grad_checkpointing_use_reentrant,
+                preserve_rng_state=self.grad_checkpointing_preserve_rng_state,
+            )
+        elif self.is_causal is False:
+            x = self.body(x)
+        else:
+            for blk in self.body:
+                x = blk(x, is_causal=True)
+
+        x = self.neck(x.permute(0, 3, 1, 2))
+
+        return x
+
+    def embedding_from_features(self, features: torch.Tensor) -> torch.Tensor:
+        return self.features(features)
+
+    def adjust_size(self, new_size: tuple[int, int]) -> None:
+        if new_size == self.size:
+            return
+
+        assert new_size[0] % self.patch_size == 0, "Input shape indivisible by patch size!"
+        assert new_size[1] % self.patch_size == 0, "Input shape indivisible by patch size!"
+
+        super().adjust_size(new_size)
+
+        new_base_size_h = new_size[0] // self.patch_size
+        new_base_size_w = new_size[1] // self.patch_size
+        with torch.no_grad():
+            for idx, m in enumerate(self.body):
+                if idx not in self.global_attn_indexes:
+                    continue
+
+                if m.attn.use_rel_pos is True:
+                    rel_pos_h = m.attn.rel_pos_h
+                    rel_pos_w = m.attn.rel_pos_w
+
+                    orig_dtype = rel_pos_h.dtype
+                    rel_pos_h = rel_pos_h.float()
+                    rel_pos_w = rel_pos_w.float()
+
+                    rel_pos_h = rel_pos_h.permute(1, 0)
+                    rel_pos_w = rel_pos_w.permute(1, 0)
+                    rel_pos_h = rel_pos_h.unsqueeze(0)
+                    rel_pos_w = rel_pos_w.unsqueeze(0)
+
+                    rel_pos_h = F.interpolate(rel_pos_h, size=2 * new_base_size_h - 1, mode="linear")
+                    rel_pos_w = F.interpolate(rel_pos_w, size=2 * new_base_size_w - 1, mode="linear")
+                    rel_pos_h = rel_pos_h.squeeze(0)
+                    rel_pos_w = rel_pos_w.squeeze(0)
+                    rel_pos_h = rel_pos_h.permute(1, 0)
+                    rel_pos_w = rel_pos_w.permute(1, 0)
+                    rel_pos_h = rel_pos_h.to(orig_dtype)
+                    rel_pos_w = rel_pos_w.to(orig_dtype)
+
+                    m.attn.rel_pos_h = nn.Parameter(rel_pos_h, requires_grad=m.attn.rel_pos_h.requires_grad)
+                    m.attn.rel_pos_w = nn.Parameter(rel_pos_w, requires_grad=m.attn.rel_pos_w.requires_grad)
+
+            orig_dtype = self.pos_embedding.dtype
+            pos_embedding = self.pos_embedding.float()
+            pos_embedding = pos_embedding.permute(0, 3, 1, 2)
+            pos_embedding = F.interpolate(
+                pos_embedding, size=(new_base_size_h, new_base_size_w), mode="bicubic", antialias=True
+            )
+            pos_embedding = pos_embedding.permute(0, 2, 3, 1)
+            pos_embedding = pos_embedding.to(orig_dtype)
+
+        self.pos_embedding = nn.Parameter(pos_embedding, requires_grad=self.pos_embedding.requires_grad)
+
+    def load_vit_weights(self, state_dict: dict[str, Any]) -> None:
+        """
+        As suggested at "Exploring Plain Vision Transformer Backbones for Object Detection"
+        (https://arxiv.org/abs/2203.16527), weights can be transfer from vanilla ViT for faster start-up.
+        The relative position embedding and "neck" convolutions are left intact.
+        """
+
+        # Remove all special token
+        num_special_tokens = 0
+        if "class_token" in state_dict:
+            num_special_tokens += 1
+            del state_dict["class_token"]
+
+        if "reg_tokens" in state_dict:
+            num_special_tokens += state_dict["reg_tokens"].size(1)
+            del state_dict["reg_tokens"]
+
+        # Remove final norm
+        del state_dict["norm.weight"]
+        if "norm.bias" in state_dict:
+            del state_dict["norm.bias"]
+
+        # Remove classifier weights
+        if "classifier.weight" in state_dict:
+            del state_dict["classifier.weight"]
+            del state_dict["classifier.bias"]
+
+        seq_length = (self.size[0] // self.patch_size) * (self.size[1] // self.patch_size)
+
+        # Adjust pos_embedding
+        if state_dict["pos_embedding"].ndim == 2:
+            vit_pos_embed_special_tokens = state_dict["pos_embedding"].size(0) != seq_length
+            if vit_pos_embed_special_tokens is True:
+                state_dict["pos_embedding"] = state_dict["pos_embedding"][num_special_tokens:, :]
+        else:
+            vit_pos_embed_special_tokens = state_dict["pos_embedding"].size(1) != seq_length
+            if vit_pos_embed_special_tokens is True:
+                state_dict["pos_embedding"] = state_dict["pos_embedding"][:, num_special_tokens:, :]
+
+        state_dict["pos_embedding"] = state_dict["pos_embedding"].reshape(
+            1, self.size[0] // self.patch_size, self.size[1] // self.patch_size, -1
+        )
+
+        # Modify encoder weight names
+        modified_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("conv_proj.") is True:
+                k = k.replace("conv_proj.", "patch_embed.proj.")
+            elif k.startswith("encoder.block.") is True:
+                k = k.replace("encoder.block.", "body.")
+                k = k.replace("ln1", "norm1")
+                k = k.replace("ln2", "norm2")
+                if "self_attention.in_proj" in k:
+                    k = k.replace("self_attention.in_proj_", "attn.qkv.")
+                elif "self_attention.out_proj" in k:
+                    k = k.replace("self_attention.out_proj.", "attn.proj.")
+
+            modified_state_dict[k] = v
+
+        # Load the modified state dict
+        incompatible_keys = self.load_state_dict(modified_state_dict, strict=False)
+        assert len(incompatible_keys.unexpected_keys) == 0
+
+
+# ViTDet (no neck)
+registry.register_model_config(
+    "vit_det_s16",
+    ViT_SAM,
+    config={"patch_size": 16, **SMALL, "window_size": (14, 14), "global_attn_indexes": [2, 5, 8, 11]},
+)
+registry.register_model_config(
+    "vit_det_m16_rms",
+    ViT_SAM,
+    config={
+        "patch_size": 16,
+        **MEDIUM,
+        "norm_layer_type": "RMSNorm",
+        "window_size": (14, 14),
+        "global_attn_indexes": [2, 5, 8, 11],
+    },
+)
+registry.register_model_config(
+    "vit_det_b16",
+    ViT_SAM,
+    config={"patch_size": 16, **BASE, "window_size": (14, 14), "global_attn_indexes": [2, 5, 8, 11]},
+)
+
+# ViT SAM (with neck)
+registry.register_model_config(
+    "vit_sam_b16",
+    ViT_SAM,
+    config={
+        "patch_size": 16,
+        **BASE,
+        "window_size": (14, 14),
+        "global_attn_indexes": [2, 5, 8, 11],
+        "neck_channels": 256,
+    },
+)
+registry.register_model_config(
+    "vit_sam_l16",
+    ViT_SAM,
+    config={
+        "patch_size": 16,
+        **LARGE,
+        "window_size": (14, 14),
+        "global_attn_indexes": [5, 11, 17, 23],
+        "neck_channels": 256,
+        "drop_path_rate": 0.4,
+    },
+)
+registry.register_model_config(
+    "vit_sam_h16",
+    ViT_SAM,
+    config={
+        "patch_size": 16,
+        **HUGE,
+        "window_size": (14, 14),
+        "global_attn_indexes": [7, 15, 23, 31],
+        "neck_channels": 256,
+        "drop_path_rate": 0.5,
+    },
+)
+
+registry.register_weights(  # Segment Anything: https://arxiv.org/abs/2304.02643
+    "vit_sam_b16_sam-sa1b",
+    {
+        "url": "https://huggingface.co/birder-project/vit_sam_b16_sam-sa1b/resolve/main",
+        "description": (
+            "ViT SAM B/16 image encoder pretrained by Meta AI. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (1024, 1024),
+        "formats": {
+            "pt": {
+                "file_size": 342.1,
+                "sha256": "aa944aa652ea9fff1e4ac683bad564789b4ef7084f6fdc1127763dbe6571bb2c",
+            },
+        },
+        "net": {"network": "vit_sam_b16", "tag": "sam-sa1b"},
+    },
+)

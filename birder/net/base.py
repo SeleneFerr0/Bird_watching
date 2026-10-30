@@ -1,0 +1,483 @@
+import copy
+import logging
+from collections.abc import Callable
+from collections.abc import Sequence
+from typing import Any
+from typing import ClassVar
+from typing import Literal
+from typing import NotRequired
+from typing import Optional
+from typing import TypedDict
+from typing import overload
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from birder.layers.moe import MoESpec
+from birder.layers.moe import MoETrainingOutputType
+from birder.model_registry import Task
+from birder.model_registry import registry
+
+logger = logging.getLogger(__name__)
+
+DataShapeType = TypedDict("DataShapeType", {"data_shape": list[int]})
+SignatureType = TypedDict("SignatureType", {"inputs": list[DataShapeType], "outputs": list[DataShapeType]})
+TokenOmissionResultType = TypedDict(
+    "TokenOmissionResultType",
+    {
+        "tokens": NotRequired[torch.Tensor],
+        "embedding": NotRequired[torch.Tensor],
+        "moe_training_output": NotRequired[MoETrainingOutputType],
+    },
+)
+TokenRetentionResultType = TypedDict(
+    "TokenRetentionResultType",
+    {
+        "features": NotRequired[torch.Tensor],
+        "embedding": NotRequired[torch.Tensor],
+        "moe_training_output": NotRequired[MoETrainingOutputType],
+    },
+)
+
+
+def get_signature(input_shape: tuple[int, ...], num_outputs: int) -> SignatureType:
+    return {
+        "inputs": [{"data_shape": [0, *input_shape[1:]]}],
+        "outputs": [{"data_shape": [0, num_outputs]}],
+    }
+
+
+def make_divisible(v: float, divisor: int, min_value: Optional[int] = None, round_limit: float = 0.9) -> int:
+    """
+    This function is taken from the original TensorFlow repository.
+    It ensures that all layers have a channel number that is divisible by 8
+    It can be seen here:
+    https://github.com/tensorflow/models/blob/master/research/slim/nets/mobilenet/mobilenet.py
+    """
+
+    if min_value is None:
+        min_value = divisor
+
+    new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
+
+    # Make sure that round down does not go down by more than the round limit
+    if new_v < round_limit * v:
+        new_v += divisor
+
+    return new_v
+
+
+def stochastic_depth_rates(
+    drop_path_rate: float, num_blocks: int, endpoint: bool = True, constant: bool = False
+) -> list[float]:
+    if num_blocks == 0:
+        return []
+
+    if constant is True:
+        return [drop_path_rate] * num_blocks
+
+    num_steps = num_blocks if endpoint is True else num_blocks + 1
+    rates: list[float] = torch.linspace(0.0, drop_path_rate, steps=num_steps, device="cpu").tolist()
+    if endpoint is False:
+        rates.pop()
+
+    return rates
+
+
+def staged_stochastic_depth_rates(
+    drop_path_rate: float, depths: Sequence[int], endpoint: bool = True, constant: bool = False
+) -> list[list[float]]:
+    rates = stochastic_depth_rates(drop_path_rate, sum(depths), endpoint=endpoint, constant=constant)
+
+    staged_rates = []
+    offset = 0
+    for depth in depths:
+        staged_rates.append(rates[offset : offset + depth])
+        offset += depth
+
+    return staged_rates
+
+
+@overload
+def normalize_out_indices(out_indices: None, num_layers: int) -> None: ...
+
+
+@overload
+def normalize_out_indices(out_indices: list[int], num_layers: int) -> list[int]: ...
+
+
+def normalize_out_indices(out_indices: Optional[list[int]], num_layers: int) -> Optional[list[int]]:
+    if out_indices is None:
+        return None
+
+    normalized_indices = []
+    for idx in out_indices:
+        if idx < 0:
+            idx = num_layers + idx
+        if idx < 0 or idx >= num_layers:
+            raise ValueError(f"out_indices contains invalid index for num_layers={num_layers}")
+
+        normalized_indices.append(idx)
+
+    return normalized_indices
+
+
+# class MiscNet(nn.Module):
+#     """
+#     Base class for general-purpose neural networks with automatic model registration
+
+#     MiscNet provides a minimal foundation for integrating arbitrary PyTorch models into a unified model ecosystem.
+#     Unlike specialized base classes (e.g., DetectionBaseNet for object detection),
+#     MiscNet imposes minimal constraints and is suitable for any neural network architecture
+#     that doesn't fit into specific task categories.
+#     """
+
+#     auto_register = False
+#     scriptable = True
+#     task = str(Task.MISCELLANEOUS)
+
+#     def __init_subclass__(cls) -> None:
+#         if cls.auto_register is False:
+#             # Exclude networks with custom config (initialized only with registered configs)
+#             return
+
+#         registry.register_model(cls.__name__.lower(), cls)
+
+#     def __init__(self, *, config: Optional[dict[str, Any]] = None) -> None:
+#         super().__init__()
+#         if hasattr(self, "config") is False:  # Avoid overriding registered configs
+#             self.config = config
+#         elif config is not None:
+#             assert self.config is not None
+#             self.config.update(config)  # Override with custom config
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         raise NotImplementedError
+
+
+class BaseNet(nn.Module):
+    default_size: ClassVar[tuple[int, int]] = (224, 224)
+    block_group_regex: ClassVar[Optional[str]]
+    auto_register: ClassVar[bool] = False
+    scriptable: ClassVar[bool] = True
+    square_only: ClassVar[bool] = False
+    task: ClassVar[str] = str(Task.IMAGE_CLASSIFICATION)
+
+    def __init_subclass__(cls) -> None:
+        super().__init_subclass__()
+        if cls.__name__ in ["PreTrainEncoder", "DetectorBackbone"]:
+            # Exclude all other base classes here
+            return
+
+        if cls.auto_register is False:
+            # Exclude networks with custom config (initialized only with registered configs)
+            return
+
+        registry.register_model(cls.__name__.lower(), cls)
+
+    def __init__(
+        self,
+        input_channels: int,
+        num_classes: int,
+        *,
+        config: Optional[dict[str, Any]] = None,
+        size: Optional[tuple[int, int]] = None,
+    ) -> None:
+        super().__init__()
+        self.input_channels = input_channels
+        self.num_classes = num_classes
+        if hasattr(self, "config") is False:  # Avoid overriding registered configs
+            self.config = config
+        else:
+            if self.config is not None:
+                self.config = copy.deepcopy(self.config)  # Avoid mutating registered configs
+
+        if config is not None:
+            assert self.config is not None
+            self.config.update(config)  # Override with custom config
+
+        if size is not None:
+            self.size = size
+        else:
+            self.size = self.default_size
+
+        assert isinstance(self.size, tuple)
+        assert isinstance(self.size[0], int)
+        assert isinstance(self.size[1], int)
+        if self.square_only is True:
+            assert self.size[0] == self.size[1]
+
+        self.dynamic_size = False
+        self.head_bias = True
+        self.mlp_head = False
+        if self.config is not None:
+            self.head_bias = self.config.get("head_bias", True)
+            self.mlp_head = self.config.get("mlp_head", False)
+
+        self.max_stride: int
+        self.feature_dim: int
+        self.embedding_size: int
+        self.classifier: nn.Module
+
+    def create_classifier(
+        self, embed_dim: Optional[int] = None, head_bias: Optional[bool] = None, mlp_head: Optional[bool] = None
+    ) -> nn.Module:
+        if self.num_classes == 0:
+            return nn.Identity()
+
+        if embed_dim is None:
+            embed_dim = self.embedding_size
+        if head_bias is None:
+            head_bias = self.head_bias
+        if mlp_head is None:
+            mlp_head = self.mlp_head
+
+        if mlp_head is True:
+            hidden_dim = 3 * embed_dim
+            return nn.Sequential(
+                nn.Linear(embed_dim, hidden_dim),
+                nn.GELU(),
+                nn.LayerNorm(hidden_dim, eps=1e-6),
+                nn.Linear(hidden_dim, self.num_classes, bias=head_bias),
+            )
+
+        return nn.Linear(embed_dim, self.num_classes, bias=head_bias)
+
+    def reset_classifier(self, num_classes: int) -> None:
+        self.num_classes = num_classes
+        self.classifier = self.create_classifier()
+
+    def set_dynamic_size(self, dynamic_size: bool = True) -> None:
+        logger.debug(f"Setting dynamic size to: {dynamic_size}")
+        self.dynamic_size = dynamic_size
+
+    def strip_for_forward_features(self) -> None:
+        """
+        Remove parameters and buffers that are not used by forward_features
+        """
+
+        if hasattr(self, "features") is True:
+            self.features = nn.Identity()  # pylint: disable=attribute-defined-outside-init
+
+        self.classifier = nn.Identity()
+
+    def set_grad_checkpointing(
+        self,
+        enable: bool = True,
+        *,
+        segments: Optional[int] = None,
+        preserve_rng_state: bool = True,
+        use_reentrant: bool = False,
+    ) -> None:
+        raise RuntimeError(f"{self.__class__.__name__} does not support gradient checkpointing")
+
+    def adjust_size(self, new_size: tuple[int, int]) -> None:
+        """
+        Override this when one time adjustments for different resolutions is required.
+        This should run after load_state_dict.
+        """
+
+        if new_size == self.size:
+            return
+
+        if self.square_only is True:
+            assert new_size[0] == new_size[1]
+
+        logger.info(f"Adjusting model input resolution from {self.size} to {new_size}")
+        self.size = new_size
+
+    def _get_input_conv(self) -> nn.Conv2d:
+        raise RuntimeError(f"{self.__class__.__name__} does not support input channel adjustment")
+
+    def adjust_input_channels(self, input_channels: int) -> None:
+        if input_channels == self.input_channels:
+            return
+
+        conv = self._get_input_conv()
+        if conv.groups != 1 or conv.in_channels != self.input_channels:
+            raise RuntimeError("Input channel adjustment requires an ungrouped input convolution")
+
+        weight = conv.weight.detach()
+        if weight.dtype in (torch.float16, torch.bfloat16):
+            weight = weight.float()
+
+        if input_channels == 1:
+            weight = weight.sum(dim=1, keepdim=True)
+        else:
+            repeats = (input_channels + self.input_channels - 1) // self.input_channels
+            weight = weight.repeat(1, repeats, 1, 1)[:, :input_channels]
+            weight = weight * (self.input_channels / input_channels)
+
+        logger.info(f"Adjusting model input channels from {self.input_channels} to {input_channels}")
+        conv.weight = nn.Parameter(weight.to(dtype=conv.weight.dtype), requires_grad=conv.weight.requires_grad)
+        conv.in_channels = input_channels
+        self.input_channels = input_channels
+
+    def freeze(self, freeze_classifier: bool = True, unfreeze_features: bool = False) -> None:
+        for param in self.parameters():
+            param.requires_grad_(False)
+
+        if freeze_classifier is False:
+            for param in self.classifier.parameters():
+                param.requires_grad_(True)
+        if unfreeze_features is True and hasattr(self, "features") is True:
+            for param in self.features.parameters():
+                param.requires_grad_(True)
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Return full feature map, including special tokens
+        """
+
+        raise NotImplementedError
+
+    def flatten_features(
+        self, features: torch.Tensor, include_special_tokens: bool = True  # pylint: disable=unused-argument
+    ) -> torch.Tensor:
+        if features.ndim == 4:
+            return features.flatten(2).permute(0, 2, 1)
+        if features.ndim == 3:
+            return features
+
+        raise RuntimeError(f"Unsupported feature shape: {features.size()}")
+
+    def embedding_from_features(self, features: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def embedding(self, x: torch.Tensor) -> torch.Tensor:
+        return self.embedding_from_features(self.forward_features(x))
+
+    def classify(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.forward_features(x)
+        x = self.embedding_from_features(x)
+        return self.classify(x)
+
+
+class PreTrainEncoder(BaseNet):  # pylint: disable=abstract-method
+    def __init__(
+        self,
+        input_channels: int,
+        num_classes: int,
+        *,
+        config: Optional[dict[str, Any]] = None,
+        size: Optional[tuple[int, int]] = None,
+    ) -> None:
+        super().__init__(input_channels, num_classes, config=config, size=size)
+        self.stem_stride: int
+        self.stem_width: int
+        self.decoder_block: Callable[[int], nn.Module]
+
+
+class MaskedTokenOmissionMixin:
+    num_special_tokens: int
+
+    def masked_encoding_omission(
+        self,
+        x: torch.Tensor,
+        ids_keep: Optional[torch.Tensor] = None,
+        return_all_features: bool = False,
+        return_keys: Literal["all", "tokens", "embedding"] = "tokens",
+    ) -> TokenOmissionResultType:
+        # Returned size (N, L, D)
+        raise NotImplementedError
+
+
+class MaskedTokenRetentionMixin:
+    def masked_encoding_retention(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        mask_token: Optional[torch.Tensor] = None,
+        return_keys: Literal["all", "features", "embedding"] = "features",
+    ) -> TokenRetentionResultType:
+        # Returned features size (B, C, H, W) or (B, C, L) for padded token sequences, embedding (B, D)
+        raise NotImplementedError
+
+
+class DetectorBackbone(BaseNet):
+    def __init__(
+        self,
+        input_channels: int,
+        num_classes: int,
+        *,
+        config: Optional[dict[str, Any]] = None,
+        size: Optional[tuple[int, int]] = None,
+    ) -> None:
+        super().__init__(input_channels, num_classes, config=config, size=size)
+        self.return_stages = ["stage1", "stage2", "stage3", "stage4"]
+        self.return_channels: list[int]
+
+    def strip_for_detection_features(self) -> None:
+        """
+        Remove parameters and buffers that are not used by detection_features
+        """
+
+        super().strip_for_forward_features()
+
+    def detection_features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        raise NotImplementedError
+
+    def freeze_stages(self, up_to_stage: int) -> None:
+        raise NotImplementedError
+
+
+def pos_embedding_sin_cos_2d(
+    h: int,
+    w: int,
+    dim: int,
+    num_special_tokens: int,
+    temperature: int = 10000,
+    include_frequency_endpoint: bool = True,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    # assert (dim % 4) == 0, "feature dimension must be multiple of 4 for sin-cos emb"
+
+    y, x = torch.meshgrid(torch.arange(h, device=device), torch.arange(w, device=device), indexing="ij")
+    pos_dim = dim // 4
+    denominator = pos_dim - 1 if include_frequency_endpoint is True else pos_dim
+    omega = torch.arange(pos_dim, device=device) / denominator
+    omega = 1.0 / (temperature**omega)
+
+    y = y.flatten()[:, None] * omega[None, :]
+    x = x.flatten()[:, None] * omega[None, :]
+    pe = torch.concat((x.sin(), x.cos(), y.sin(), y.cos()), dim=1)
+
+    if num_special_tokens > 0:
+        pe = torch.concat([torch.zeros([num_special_tokens, dim], device=device), pe], dim=0)
+
+    return pe
+
+
+def interpolate_attention_bias(
+    attention_bias: torch.Tensor,
+    old_resolution: tuple[int, int],
+    new_resolution: tuple[int, int],
+    mode: Literal["bilinear", "bicubic"] = "bicubic",
+) -> torch.Tensor:
+    H, _ = attention_bias.size()
+
+    # Interpolate
+    orig_dtype = attention_bias.dtype
+    attention_bias = attention_bias.float()  # Interpolate needs float32
+    attention_bias = attention_bias.reshape(1, H, old_resolution[0], old_resolution[1])
+    attention_bias = F.interpolate(attention_bias, size=new_resolution, mode=mode, antialias=True)
+    attention_bias = attention_bias.reshape(H, new_resolution[0] * new_resolution[1])
+    attention_bias = attention_bias.to(orig_dtype)
+
+    return attention_bias
+
+
+def reparameterize_available(net: nn.Module) -> bool:
+    return hasattr(net, "reparameterize_model")
+
+
+def active_params_available(net: nn.Module) -> bool:
+    return hasattr(net, "get_active_params")
+
+
+def get_moe_spec(module: nn.Module) -> Optional[MoESpec]:
+    return getattr(module, "moe_spec", None)

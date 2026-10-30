@@ -1,0 +1,479 @@
+"""
+DETR (DEtection TRansformer), adapted from
+https://github.com/facebookresearch/detr/blob/main/models/detr.py
+
+Paper "End-to-End Object Detection with Transformers", https://arxiv.org/abs/2005.12872
+
+Changes from original:
+* Move background index to first from last (to be inline with the rest of Birder detectors)
+* Penalize cost matrix elements on overflow (HungarianMatcher)
+"""
+
+# Reference license: Apache-2.0
+
+import copy
+import math
+from typing import Any
+from typing import Optional
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torchvision.ops import MLP
+from torchvision.ops import boxes as box_ops
+
+from birder.common import training_utils
+from birder.model_registry import registry
+from birder.net.base import DetectorBackbone
+from birder.net.detection.base import DetectionBaseNet
+from birder.net.detection.hungarian_matcher import HungarianMatcher
+from birder.ops.soft_nms import SoftNMS
+
+
+def _get_clones(module: nn.Module, N: int) -> nn.ModuleList:
+    return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
+
+
+class TransformerEncoderLayer(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, dim_feedforward: int, dropout: float) -> None:
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout)
+
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.activation = nn.ReLU()
+
+    def forward(
+        self, src: torch.Tensor, pos: torch.Tensor, src_key_padding_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        q = src + pos
+        k = src + pos
+
+        src2, _ = self.self_attn(q, k, value=src, key_padding_mask=src_key_padding_mask, need_weights=False)
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+
+        return src
+
+
+class TransformerDecoderLayer(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, dim_feedforward: int, dropout: float) -> None:
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout)
+        self.multihead_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout)
+
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        self.activation = nn.ReLU()
+
+    def forward(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        pos: torch.Tensor,
+        query_pos: torch.Tensor,
+        memory_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        q_k = tgt + query_pos
+
+        tgt2, _ = self.self_attn(q_k, q_k, value=tgt, need_weights=False)
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+        tgt2, _ = self.multihead_attn(
+            query=tgt + query_pos,
+            key=memory + pos,
+            value=memory,
+            key_padding_mask=memory_key_padding_mask,
+            need_weights=False,
+        )
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(tgt2)
+        tgt = self.norm3(tgt)
+
+        return tgt
+
+
+class TransformerEncoder(nn.Module):
+    def __init__(self, encoder_layer: nn.Module, num_layers: int) -> None:
+        super().__init__()
+        self.layers = _get_clones(encoder_layer, num_layers)
+
+    def forward(
+        self, x: torch.Tensor, pos: torch.Tensor, x_key_padding_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        out = x
+        for layer in self.layers:
+            out = layer(out, pos=pos, src_key_padding_mask=x_key_padding_mask)
+
+        return out
+
+
+class TransformerDecoder(nn.Module):
+    def __init__(self, decoder_layer: nn.Module, num_layers: int, norm: nn.Module, return_intermediate: bool) -> None:
+        super().__init__()
+        self.layers = _get_clones(decoder_layer, num_layers)
+        self.num_layers = num_layers
+        self.norm = norm
+        self.return_intermediate = return_intermediate
+
+    def forward(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        pos: torch.Tensor,
+        query_pos: torch.Tensor,
+        memory_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        output = tgt
+        intermediate = []
+        for layer in self.layers:
+            output = layer(
+                output, memory, pos=pos, query_pos=query_pos, memory_key_padding_mask=memory_key_padding_mask
+            )
+            if self.return_intermediate is True:
+                intermediate.append(self.norm(output))
+
+        if self.return_intermediate is True:
+            return torch.stack(intermediate)
+
+        return self.norm(output).unsqueeze(0)
+
+
+class Transformer(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        num_encoder_layers: int,
+        num_decoder_layers: int,
+        dim_feedforward: int,
+        dropout: float,
+        return_intermediate_dec: bool,
+    ) -> None:
+        super().__init__()
+        encoder_layer = TransformerEncoderLayer(d_model, num_heads, dim_feedforward, dropout)
+        self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers)
+
+        decoder_layer = TransformerDecoderLayer(d_model, num_heads, dim_feedforward, dropout)
+        decoder_norm = nn.LayerNorm(d_model)
+        self.decoder = TransformerDecoder(
+            decoder_layer, num_decoder_layers, decoder_norm, return_intermediate=return_intermediate_dec
+        )
+
+        # Weights initialization
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(
+        self, src: torch.Tensor, query_embed: torch.Tensor, pos_embed: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        # Flatten BxCxHxW to HWxBxC
+        B = src.size(0)
+        src = src.flatten(2).permute(2, 0, 1)
+        pos_embed = pos_embed.flatten(2).permute(2, 0, 1)
+        query_embed = query_embed.unsqueeze(1).repeat(1, B, 1)
+        if mask is not None:
+            mask = mask.flatten(1)
+
+        tgt = torch.zeros_like(query_embed)
+        memory = self.encoder(src, pos=pos_embed, x_key_padding_mask=mask)
+        hs = self.decoder(tgt, memory, pos=pos_embed, query_pos=query_embed, memory_key_padding_mask=mask)
+
+        return hs.transpose(1, 2)
+
+
+class PositionEmbeddingSine(nn.Module):
+    def __init__(
+        self, num_pos_feats: int, temperature: int = 10000, normalize: bool = False, offset: float = 0.0
+    ) -> None:
+        super().__init__()
+        self.num_pos_feats = num_pos_feats
+        self.temperature = temperature
+        self.normalize = normalize
+        self.offset = offset
+        self.scale = 2 * math.pi
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if mask is None:
+            B, _, H, W = x.size()
+            mask = torch.zeros(B, H, W, dtype=torch.bool, device=x.device)
+
+        not_mask = ~mask
+        y_embed = not_mask.cumsum(1, dtype=torch.float32)
+        x_embed = not_mask.cumsum(2, dtype=torch.float32)
+        if self.normalize is True:
+            eps = 1e-6
+            y_embed = (y_embed - self.offset) / (y_embed[:, -1:, :] + eps) * self.scale
+            x_embed = (x_embed - self.offset) / (x_embed[:, :, -1:] + eps) * self.scale
+
+        dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=x.device)
+        dim_t = self.temperature ** (2 * (dim_t // 2) / self.num_pos_feats)
+
+        pos_x = x_embed[:, :, :, None] / dim_t
+        pos_y = y_embed[:, :, :, None] / dim_t
+        pos_x = torch.stack((pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4).flatten(3)
+        pos_y = torch.stack((pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4).flatten(3)
+        pos = torch.concat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
+
+        return pos
+
+
+class DETR(DetectionBaseNet):
+    default_size = (640, 640)
+
+    def __init__(
+        self,
+        num_classes: int,
+        backbone: DetectorBackbone,
+        *,
+        config: Optional[dict[str, Any]] = None,
+        size: Optional[tuple[int, int]] = None,
+        export_mode: bool = False,
+    ) -> None:
+        super().__init__(num_classes, backbone, config=config, size=size, export_mode=export_mode)
+        assert self.config is not None, "must set config"
+
+        hidden_dim = 256
+        num_heads = 8
+        dim_feedforward = 2048
+        dropout: float = self.config.get("dropout", 0.1)
+        num_encoder_layers: int = self.config["num_encoder_layers"]
+        num_decoder_layers: int = self.config["num_decoder_layers"]
+        num_queries: int = self.config.get("num_queries", 100)
+        return_intermediate: bool = self.config.get("return_intermediate", True)
+        soft_nms: bool = self.config.get("soft_nms", False)
+
+        self.soft_nms = None
+        if soft_nms is True:
+            self.soft_nms = SoftNMS()
+
+        self.hidden_dim = hidden_dim
+        self.transformer = Transformer(
+            d_model=hidden_dim,
+            num_heads=num_heads,
+            num_encoder_layers=num_encoder_layers,
+            num_decoder_layers=num_decoder_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            return_intermediate_dec=return_intermediate,
+        )
+
+        self.class_embed = nn.Linear(hidden_dim, self.num_classes)
+        self.bbox_embed = MLP(hidden_dim, [hidden_dim, hidden_dim, 4], activation_layer=nn.ReLU)
+        self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        self.input_proj = nn.Conv2d(
+            self.backbone.return_channels[-1], hidden_dim, kernel_size=(1, 1), stride=(1, 1), padding=(0, 0)
+        )
+        self.pos_enc = PositionEmbeddingSine(hidden_dim // 2, normalize=True)
+
+        self.matcher = HungarianMatcher(class_weight=1.0, bbox_weight=5.0, giou_weight=2.0, use_focal_cost=False)
+        empty_weight = torch.ones(self.num_classes)
+        empty_weight[0] = 0.1
+        self.empty_weight = nn.Buffer(empty_weight)
+
+        if self.export_mode is False:
+            self.forward = torch.compiler.disable(recursive=False)(self.forward)  # type: ignore[method-assign]
+
+    def reset_classifier(self, num_classes: int) -> None:
+        self.num_classes = num_classes + 1
+        self.class_embed = nn.Linear(self.hidden_dim, self.num_classes)
+
+        empty_weight = torch.ones(self.num_classes)
+        empty_weight[0] = 0.1
+        self.empty_weight = nn.Buffer(empty_weight)
+
+    def freeze(self, freeze_classifier: bool = True) -> None:
+        for param in self.parameters():
+            param.requires_grad_(False)
+
+        if freeze_classifier is False:
+            for param in self.class_embed.parameters():
+                param.requires_grad_(True)
+
+    @staticmethod
+    def _get_src_permutation_idx(indices: list[tuple[torch.Tensor, torch.Tensor]]) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_idx = torch.concat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
+        src_idx = torch.concat([src for (src, _) in indices])
+        return (batch_idx, src_idx)
+
+    def _class_loss(
+        self,
+        cls_logits: torch.Tensor,
+        targets: list[dict[str, torch.Tensor]],
+        indices: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        idx = self._get_src_permutation_idx(indices)
+        target_classes_o = torch.concat([t["labels"][J] for t, (_, J) in zip(targets, indices)], dim=0)
+        target_classes = torch.full(cls_logits.shape[:2], 0, dtype=torch.int64, device=cls_logits.device)
+        target_classes[idx] = target_classes_o
+        loss_ce = F.cross_entropy(cls_logits.transpose(1, 2), target_classes, self.empty_weight)
+
+        return loss_ce
+
+    def _box_loss(
+        self,
+        box_output: torch.Tensor,
+        targets: list[dict[str, torch.Tensor]],
+        indices: list[tuple[torch.Tensor, torch.Tensor]],
+        num_boxes: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        idx = self._get_src_permutation_idx(indices)
+        src_boxes = box_output[idx]
+        target_boxes = torch.concat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
+
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction="none")
+        loss_bbox = loss_bbox.sum() / num_boxes
+
+        loss_giou = 1 - torch.diag(
+            box_ops.generalized_box_iou(
+                box_ops.box_convert(src_boxes, in_fmt="cxcywh", out_fmt="xyxy"),
+                box_ops.box_convert(target_boxes, in_fmt="cxcywh", out_fmt="xyxy"),
+            )
+        )
+        loss_giou = loss_giou.sum() / num_boxes
+
+        return (loss_bbox, loss_giou)
+
+    @torch.jit.unused  # type: ignore[untyped-decorator]
+    @torch.compiler.disable()  # type: ignore[untyped-decorator]
+    def compute_loss(
+        self,
+        targets: list[dict[str, torch.Tensor]],
+        cls_logits: torch.Tensor,
+        box_output: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        # Compute the average number of target boxes across all nodes, for normalization purposes
+        num_boxes = sum(len(t["labels"]) for t in targets)
+        num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=cls_logits.device)
+        if training_utils.is_dist_available_and_initialized() is True:
+            torch.distributed.all_reduce(num_boxes)
+
+        num_boxes = torch.clamp(num_boxes / training_utils.get_world_size(), min=1)
+
+        loss_ce_list = []
+        loss_bbox_list = []
+        loss_giou_list = []
+        for idx in range(cls_logits.size(0)):
+            indices = self.matcher.match(cls_logits[idx], box_output[idx], targets)
+            loss_ce_i = self._class_loss(cls_logits[idx], targets, indices)
+            loss_bbox_i, loss_giou_i = self._box_loss(box_output[idx], targets, indices, num_boxes)
+            loss_ce_list.append(loss_ce_i)
+            loss_bbox_list.append(loss_bbox_i)
+            loss_giou_list.append(loss_giou_i)
+
+        loss_ce = torch.stack(loss_ce_list).sum() * 1
+        loss_bbox = torch.stack(loss_bbox_list).sum() * 5
+        loss_giou = torch.stack(loss_giou_list).sum() * 2
+        losses = {
+            "labels": loss_ce,
+            "boxes": loss_bbox,
+            "giou": loss_giou,
+        }
+
+        return losses
+
+    def postprocess_detections(
+        self, class_logits: torch.Tensor, box_regression: torch.Tensor, image_sizes: torch.Tensor
+    ) -> list[dict[str, torch.Tensor]]:
+        prob = F.softmax(class_logits, -1)
+        scores, labels = prob[..., 1:].max(-1)
+        labels = labels + 1
+
+        # Convert to [x0, y0, x1, y1] format
+        boxes = box_ops.box_convert(box_regression, in_fmt="cxcywh", out_fmt="xyxy")
+
+        # Convert from relative [0, 1] to absolute [0, height] coordinates
+        img_h, img_w = image_sizes.unbind(1)
+        scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
+        boxes = boxes * scale_fct[:, None, :]
+
+        detections: list[dict[str, torch.Tensor]] = []
+        for s, l, b in zip(scores, labels, boxes):
+            # Non-maximum suppression
+            if self.soft_nms is not None:
+                soft_scores, keep = self.soft_nms(b, s, l, score_threshold=0.001)
+                s[keep] = soft_scores
+
+                b = b[keep]
+                s = s[keep]
+                l = l[keep]  # noqa: E741
+
+            detections.append(
+                {
+                    "boxes": b,
+                    "scores": s,
+                    "labels": l,
+                }
+            )
+
+        return detections
+
+    def forward_net(self, x: torch.Tensor, masks: Optional[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        features: dict[str, torch.Tensor] = self.backbone.detection_features(x)
+        x = features[self.backbone.return_stages[-1]]
+        if masks is not None:
+            masks = F.interpolate(masks[None].float(), size=x.shape[-2:], mode="nearest").to(torch.bool)[0]
+
+        pos = self.pos_enc(x, masks).to(x.dtype)
+        hs = self.transformer(self.input_proj(x), self.query_embed.weight, pos_embed=pos, mask=masks)
+        outputs_class = self.class_embed(hs)
+        outputs_coord = self.bbox_embed(hs).sigmoid()
+
+        return (outputs_class, outputs_coord)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        targets: Optional[list[dict[str, torch.Tensor]]] = None,
+        masks: Optional[torch.Tensor] = None,
+        image_sizes: Optional[list[tuple[int, int]]] = None,
+    ) -> tuple[list[dict[str, torch.Tensor]], dict[str, torch.Tensor]]:
+        self._input_check(targets)
+        image_sizes_tensor = self._to_img_list(x, image_sizes).image_sizes
+
+        outputs_class, outputs_coord = self.forward_net(x, masks)
+
+        losses = {}
+        detections: list[dict[str, torch.Tensor]] = []
+        if self.training is True:
+            assert targets is not None, "targets should not be none when in training mode"
+
+            # Convert target boxes
+            for idx, target in enumerate(targets):
+                boxes = target["boxes"]
+                boxes = box_ops.box_convert(boxes, in_fmt="xyxy", out_fmt="cxcywh")
+                scale = image_sizes_tensor[idx].flip(0).repeat(2).float()  # flip to [W, H], repeat to [W, H, W, H]
+                boxes = boxes / scale
+                targets[idx]["boxes"] = boxes
+
+            losses = self.compute_loss(targets, outputs_class, outputs_coord)
+
+        else:
+            detections = self.postprocess_detections(outputs_class[-1], outputs_coord[-1], image_sizes_tensor)
+
+        return (detections, losses)
+
+
+registry.register_model_config("detr", DETR, config={"num_encoder_layers": 6, "num_decoder_layers": 6})

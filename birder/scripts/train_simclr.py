@@ -1,0 +1,830 @@
+"""
+SimCLR
+
+Paper "A Simple Framework for Contrastive Learning of Visual Representations",
+https://arxiv.org/abs/2002.05709
+"""
+
+import argparse
+import logging
+import math
+import sys
+import time
+from collections.abc import Callable
+from collections.abc import Iterator
+from contextlib import nullcontext
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from typing import Optional
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.amp
+import torchinfo
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+from birder.common import cli
+from birder.common import fs_ops
+from birder.common import fsdp_utils
+from birder.common import training_cli
+from birder.common import training_utils
+from birder.common.lib import format_duration
+from birder.common.lib import get_mim_network_name
+from birder.common.lib import get_network_name
+from birder.conf import settings
+from birder.data.dataloader.webdataset import make_wds_loader
+from birder.data.datasets.directory import get_image_loader
+from birder.data.datasets.directory import make_image_dataset
+from birder.data.datasets.fake import FakeDataWithPaths
+from birder.data.datasets.webdataset import WDSImageDecoder
+from birder.data.datasets.webdataset import make_wds_dataset
+from birder.data.datasets.webdataset import prepare_wds_args
+from birder.data.datasets.webdataset import wds_args_from_info
+from birder.data.transforms.classification import get_rgb_stats
+from birder.model_registry import Task
+from birder.model_registry import registry
+from birder.net.base import get_moe_spec
+from birder.net.base import get_signature
+from birder.net.ssl.base import get_ssl_signature
+from birder.net.ssl.simclr import SimCLR
+
+logger = logging.getLogger(__name__)
+
+ImageLoader = Callable[[str], Any]
+ImageTransform = Callable[[Any], tuple[torch.Tensor, torch.Tensor]]
+TransformFactory = Callable[[argparse.Namespace], ImageTransform]
+
+
+@dataclass(frozen=True)
+class TrainOverrides:
+    training_transform: Optional[TransformFactory] = None
+    image_loader: Optional[ImageLoader] = None
+    wds_image_decoder: Optional[WDSImageDecoder] = None
+
+
+class TrainTransform:
+    def __init__(self, transform: Callable[..., torch.Tensor]) -> None:
+        self.transform = transform
+
+    def __call__(self, sample: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        x1 = self.transform(sample)
+        x2 = self.transform(sample)
+        return (x1, x2)
+
+
+def _simclr_fsdp_wrap_modules(net: SimCLR, args: argparse.Namespace) -> list[torch.nn.Module]:
+    # Only backbone sub-modules are wrapped, the projection head is small and gets wrapped with the root
+    if args.fsdp_wrap_policy == "stages":
+        matched_modules = fsdp_utils.modules_from_stages(net.backbone)
+        if len(matched_modules) == 0:
+            logger.warning("FSDP stages policy did not match any returned stage module on backbone")
+
+        logger.info(f"FSDP wrap modules resolved: {len(matched_modules)}")
+        return matched_modules
+
+    if args.fsdp_wrap_policy == "min-num-params":
+        min_num_params = int(args.fsdp_wrap_min_num_params * 1_000_000)
+        matched_modules = fsdp_utils.modules_from_min_num_params(net.backbone, min_num_params=min_num_params)
+        if len(matched_modules) == 0:
+            logger.warning(
+                f"FSDP min-num-params policy with threshold {args.fsdp_wrap_min_num_params:g}M "
+                "did not match any module on backbone"
+            )
+
+        logger.info(f"FSDP wrap modules resolved: {len(matched_modules)}")
+        return matched_modules
+
+    block_group_regex = getattr(net.backbone, "block_group_regex", None)
+    if block_group_regex is None:
+        logger.warning("No block_group_regex on backbone, using root-only FSDP")
+        return []
+
+    matched_modules = fsdp_utils.modules_from_block_group_regex(net.backbone, block_group_regex)
+    if len(matched_modules) == 0:
+        logger.warning(f"FSDP wrap regex '{block_group_regex}' did not match any module on backbone")
+
+    logger.info(f"FSDP wrap modules resolved: {len(matched_modules)}")
+    return matched_modules
+
+
+def train(args: argparse.Namespace, overrides: Optional[TrainOverrides] = None) -> None:
+    if overrides is None:
+        overrides = TrainOverrides()
+
+    #
+    # Initialize
+    #
+    device, device_id, disable_tqdm = training_utils.init_training(args, logger)
+    fsdp_mode = fsdp_utils.is_fsdp_mode(args)
+
+    if args.size is None:
+        args.size = registry.get_default_size(args.network)
+
+    logger.info(f"Using size={args.size}")
+
+    #
+    # Data
+    #
+    rgb_stats = get_rgb_stats(args.rgb_mode, args.rgb_mean, args.rgb_std)
+    logger.debug(f"Using RGB stats: {rgb_stats}")
+
+    if overrides.training_transform is not None:
+        training_transform = overrides.training_transform(args)
+    else:
+        training_transform = TrainTransform(training_utils.get_training_transform(args))
+
+    if args.use_fake_data is True:
+        logger.warning("Using fake data")
+        training_dataset = FakeDataWithPaths(
+            10000, (args.channels, *args.size), num_classes=10, transform=training_transform
+        )
+
+    elif args.wds is True:
+        if overrides.wds_image_decoder is not None:
+            wds_image_decoder = overrides.wds_image_decoder
+        else:
+            wds_image_decoder = args.img_loader
+
+        wds_path: str | list[str]
+        if args.wds_info is not None:
+            wds_path, dataset_size = wds_args_from_info(args.wds_info, args.wds_split)
+            if args.wds_size is not None:
+                dataset_size = args.wds_size
+        else:
+            wds_path, dataset_size = prepare_wds_args(args.data_path[0], args.wds_size, device)
+
+        training_dataset = make_wds_dataset(
+            wds_path,
+            dataset_size=dataset_size,
+            shuffle=True,
+            samples_names=True,
+            transform=training_transform,
+            image_decoder=wds_image_decoder,
+            channels=args.channels,
+            cls_key=None,
+            cache_dir=args.wds_cache_dir,
+        )
+
+    else:
+        if overrides.image_loader is not None:
+            image_loader = overrides.image_loader
+        else:
+            image_loader = get_image_loader(args.img_loader, args.channels)
+
+        training_dataset = make_image_dataset(
+            args.data_path,
+            {},
+            transforms=training_transform,
+            loader=image_loader,
+        )
+
+    logger.info(f"Using device {device}:{device_id}")
+    logger.info(f"Training dataset has {len(training_dataset):,} samples")
+
+    batch_size: int = args.batch_size
+    grad_accum_steps: int = args.grad_accum_steps
+    logger.debug(f"Effective batch size = {batch_size * grad_accum_steps * args.world_size}")
+
+    # Data loaders and samplers
+    virtual_epoch_mode = args.steps_per_epoch is not None
+    train_sampler, _ = training_utils.get_samplers(
+        args, training_dataset, validation_dataset=None, device=device, infinite=virtual_epoch_mode
+    )
+
+    if args.wds is True:
+        training_loader = make_wds_loader(
+            training_dataset,
+            batch_size,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+            collate_fn=None,
+            world_size=args.world_size,
+            pin_memory=args.pin_memory,
+            drop_last=args.drop_last,
+            persistent_workers=args.persistent_workers,
+            shuffle=args.wds_extra_shuffle,
+            infinite=virtual_epoch_mode,
+        )
+
+    else:
+        training_loader = DataLoader(
+            training_dataset,
+            batch_size=batch_size,
+            sampler=train_sampler,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+            pin_memory=args.pin_memory,
+            drop_last=args.drop_last,
+            persistent_workers=args.persistent_workers,
+        )
+
+    if virtual_epoch_mode is True:
+        optimizer_steps_per_epoch = args.steps_per_epoch
+        epoch_num_batches = args.steps_per_epoch * grad_accum_steps
+        epoch_samples = epoch_num_batches * batch_size * args.world_size
+        logger.debug(f"Virtual epoch has {epoch_samples:,} samples")
+    else:
+        optimizer_steps_per_epoch = math.ceil(len(training_loader) / grad_accum_steps)
+        epoch_num_batches = len(training_loader)
+        epoch_samples = len(training_dataset)
+
+    last_batch_idx = epoch_num_batches - 1
+    last_accum_steps = epoch_num_batches % grad_accum_steps
+    if last_accum_steps == 0:
+        last_accum_steps = grad_accum_steps
+
+    last_accum_start_idx = epoch_num_batches - last_accum_steps
+    begin_epoch = 1 if args.resume_epoch is None else args.resume_epoch + 1
+    epochs = args.epochs + 1
+    args.stop_epoch = training_utils.normalize_stop_epoch(epochs, args.stop_epoch)
+
+    logger.debug(
+        f"Epoch has {epoch_num_batches} iterations ({optimizer_steps_per_epoch} steps), "
+        f"virtual mode={virtual_epoch_mode}"
+    )
+    training_epochs = max(0, args.stop_epoch - begin_epoch)
+
+    # Approximate total: does not account for --drop-last or sampler padding
+    logger.info(f"Training will process {epoch_samples * training_epochs:,} samples over {training_epochs} epochs")
+
+    #
+    # Initialize network
+    #
+    model_dtype: torch.dtype = getattr(torch, args.model_dtype)
+    sample_shape = (batch_size, args.channels, *args.size)  # B, C, H, W
+    backbone_name = get_network_name(args.network, tag="simclr")
+    if args.tag is not None:
+        backbone_name = f"{backbone_name}-{args.tag}"
+
+    network_name = get_mim_network_name("simclr", encoder=args.network, tag=args.tag)
+
+    backbone = registry.net_factory(args.network, 0, sample_shape[1], config=args.model_config, size=args.size)
+    net = SimCLR(
+        backbone,
+        config={
+            "projection_hidden_dim": backbone.embedding_size,
+            "projection_dim": args.projection_dim,
+            "temperature": args.temperature,
+        },
+    )
+
+    if args.resume_epoch is not None:
+        net, training_states = fs_ops.load_simple_checkpoint(
+            device, net, network_name, epoch=args.resume_epoch, strict=not args.non_strict_weights
+        )
+
+    else:
+        training_states = fs_ops.TrainingStates.empty()
+
+    net.to(device, dtype=model_dtype)
+    if args.freeze_bn is True:
+        net = training_utils.freeze_batchnorm2d(net)
+    elif args.sync_bn is True and args.distributed is True:
+        net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net)
+
+    if args.fast_matmul is True or args.amp is True:
+        torch.set_float32_matmul_precision("high")
+
+    if args.grad_checkpointing is True:
+        net.backbone.set_grad_checkpointing(
+            segments=args.grad_checkpointing_segments,
+            preserve_rng_state=args.grad_checkpointing_preserve_rng_state,
+        )
+
+    if fsdp_mode is True:
+        fsdp_wrap_modules = _simclr_fsdp_wrap_modules(net, args)
+        net = fsdp_utils.setup_fsdp(net, args, device, wrap_modules=fsdp_wrap_modules)
+
+    # Compile
+    if args.compile is True:
+        net = torch.compile(net, fullgraph=args.compile_fullgraph, mode=args.compile_mode)
+
+    #
+    # Optimizer, learning rate scheduler and training parameter groups
+    #
+
+    # Learning rate scaling
+    lr = training_utils.scale_lr(args)
+
+    # Training parameter groups
+    custom_keys_weight_decay = training_utils.get_wd_custom_keys(args)
+    parameters = training_utils.optimizer_parameter_groups(
+        net,
+        args.wd,
+        base_lr=lr,
+        norm_weight_decay=args.norm_wd,
+        custom_keys_weight_decay=custom_keys_weight_decay,
+        custom_layer_weight_decay=args.custom_layer_wd,
+        layer_decay=args.layer_decay,
+        backbone_layer_decay=args.backbone_layer_decay,
+        layer_decay_min_scale=args.layer_decay_min_scale,
+        layer_decay_no_opt_scale=args.layer_decay_no_opt_scale,
+        bias_lr=args.bias_lr,
+        custom_layer_lr_scale=args.custom_layer_lr_scale,
+    )
+
+    if args.lr_scheduler_update == "epoch":
+        step_update = False
+        scheduler_steps_per_epoch = 1
+    elif args.lr_scheduler_update == "step":
+        step_update = True
+        scheduler_steps_per_epoch = optimizer_steps_per_epoch
+    else:
+        raise ValueError("Unsupported lr_scheduler_update")
+
+    # Optimizer and learning rate scheduler
+    optimizer = training_utils.get_optimizer(parameters, lr, args)
+    scheduler = training_utils.get_scheduler(optimizer, scheduler_steps_per_epoch, args)
+    if args.compile_opt is True:
+        optimizer.step = torch.compile(optimizer.step, fullgraph=False)
+
+    # Gradient scaler and AMP related tasks
+    scaler, amp_dtype = training_utils.get_amp_scaler(device, args.amp, args.amp_dtype)
+
+    # Load states
+    if args.load_states is True:
+        if fsdp_mode is True:
+            fsdp_utils.load_full_optimizer_state_dict(
+                net, optimizer, training_states.optimizer_state  # type: ignore[arg-type]
+            )
+        else:
+            optimizer.load_state_dict(training_states.optimizer_state)
+
+        scheduler.load_state_dict(training_states.scheduler_state)
+        if scaler is not None:
+            scaler.load_state_dict(training_states.scaler_state)
+
+    elif args.load_scheduler is True:
+        scheduler.load_state_dict(training_states.scheduler_state)
+        last_lrs = scheduler.get_last_lr()
+        for g, last_lr in zip(optimizer.param_groups, last_lrs):
+            g["lr"] = last_lr
+
+    last_lr = float(max(scheduler.get_last_lr()))
+    if args.plot_lr is True:
+        logger.info("Fast forwarding scheduler...")
+        optimizer.step()
+        lrs = []
+        for _ in range(begin_epoch, epochs):
+            for _ in range(scheduler_steps_per_epoch):
+                lrs.append(float(max(scheduler.get_last_lr())))
+                scheduler.step()
+
+        plt.plot(
+            np.linspace(begin_epoch, epochs, scheduler_steps_per_epoch * (epochs - begin_epoch), endpoint=False), lrs
+        )
+        plt.show()
+        raise SystemExit(0)
+
+    #
+    # Distributed (DDP)
+    #
+    net_without_ddp = net
+    no_sync_cm = nullcontext
+    if args.distributed is True and fsdp_mode is False:
+        net = torch.nn.parallel.DistributedDataParallel(
+            net,
+            device_ids=training_utils.get_ddp_device_ids(device, device_id),
+            find_unused_parameters=args.find_unused_parameters,
+            broadcast_buffers=not args.no_broadcast_buffers,
+        )
+        training_utils.register_ddp_comm_hook(net, args.ddp_comm_dtype)
+        no_sync_cm = net.no_sync
+        net_without_ddp = net.module
+
+    model_to_save = net_without_ddp
+    if args.compile is True and hasattr(model_to_save, "_orig_mod") is True:
+        model_to_save = model_to_save._orig_mod
+
+    #
+    # Misc
+    #
+
+    # Print network summary
+    net_for_info = model_to_save
+    if args.no_summary is False:
+        summary = torchinfo.summary(
+            net_for_info,
+            device=device,
+            input_size=(sample_shape, sample_shape),
+            dtypes=[model_dtype, model_dtype],
+            col_names=["input_size", "output_size", "kernel_size", "num_params"],
+            depth=4,
+            verbose=0,
+        )
+        if training_utils.is_global_primary(args) is True:
+            # Write to stderr, same as all the logs
+            print(summary, file=sys.stderr)
+
+    # Training logs
+    training_log_path = training_utils.training_log_path(network_name, device, args.experiment)
+    logger.info(f"Logging training run at {training_log_path}")
+    summary_writer = SummaryWriter(training_log_path)
+
+    signature = get_ssl_signature(input_shape=sample_shape)
+    backbone_signature = get_signature(input_shape=sample_shape, num_outputs=0)
+    file_handler: logging.Handler = logging.NullHandler()
+    if training_utils.is_global_primary(args) is True:
+        summary_writer.flush()
+        fs_ops.write_config(network_name, net_for_info, signature=signature, rgb_stats=rgb_stats)
+        file_handler = training_utils.setup_file_logging(training_log_path.joinpath("training.log"))
+        training_utils.write_training_args_json(training_log_path, args)
+        training_utils.write_training_data_json(training_log_path, {"training_samples": len(training_dataset)})
+
+    moe_spec = None
+    moe_expert_load_accumulator: Optional[training_utils.MoEExpertLoadAccumulator] = None
+    if args.moe_training is True:
+        moe_model = training_utils.unwrap_compiled_module(net_without_ddp).backbone
+        moe_spec = get_moe_spec(moe_model)
+        if moe_spec is None:
+            raise cli.ValidationError("--moe-training requires a backbone with MoE support")
+
+        if moe_spec.requires_expert_bias_update is True:
+            moe_expert_load_accumulator = training_utils.MoEExpertLoadAccumulator()
+            moe_expert_bias_updater = moe_model.update_moe_expert_biases
+
+    return_moe_training_output = moe_spec is not None and moe_spec.requires_training_output is True
+
+    #
+    # Training loop
+    #
+    if virtual_epoch_mode is True:
+        train_iter = iter(training_loader)
+
+    running_loss = training_utils.SmoothedValue()
+    running_moe_aux_loss: Optional[training_utils.SmoothedValue] = None
+    if moe_spec is not None and moe_spec.has_auxiliary_loss is True:
+        running_moe_aux_loss = training_utils.SmoothedValue(window_size=64)
+
+    logger.info(f"Starting training with learning rate of {last_lr}")
+    for epoch in range(begin_epoch, args.stop_epoch):
+        tic = time.time()
+        net.train()
+
+        # Clear metrics
+        running_loss.clear()
+        if running_moe_aux_loss is not None:
+            running_moe_aux_loss.clear()
+
+        if args.distributed is True or virtual_epoch_mode is True:
+            train_sampler.set_epoch(epoch)
+
+        progress = tqdm(
+            desc=f"Epoch {epoch}/{epochs-1}",
+            total=epoch_samples,
+            leave=False,
+            disable=disable_tqdm,
+            unit="samples",
+            initial=0,
+        )
+
+        # Zero the parameter gradients
+        optimizer.zero_grad()
+
+        epoch_start = time.time()
+        start_time = epoch_start
+        last_idx = -1
+        batch_iter: Iterator[tuple[int, Any]]
+        if virtual_epoch_mode is True:
+            batch_iter = ((i, next(train_iter)) for i in range(epoch_num_batches))
+        else:
+            batch_iter = enumerate(training_loader)
+
+        for i, (_, (x, y), _) in batch_iter:
+            x = x.to(device, dtype=model_dtype, non_blocking=True)
+            y = y.to(device, dtype=model_dtype, non_blocking=True)
+
+            optimizer_update = (i == last_batch_idx) or ((i + 1) % grad_accum_steps == 0)
+            sync_context = no_sync_cm if optimizer_update is False else nullcontext
+            if i >= last_accum_start_idx:
+                effective_accum_steps = last_accum_steps
+            else:
+                effective_accum_steps = grad_accum_steps
+
+            if fsdp_mode is True and grad_accum_steps > 1:
+                net.set_requires_gradient_sync(requires_gradient_sync=optimizer_update)
+            if fsdp_mode is True and args.no_broadcast_buffers is False:
+                fsdp_utils.broadcast_module_buffers(net)
+
+            # Forward and backward
+            with sync_context():
+                with torch.amp.autocast(device.type, enabled=args.amp, dtype=amp_dtype):
+                    if return_moe_training_output is True:
+                        simclr_loss, moe_training_output = net(x, y, return_moe_training_output=True)
+                        raw_loss = simclr_loss
+                        if moe_expert_load_accumulator is not None:
+                            moe_expert_load_accumulator.add(moe_training_output["expert_loads"])
+                        if moe_spec.has_auxiliary_loss is True:  # type: ignore[union-attr]
+                            moe_aux_loss = moe_training_output["auxiliary_loss"]
+                            raw_loss = simclr_loss + moe_aux_loss
+                    else:
+                        simclr_loss = net(x, y)
+                        raw_loss = simclr_loss
+
+                loss = raw_loss / effective_accum_steps
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+
+            if optimizer_update is True:
+                if scaler is not None:
+                    if args.clip_grad_norm is not None:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(net.parameters(), args.clip_grad_norm)
+
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    if args.clip_grad_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(net.parameters(), args.clip_grad_norm)
+
+                    optimizer.step()
+
+                if moe_expert_load_accumulator is not None:
+                    moe_expert_load_accumulator.flush(
+                        moe_expert_bias_updater  # pylint: disable=possibly-used-before-assignment
+                    )
+
+                optimizer.zero_grad()
+                if step_update is True:
+                    scheduler.step()
+
+            # Statistics
+            running_loss.update(simclr_loss.detach())
+            if running_moe_aux_loss is not None:
+                running_moe_aux_loss.update(moe_aux_loss.detach())
+
+            # Write statistics
+            if (i + 1) % args.log_interval == 0 or i == last_batch_idx:
+                time_now = time.time()
+                time_cost = time_now - start_time
+                iters_processed_in_interval = i - last_idx
+                rate = iters_processed_in_interval * (batch_size * args.world_size) / time_cost
+
+                avg_time_per_iter = time_cost / iters_processed_in_interval
+                remaining_iters_in_epoch = last_batch_idx - i
+                estimated_time_to_finish_epoch = remaining_iters_in_epoch * avg_time_per_iter
+
+                start_time = time_now
+                last_idx = i
+                cur_lr = float(max(scheduler.get_last_lr()))
+
+                running_loss.synchronize_between_processes(device)
+                if running_moe_aux_loss is not None:
+                    running_moe_aux_loss.synchronize_between_processes(device)
+
+                with training_utils.single_handler_logging(logger, file_handler, enabled=not disable_tqdm) as log:
+                    log.info(
+                        f"[Trn] Epoch {epoch}/{epochs-1}, iter {i+1}/{last_batch_idx+1}  "
+                        f"Loss: {running_loss.avg:.4f}  "
+                        f"Elapsed: {format_duration(time_now-epoch_start)}  "
+                        f"ETA: {format_duration(estimated_time_to_finish_epoch)}  "
+                        f"T: {time_cost:.1f}s  "
+                        f"R: {rate:.1f} samples/s  "
+                        f"LR: {cur_lr:.4e}"
+                    )
+                    if running_moe_aux_loss is not None:
+                        log.info(
+                            f"[Trn] Epoch {epoch}/{epochs-1}, iter {i+1}/{last_batch_idx+1}  "
+                            f"MoE auxiliary loss: {running_moe_aux_loss.avg:.4f}"
+                        )
+
+                if training_utils.is_global_primary(args) is True:
+                    summary_writer.add_scalars(
+                        "loss",
+                        {"training": running_loss.avg},
+                        ((epoch - 1) * epoch_samples) + ((i + 1) * batch_size * args.world_size),
+                    )
+                    if running_moe_aux_loss is not None:
+                        summary_writer.add_scalars(
+                            "loss",
+                            {"moe_auxiliary": running_moe_aux_loss.avg},
+                            ((epoch - 1) * epoch_samples) + ((i + 1) * batch_size * args.world_size),
+                        )
+
+            # Update progress bar
+            progress.update(n=batch_size * args.world_size)
+
+        progress.close()
+
+        # Epoch training metrics
+        logger.info(f"[Trn] Epoch {epoch}/{epochs-1} training_loss: {running_loss.global_avg:.4f}")
+        if running_moe_aux_loss is not None:
+            logger.info(
+                f"[Trn] Epoch {epoch}/{epochs-1} training_moe_auxiliary_loss: {running_moe_aux_loss.global_avg:.4f}"
+            )
+
+        # Learning rate scheduler update
+        if step_update is False:
+            scheduler.step()
+        if last_lr != float(max(scheduler.get_last_lr())):
+            last_lr = float(max(scheduler.get_last_lr()))
+            logger.info(f"Updated learning rate to: {last_lr}")
+
+        # Checkpoint model
+        if epoch % args.save_frequency == 0:
+            if fsdp_mode is True:
+                full_model_state = fsdp_utils.gather_full_model_state_dict(model_to_save)
+                backbone_model_state = fsdp_utils.extract_submodule_state_dict(
+                    full_model_state, model_to_save, model_to_save.backbone
+                )
+            else:
+                full_model_state = None
+                backbone_model_state = None
+
+            training_utils.save_training_checkpoint(
+                args,
+                network_name=network_name,
+                epoch=epoch,
+                net=model_to_save,
+                signature=signature,
+                class_to_idx={},
+                rgb_stats=rgb_stats,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                model_base=None,
+                fsdp_mode=fsdp_mode,
+                fsdp_model_state=full_model_state,
+            )
+            training_utils.save_training_checkpoint(
+                args,
+                network_name=backbone_name,
+                epoch=epoch,
+                net=model_to_save.backbone,
+                signature=backbone_signature,
+                class_to_idx={},
+                rgb_stats=rgb_stats,
+                optimizer=None,
+                scheduler=None,
+                scaler=None,
+                model_base=None,
+                fsdp_mode=fsdp_mode,
+                fsdp_model_state=backbone_model_state,
+            )
+            if args.keep_last is not None and training_utils.is_global_primary(args) is True:
+                fs_ops.clean_checkpoints(network_name, args.keep_last)
+                fs_ops.clean_checkpoints(backbone_name, args.keep_last)
+
+        # Epoch timing
+        toc = time.time()
+        logger.info(f"Total time: {format_duration(toc - tic)}")
+        logger.info("---")
+
+    summary_writer.close()
+
+    # Checkpoint model
+    if fsdp_mode is True:
+        full_model_state = fsdp_utils.gather_full_model_state_dict(model_to_save)
+        backbone_model_state = fsdp_utils.extract_submodule_state_dict(
+            full_model_state, model_to_save, model_to_save.backbone
+        )
+    else:
+        full_model_state = None
+        backbone_model_state = None
+
+    training_utils.save_training_checkpoint(
+        args,
+        network_name=network_name,
+        epoch=epoch,
+        net=model_to_save,
+        signature=signature,
+        class_to_idx={},
+        rgb_stats=rgb_stats,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        model_base=None,
+        fsdp_mode=fsdp_mode,
+        fsdp_model_state=full_model_state,
+    )
+    training_utils.save_training_checkpoint(
+        args,
+        network_name=backbone_name,
+        epoch=epoch,
+        net=model_to_save.backbone,
+        signature=backbone_signature,
+        class_to_idx={},
+        rgb_stats=rgb_stats,
+        optimizer=None,
+        scheduler=None,
+        scaler=None,
+        model_base=None,
+        fsdp_mode=fsdp_mode,
+        fsdp_model_state=backbone_model_state,
+    )
+
+    training_utils.shutdown_distributed_mode(args)
+
+
+def get_args_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        allow_abbrev=False,
+        description="Pretrain model",
+        epilog=(
+            "Usage examples\n"
+            "==============\n"
+            "torchrun --nproc_per_node=2 -m birder.scripts.train_simclr \\\n"
+            "    --network resnet_v1_50 \\\n"
+            "    --opt lars \\\n"
+            "    --lr 0.075 \\\n"
+            "    --lr-scale 4096 \\\n"
+            "    --lr-scale-type sqrt \\\n"
+            "    --lr-scheduler cosine \\\n"
+            "    --warmup-epochs 10 \\\n"
+            "    --batch-size 256 \\\n"
+            "    --epochs 100 \\\n"
+            "    --wd 0.0001 \\\n"
+            "    --amp \\\n"
+            "    --compile \\\n"
+            "    --data-path data/training\n"
+        ),
+        formatter_class=cli.ArgumentHelpFormatter,
+    )
+    parser.add_argument("-n", "--network", type=str, help="the neural network to train")
+    parser.add_argument("-t", "--tag", type=str, help="add model tag")
+    parser.add_argument(
+        "--model-config",
+        action=cli.FlexibleDictAction,
+        help=(
+            "override the model default configuration, accepts key-value pairs or JSON "
+            "('drop_path_rate=0.2' or '{\"units\": [3, 24, 36, 3], \"dropout\": 0.2}'"
+        ),
+    )
+    parser.add_argument("--projection-dim", type=int, default=128, metavar="DIM", help="projection dim")
+    parser.add_argument("--temperature", type=float, default=0.1, help="loss temperature")
+    parser.add_argument(
+        "--moe-training",
+        default=False,
+        action="store_true",
+        help="enable MoE training behavior, including auxiliary balancing losses and expert-bias updates",
+    )
+    training_cli.add_optimization_args(parser)
+    training_cli.add_lr_wd_args(parser, backbone_layer_decay=True)
+    training_cli.add_lr_scheduler_args(parser)
+    training_cli.add_training_schedule_args(parser)
+    training_cli.add_batch_norm_args(parser)
+    training_cli.add_input_args(parser)
+    training_cli.add_data_aug_args(parser, default_min_scale=0.2, default_re_prob=0.0)
+    training_cli.add_dataloader_args(parser, default_drop_last=True)
+    training_cli.add_precision_args(parser)
+    training_cli.add_grad_checkpointing_args(parser)
+    training_cli.add_compile_args(parser)
+    training_cli.add_checkpoint_args(parser)
+    training_cli.add_distributed_args(parser, fsdp=True)
+    training_cli.add_logging_and_debug_args(parser, default_log_interval=100)
+    training_cli.add_training_data_args(parser, unsupervised=True)
+
+    return parser
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    args.data_path = [str(p) for p in args.data_path]
+    args.size = cli.parse_size(args.size)
+
+    # This will capture the common argument mistakes
+    training_cli.common_args_validation(args)
+
+    # Script specific checks
+    if registry.exists(args.network, task=Task.IMAGE_CLASSIFICATION) is False:
+        raise cli.ValidationError(f"--network {args.network} not supported, see list-models tool for available options")
+    if args.moe_training is True:
+        if args.batch_size % 8 != 0:
+            raise cli.ValidationError("--moe-training requires local --batch-size to be divisible by 8")
+        if args.drop_last is False:
+            raise cli.ValidationError("--moe-training requires --drop-last")
+
+
+def args_from_dict(**kwargs: Any) -> argparse.Namespace:
+    parser = get_args_parser()
+    parser.set_defaults(**kwargs)
+    args = parser.parse_args([])
+    validate_args(args)
+
+    return args
+
+
+def main(overrides: Optional[TrainOverrides] = None) -> None:
+    parser = get_args_parser()
+    args = parser.parse_args()
+    validate_args(args)
+
+    if settings.MODELS_DIR.exists() is False:
+        logger.info(f"Creating {settings.MODELS_DIR} directory...")
+        settings.MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+    if args.wds_cache_dir is not None and Path(args.wds_cache_dir).exists() is False:
+        logger.info(f"Creating {args.wds_cache_dir} directory...")
+        Path(args.wds_cache_dir).mkdir(parents=True, exist_ok=True)
+
+    train(args, overrides=overrides)
+
+
+if __name__ == "__main__":
+    logger = logging.getLogger(getattr(__spec__, "name", __name__))
+    main()

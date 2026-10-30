@@ -1,0 +1,595 @@
+import math
+import random
+from collections.abc import Callable
+from typing import Any
+from typing import Literal
+from typing import Optional
+
+import torch
+from torch import nn
+from torchvision import tv_tensors
+from torchvision.transforms import v2
+from torchvision.transforms.v2 import functional as F
+
+from birder.data.transforms.classification import RGBType
+
+MULTISCALE_STEP = 32
+DEFAULT_MULTISCALE_MIN_SIZE = 480
+DEFAULT_MULTISCALE_BASE_SIZE = 640
+DEFAULT_MULTISCALE_MAX_SIZE = 800
+DEFAULT_MULTISCALE_LONG_EDGE_SIZE = 1333
+
+
+def build_multiscale_sizes(
+    min_size: Optional[int] = None, max_size: Optional[int] = None, multiscale_step: int = MULTISCALE_STEP
+) -> tuple[int, ...]:
+    if multiscale_step <= 0:
+        raise ValueError("multiscale_step must be positive")
+
+    if min_size is None:
+        min_size = DEFAULT_MULTISCALE_MIN_SIZE
+    if max_size is None:
+        max_size = DEFAULT_MULTISCALE_MAX_SIZE
+
+    start = int(math.ceil(min_size / multiscale_step) * multiscale_step)
+    end = int(math.floor(max_size / multiscale_step) * multiscale_step)
+    if end < start:
+        return (start,)
+
+    return tuple(range(start, end + 1, multiscale_step))
+
+
+def resolve_multiscale_sizes(
+    size: tuple[int, int],
+    multiscale_min_size: Optional[int],
+    multiscale_max_size: Optional[int],
+    multiscale_step: int = MULTISCALE_STEP,
+) -> tuple[int, ...]:
+    target_size = min(size)
+    if multiscale_min_size is None:
+        multiscale_min_size = math.ceil(target_size * DEFAULT_MULTISCALE_MIN_SIZE / DEFAULT_MULTISCALE_BASE_SIZE)
+    if multiscale_max_size is None:
+        multiscale_max_size = round(target_size * DEFAULT_MULTISCALE_MAX_SIZE / DEFAULT_MULTISCALE_BASE_SIZE)
+
+    return build_multiscale_sizes(multiscale_min_size, multiscale_max_size, multiscale_step=multiscale_step)
+
+
+def resolve_multiscale_long_edge_size(multiscale_sizes: tuple[int, ...], max_size: Optional[int]) -> int:
+    if max_size is not None:
+        return max_size
+
+    return round(multiscale_sizes[-1] * DEFAULT_MULTISCALE_LONG_EDGE_SIZE / DEFAULT_MULTISCALE_MAX_SIZE)
+
+
+def resolve_detr_intermediate_sizes(size: tuple[int, int]) -> tuple[int, ...]:
+    return tuple(
+        round(intermediate_size * min(size) / DEFAULT_MULTISCALE_BASE_SIZE) for intermediate_size in (400, 500, 600)
+    )
+
+
+class ResizeWithRandomInterpolation(nn.Module):
+    def __init__(
+        self, size: Optional[int] | tuple[int, int], max_size: Optional[int], interpolation: list[v2.InterpolationMode]
+    ) -> None:
+        super().__init__()
+        self.transform = []
+        for interp in interpolation:
+            self.transform.append(
+                v2.Resize(
+                    size,
+                    interpolation=interp,
+                    max_size=max_size,
+                    antialias=True,
+                )
+            )
+
+    def forward(self, *x: Any) -> torch.Tensor:
+        t = random.choice(self.transform)
+        return t(x)
+
+
+class FixedSizeCrop(v2.Transform):
+    """
+    Crop or pad inputs to a fixed size
+
+    Adapted from:
+    https://github.com/pytorch/vision/blob/main/references/detection/transforms.py
+    """
+
+    def __init__(self, size: tuple[int, int], fill: list[float]) -> None:
+        super().__init__()
+        self.size = size
+        self.fill = fill
+
+    def make_params(self, flat_inputs: list[Any]) -> dict[str, Any]:
+        image_h, image_w = F.get_size(flat_inputs[0])
+        crop_h = min(image_h, self.size[0])
+        crop_w = min(image_w, self.size[1])
+
+        needs_crop = crop_h != image_h or crop_w != image_w
+        if needs_crop is True:
+            offset_h = max(image_h - self.size[0], 0)
+            offset_w = max(image_w - self.size[1], 0)
+            top = torch.randint(0, offset_h + 1, size=(1,)).item()
+            left = torch.randint(0, offset_w + 1, size=(1,)).item()
+        else:
+            top = 0
+            left = 0
+
+        return {
+            "needs_crop": needs_crop,
+            "top": top,
+            "left": left,
+            "height": crop_h,
+            "width": crop_w,
+            "pad_right": max(self.size[1] - crop_w, 0),
+            "pad_bottom": max(self.size[0] - crop_h, 0),
+        }
+
+    def transform(self, inpt: Any, params: dict[str, Any]) -> Any:
+        if params["needs_crop"] is True:
+            output = F.crop(
+                inpt,
+                top=params["top"],
+                left=params["left"],
+                height=params["height"],
+                width=params["width"],
+            )
+        else:
+            output = inpt
+        if params["pad_right"] > 0 or params["pad_bottom"] > 0:
+            fill = 0 if isinstance(inpt, (tv_tensors.BoundingBoxes, tv_tensors.Mask)) else self.fill
+            output = F.pad(
+                output,
+                padding=[0, 0, params["pad_right"], params["pad_bottom"]],
+                fill=fill,
+            )
+
+        return output
+
+
+class RandomSizeCrop(nn.Module):
+    def __init__(self, min_size: int, max_size: int) -> None:
+        super().__init__()
+        self.min_size = min_size
+        self.max_size = max_size
+
+    def forward(self, *x: Any) -> torch.Tensor:
+        image = x[0]
+        image_h = int(image.shape[-2])
+        image_w = int(image.shape[-1])
+        crop_h = random.randint(self.min_size, min(image_h, self.max_size))
+        crop_w = random.randint(self.min_size, min(image_w, self.max_size))
+
+        return v2.RandomCrop((crop_h, crop_w))(x)
+
+
+def get_birder_augment(
+    size: tuple[int, int],
+    level: int,
+    fill_value: list[float],
+    dynamic_size: bool,
+    multiscale: bool,
+    max_size: Optional[int],
+    multiscale_min_size: Optional[int],
+    multiscale_max_size: Optional[int],
+    multiscale_step: int = MULTISCALE_STEP,
+    post_mosaic: bool = False,
+) -> Callable[..., torch.Tensor]:
+    dynamic_resize = dynamic_size is True or max_size is not None
+    if dynamic_resize is True:
+        target_size: Optional[int] | tuple[int, int] = min(size)
+    else:
+        target_size = size
+
+    transformations = []
+
+    # Base augmentations
+    if level >= 1:
+        if dynamic_resize is False and multiscale is False and post_mosaic is False:
+            transformations.extend(
+                [
+                    v2.RandomChoice(
+                        [
+                            v2.Compose(
+                                [
+                                    v2.ScaleJitter(
+                                        target_size=(size[1], size[0]),  # ScaleJitter expects (width, height)
+                                        scale_range=(max(0.1, 0.5 - (0.08 * level)), 2),
+                                        antialias=True,
+                                    ),
+                                    FixedSizeCrop(size, fill_value),
+                                ]
+                            ),
+                            v2.RandomZoomOut(fill_value, side_range=(1, 3 + level * 0.1), p=0.5),
+                        ]
+                    ),
+                ]
+            )
+
+    if level >= 3:
+        if post_mosaic is False:
+            transformations.extend(
+                [
+                    v2.RandomIoUCrop(),
+                    v2.ClampBoundingBoxes(),
+                ]
+            )
+
+    # Resize
+    if multiscale is True:
+        multiscale_sizes = resolve_multiscale_sizes(
+            size, multiscale_min_size, multiscale_max_size, multiscale_step=multiscale_step
+        )
+        max_size = resolve_multiscale_long_edge_size(multiscale_sizes, max_size)
+
+        transformations.append(
+            v2.RandomShortestSize(min_size=multiscale_sizes, max_size=max_size),
+        )
+    else:
+        transformations.append(
+            ResizeWithRandomInterpolation(
+                target_size, max_size, interpolation=[v2.InterpolationMode.BILINEAR, v2.InterpolationMode.BICUBIC]
+            ),
+        )
+
+    # Classification style augmentations
+    if level >= 4:
+        transformations.extend(
+            [
+                v2.RandomChoice(
+                    [
+                        v2.ColorJitter(
+                            brightness=0.1 + (0.0125 * level),
+                            contrast=0.0 + (0.015 * level),
+                            hue=max(0, -0.025 + (level * 0.01)),
+                        ),
+                        v2.RandomPhotometricDistort(p=1.0),
+                        v2.Identity(),
+                    ]
+                ),
+            ]
+        )
+
+    if level >= 6:
+        transformations.extend(
+            [
+                v2.RandomChoice(
+                    [
+                        v2.RandomGrayscale(p=0.5),
+                        v2.RandomSolarize(255 - (10 * level), p=0.5),
+                    ]
+                ),
+            ]
+        )
+
+    transformations.extend(
+        [
+            v2.RandomHorizontalFlip(0.5),
+            v2.SanitizeBoundingBoxes(),
+        ]
+    )
+
+    return v2.Compose(transformations)  # type: ignore
+
+
+AugType = Literal["birder", "lsj", "multiscale", "ssd", "ssdlite", "yolo", "deim", "detr", "fixed_detr"]
+
+
+def training_preset(
+    size: tuple[int, int],
+    aug_type: AugType,
+    level: int,
+    rgv_values: RGBType,
+    *,
+    dynamic_size: bool = False,
+    multiscale: bool = False,
+    max_size: Optional[int] = None,
+    multiscale_min_size: Optional[int] = None,
+    multiscale_max_size: Optional[int] = None,
+    multiscale_step: int = MULTISCALE_STEP,
+    post_mosaic: bool = False,
+) -> Callable[..., torch.Tensor]:
+    mean = rgv_values["mean"]
+    std = rgv_values["std"]
+    fill_value = [255 * v for v in mean]
+    if dynamic_size is True:
+        target_size: Optional[int] | tuple[int, int] = min(size)
+    elif max_size is not None:
+        target_size = min(size)
+    else:
+        target_size = size
+
+    if aug_type == "birder":
+        if 0 > level or level > 10:
+            raise ValueError("Unsupported aug level")
+
+        return v2.Compose(  # type: ignore
+            [
+                v2.ToImage(),
+                get_birder_augment(
+                    size,
+                    level,
+                    fill_value,
+                    dynamic_size,
+                    multiscale,
+                    max_size,
+                    multiscale_min_size,
+                    multiscale_max_size,
+                    multiscale_step,
+                    post_mosaic,
+                ),
+                v2.ToDtype(torch.float32, scale=True),
+                v2.Normalize(mean=mean, std=std),
+                v2.ToPureTensor(),
+            ]
+        )
+
+    if aug_type == "lsj":
+        return v2.Compose(  # type: ignore
+            [
+                v2.ToImage(),
+                (
+                    v2.ScaleJitter(
+                        target_size=(size[1], size[0]),  # ScaleJitter expects (width, height)
+                        scale_range=(0.1, 2),
+                        antialias=True,
+                    )
+                    if post_mosaic is False
+                    else v2.Identity()
+                ),
+                FixedSizeCrop(size, fill_value),
+                v2.RandomHorizontalFlip(0.5),
+                v2.SanitizeBoundingBoxes(),
+                v2.ToDtype(torch.float32, scale=True),
+                v2.Normalize(mean=mean, std=std),
+                v2.ToPureTensor(),
+            ]
+        )
+
+    if aug_type == "multiscale":
+        multiscale_sizes = resolve_multiscale_sizes(
+            size, multiscale_min_size, multiscale_max_size, multiscale_step=multiscale_step
+        )
+        max_size = resolve_multiscale_long_edge_size(multiscale_sizes, max_size)
+
+        return v2.Compose(  # type: ignore
+            [
+                v2.ToImage(),
+                v2.RandomShortestSize(min_size=multiscale_sizes, max_size=max_size),
+                v2.RandomHorizontalFlip(0.5),
+                v2.SanitizeBoundingBoxes(),
+                v2.ToDtype(torch.float32, scale=True),
+                v2.Normalize(mean=mean, std=std),
+                v2.ToPureTensor(),
+            ]
+        )
+
+    if aug_type == "ssd":
+        return v2.Compose(  # type: ignore
+            [
+                v2.ToImage(),
+                v2.RandomPhotometricDistort(),
+                v2.RandomZoomOut(fill_value) if post_mosaic is False else v2.Identity(),
+                v2.RandomIoUCrop() if post_mosaic is False else v2.Identity(),
+                ResizeWithRandomInterpolation(
+                    target_size, max_size, interpolation=[v2.InterpolationMode.BILINEAR, v2.InterpolationMode.BICUBIC]
+                ),
+                v2.RandomHorizontalFlip(0.5),
+                v2.SanitizeBoundingBoxes(),
+                v2.ToDtype(torch.float32, scale=True),
+                v2.Normalize(mean=mean, std=std),
+                v2.ToPureTensor(),
+            ]
+        )
+
+    if aug_type == "ssdlite":
+        return v2.Compose(  # type: ignore
+            [
+                v2.ToImage(),
+                v2.RandomIoUCrop() if post_mosaic is False else v2.Identity(),
+                ResizeWithRandomInterpolation(
+                    target_size, max_size, interpolation=[v2.InterpolationMode.BILINEAR, v2.InterpolationMode.BICUBIC]
+                ),
+                v2.RandomHorizontalFlip(0.5),
+                v2.SanitizeBoundingBoxes(),
+                v2.ToDtype(torch.float32, scale=True),
+                v2.Normalize(mean=mean, std=std),
+                v2.ToPureTensor(),
+            ]
+        )
+
+    if aug_type == "yolo":
+        return v2.Compose(  # type: ignore
+            [
+                v2.ToImage(),
+                v2.RandomPhotometricDistort(),
+                (
+                    v2.RandomAffine(
+                        degrees=10.0,
+                        translate=(0.1, 0.1),
+                        scale=(0.5, 1.5),
+                        shear=2.0,
+                        interpolation=v2.InterpolationMode.BILINEAR,
+                        fill=fill_value,
+                    )
+                    if post_mosaic is False
+                    else v2.Identity()
+                ),
+                ResizeWithRandomInterpolation(
+                    target_size, max_size, interpolation=[v2.InterpolationMode.BILINEAR, v2.InterpolationMode.BICUBIC]
+                ),
+                v2.RandomHorizontalFlip(0.5),
+                v2.SanitizeBoundingBoxes(),
+                v2.ToDtype(torch.float32, scale=True),
+                v2.Normalize(mean=mean, std=std),
+                v2.ToPureTensor(),
+            ]
+        )
+
+    if aug_type == "deim":
+        return v2.Compose(  # type: ignore
+            [
+                v2.ToImage(),
+                v2.RandomPhotometricDistort(p=0.5),
+                v2.RandomZoomOut(0) if post_mosaic is False else v2.Identity(),
+                v2.RandomApply([v2.RandomIoUCrop()], p=0.8) if post_mosaic is False else v2.Identity(),
+                v2.Resize(target_size, interpolation=v2.InterpolationMode.BILINEAR, max_size=max_size, antialias=True),
+                v2.RandomHorizontalFlip(0.5),
+                v2.SanitizeBoundingBoxes(min_size=1),
+                v2.ToDtype(torch.float32, scale=True),
+                v2.Normalize(mean=mean, std=std),
+                v2.ToPureTensor(),
+            ]
+        )
+
+    if aug_type == "detr":
+        multiscale_sizes = resolve_multiscale_sizes(
+            size, multiscale_min_size, multiscale_max_size, multiscale_step=multiscale_step
+        )
+        max_size = resolve_multiscale_long_edge_size(multiscale_sizes, max_size)
+        intermediate_sizes = resolve_detr_intermediate_sizes(size)
+
+        return v2.Compose(  # type: ignore
+            [
+                v2.ToImage(),
+                v2.RandomChoice(
+                    [
+                        v2.RandomShortestSize(min_size=multiscale_sizes, max_size=max_size),
+                        v2.Compose(
+                            [
+                                v2.RandomShortestSize(intermediate_sizes, max_size=max_size),
+                                v2.RandomIoUCrop() if post_mosaic is False else v2.Identity(),  # RandomSizeCrop
+                                v2.RandomShortestSize(min_size=multiscale_sizes, max_size=max_size),
+                            ]
+                        ),
+                    ]
+                ),
+                v2.RandomHorizontalFlip(0.5),
+                v2.SanitizeBoundingBoxes(),
+                v2.ToDtype(torch.float32, scale=True),
+                v2.Normalize(mean=mean, std=std),
+                v2.ToPureTensor(),
+            ]
+        )
+
+    if aug_type == "fixed_detr":
+        resize_sizes = resolve_detr_intermediate_sizes(size)
+        crop_min_size = round(384 * min(size) / DEFAULT_MULTISCALE_BASE_SIZE)
+        if multiscale_min_size is not None or multiscale_max_size is not None:
+            resolved_min_size = multiscale_min_size if multiscale_min_size is not None else resize_sizes[0]
+            resolved_max_size = multiscale_max_size if multiscale_max_size is not None else resize_sizes[-1]
+            resize_sizes = build_multiscale_sizes(resolved_min_size, resolved_max_size, multiscale_step=multiscale_step)
+            crop_min_size = resize_sizes[0]
+
+        crop_max_size = resize_sizes[-1]
+
+        return v2.Compose(  # type: ignore
+            [
+                v2.ToImage(),
+                v2.RandomChoice(
+                    [
+                        v2.Resize(size, interpolation=v2.InterpolationMode.BILINEAR, antialias=True),
+                        v2.Compose(
+                            [
+                                v2.RandomShortestSize(resize_sizes),
+                                RandomSizeCrop(crop_min_size, crop_max_size) if post_mosaic is False else v2.Identity(),
+                                v2.Resize(size, interpolation=v2.InterpolationMode.BILINEAR, antialias=True),
+                            ]
+                        ),
+                    ]
+                ),
+                v2.RandomHorizontalFlip(0.5),
+                v2.SanitizeBoundingBoxes(),
+                v2.ToDtype(torch.float32, scale=True),
+                v2.Normalize(mean=mean, std=std),
+                v2.ToPureTensor(),
+            ]
+        )
+
+    raise ValueError("Unsupported augmentation type")
+
+
+class InferenceTransform:
+    """
+    Create a torchvision transform pipeline for detection inference
+
+    This class builds a standardized preprocessing pipeline that converts input images
+    to tensors with proper normalization and resizing for detection model inference.
+    The pipeline handles various sizing strategies.
+
+    Parameters
+    ----------
+    size
+        Target image dimensions as (height, width). Behavior depends on other parameters:
+        - With dynamic_size=False and max_size=None: Images resized exactly to this size
+        - With dynamic_size=True: min(size) used as target for shorter edge, aspect ratio preserved
+        - With max_size specified: Ignored in favor of max_size-based scaling
+    rgv_values
+        RGB normalization statistics containing 'mean' and 'std' tuples.
+        Typically obtained from get_rgb_stats().
+    dynamic_size
+        When True, preserves aspect ratios by using min(size) as the target
+        for the shorter edge. Longer edge scales proportionally.
+        Respects max_size when specified.
+    max_size
+        Maximum allowed size for the longer edge.
+    no_resize
+        When True, skips resizing step entirely.
+    """
+
+    def __init__(
+        self,
+        size: tuple[int, int],
+        rgv_values: RGBType,
+        dynamic_size: bool = False,
+        max_size: Optional[int] = None,
+        no_resize: bool = False,
+    ):
+        mean = rgv_values["mean"]
+        std = rgv_values["std"]
+        if dynamic_size is True:
+            target_size: Optional[int] | tuple[int, int] = min(size)
+        elif max_size is not None:
+            target_size = min(size)
+        else:
+            target_size = size
+
+        if no_resize is True:
+            resize = v2.Identity()
+        else:
+            resize = v2.Resize(
+                target_size, interpolation=v2.InterpolationMode.BICUBIC, max_size=max_size, antialias=True
+            )
+
+        self.transform = v2.Compose(
+            [
+                v2.ToImage(),
+                resize,
+                v2.ToDtype(torch.float32, scale=True),
+                v2.Normalize(mean=mean, std=std),
+                v2.ToPureTensor(),
+            ]
+        )
+
+    def __call__(self, *inpt: Any, **kwargs: Any) -> Any:
+        return self.transform(*inpt, **kwargs)
+
+    @staticmethod
+    def postprocess(
+        detections: list[dict[str, torch.Tensor]], image_sizes: list[list[int]], original_image_sizes: list[list[int]]
+    ) -> list[dict[str, torch.Tensor]]:
+        for i, (detection, image_size, original_size) in enumerate(zip(detections, image_sizes, original_image_sizes)):
+            if "boxes" not in detection:
+                continue
+
+            boxes = detection["boxes"]
+
+            orig_h, orig_w = original_size
+            h_ratio = orig_h / image_size[0]
+            w_ratio = orig_w / image_size[1]
+            adjusted_boxes = boxes * torch.tensor([w_ratio, h_ratio, w_ratio, h_ratio], device=boxes.device)
+
+            detections[i]["boxes"] = adjusted_boxes
+
+        return detections

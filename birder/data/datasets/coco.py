@@ -1,0 +1,364 @@
+import logging
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+from typing import Literal
+from typing import Optional
+
+import torch
+from torchvision import tv_tensors
+from torchvision.datasets import CocoDetection
+from torchvision.datasets import wrap_dataset_for_transforms_v2
+from torchvision.transforms.v2 import functional as F
+
+from birder.common.lib import class_list_from_class_to_idx
+from birder.data.transforms.mosaic import mosaic_fixed_grid
+from birder.data.transforms.mosaic import mosaic_random_center
+
+MosaicType = Literal["fixed_grid", "random_center"]
+
+logger = logging.getLogger(__name__)
+
+
+def _remove_images_without_annotations(
+    dataset: CocoDetection, ignore_list: list[str], allow_empty: bool
+) -> CocoDetection:
+    def _has_only_empty_bbox(anno: list[dict[str, Any]]) -> bool:
+        return all(any(o <= 1 for o in obj["bbox"][2:]) for obj in anno)
+
+    def _has_valid_annotation(anno: list[dict[str, Any]]) -> bool:
+        # An intentionally empty image is a valid background sample when requested
+        if len(anno) == 0:
+            return allow_empty
+
+        # If all boxes have close to zero area, there is no annotation
+        if _has_only_empty_bbox(anno):
+            return False
+
+        return True
+
+    ids = []
+    for ds_idx, img_id in enumerate(dataset.ids):
+        img_path = dataset.coco.loadImgs(img_id)[0]["file_name"]
+        if img_path in ignore_list:
+            logger.debug(f"Ignoring {img_path}")
+            continue
+
+        ann_ids = dataset.coco.getAnnIds(imgIds=img_id, iscrowd=None)
+        anno = dataset.coco.loadAnns(ann_ids)
+        if _has_valid_annotation(anno):
+            ids.append(ds_idx)
+
+    return torch.utils.data.Subset(dataset, ids)
+
+
+def _convert_to_binary_annotations(dataset: CocoDetection) -> CocoDetection:
+    for img_id in dataset.ids:
+        ann_ids = dataset.coco.getAnnIds(imgIds=img_id, iscrowd=None)
+        anno = dataset.coco.loadAnns(ann_ids)
+        for obj in anno:
+            obj["category_id"] = 1
+
+    return dataset
+
+
+def _map_annotations_to_targets(dataset: CocoDetection, source_idx_to_target_idx: dict[int, int]) -> CocoDetection:
+    for img_id in dataset.ids:
+        ann_ids = dataset.coco.getAnnIds(imgIds=img_id, iscrowd=None)
+        anno = dataset.coco.loadAnns(ann_ids)
+        for obj in anno:
+            category_id = obj["category_id"]
+            if category_id not in source_idx_to_target_idx:
+                raise ValueError(f"Missing label mapping for category_id={category_id}")
+
+            obj["category_id"] = source_idx_to_target_idx[category_id]
+
+    return dataset
+
+
+def _normalize_coco_class_name(class_name: str) -> str:
+    return class_name.strip()
+
+
+def build_coco_category_remap(
+    categories: dict[int, Any], target_class_to_idx: Optional[dict[str, int]] = None, use_class_file_ids: bool = False
+) -> tuple[dict[str, int], dict[int, int]]:
+    """
+    Build the mapping from raw COCO category ids to Birder detector labels
+
+    There are three supported modes:
+    * No target map: build a dense 1-indexed label space from categories sorted by raw id.
+    * Class-file id mode: ignore JSON category names and interpret raw category ids as
+      positions in the class file. If category id 0 exists, ids are treated as zero-based
+      and shifted by +1 because detector label 0 is reserved for background.
+    * Target map mode: remap by category name into the provided target label space.
+    """
+
+    sorted_categories = sorted(categories.values(), key=lambda item: item["id"])
+    if target_class_to_idx is None:
+        if use_class_file_ids is True:
+            raise ValueError("use_class_file_ids requires target_class_to_idx")
+
+        target_class_to_idx = {
+            _normalize_coco_class_name(category["name"]): idx + 1 for idx, category in enumerate(sorted_categories)
+        }
+
+    source_idx_to_target_idx = {}
+    target_indices = set(target_class_to_idx.values())
+    use_zero_based_category_ids = any(category["id"] == 0 for category in sorted_categories)
+    for category in sorted_categories:
+        class_name = _normalize_coco_class_name(category["name"])
+        category_id = category["id"]
+        if use_class_file_ids is True:
+            target_idx = category_id + 1 if use_zero_based_category_ids is True else category_id
+            if target_idx not in target_indices:
+                raise ValueError(
+                    f"category_id={category_id} maps to label {target_idx}, which is not covered by the class file"
+                )
+
+        else:
+            if class_name not in target_class_to_idx:
+                raise ValueError(f"Missing target class '{class_name}' for category_id={category_id}")
+
+            target_idx = target_class_to_idx[class_name]
+
+        if target_idx == 0:
+            raise ValueError(f"Class '{class_name}' maps to background label 0")
+
+        source_idx_to_target_idx[category_id] = target_idx
+
+    return (target_class_to_idx, source_idx_to_target_idx)
+
+
+def _mapped_class_to_idx(class_to_idx: dict[str, int], label_mapping: dict[str, str]) -> dict[str, int]:
+    mapped_class_to_idx: dict[str, int] = {}
+    for class_name in class_list_from_class_to_idx(class_to_idx):
+        if class_name not in label_mapping:
+            raise ValueError(f"Missing label mapping for class '{class_name}'")
+
+        mapped_name = label_mapping[class_name]
+        if mapped_name not in mapped_class_to_idx:
+            # Give place to "background" class (always index 0)
+            mapped_class_to_idx[mapped_name] = len(mapped_class_to_idx) + 1
+
+    return mapped_class_to_idx
+
+
+def build_label_mapping_indices(
+    class_to_idx: dict[str, int], label_mapping: dict[str, str], target_class_to_idx: Optional[dict[str, int]] = None
+) -> tuple[dict[str, int], dict[int, int]]:
+    if target_class_to_idx is None:
+        target_class_to_idx = _mapped_class_to_idx(class_to_idx, label_mapping)
+
+    source_idx_to_target_idx = {}
+    for class_name, idx in class_to_idx.items():
+        if class_name not in label_mapping:
+            raise ValueError(f"Missing label mapping for class '{class_name}'")
+
+        mapped_name = label_mapping[class_name]
+        if mapped_name not in target_class_to_idx:
+            raise ValueError(f"Missing target class '{mapped_name}' for class '{class_name}'")
+
+        source_idx_to_target_idx[idx] = target_class_to_idx[mapped_name]
+
+    return (target_class_to_idx, source_idx_to_target_idx)
+
+
+class _CocoDetectionTransform:
+    """
+    Normalize empty COCO targets before applying detection transforms
+    """
+
+    def __init__(self, transforms: Optional[Callable[..., torch.Tensor]]) -> None:
+        self.transforms = transforms
+
+    def __call__(self, image: Any, target: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+        # The torchvision COCO v2 wrapper returns only {"image_id": ...} when an image has no annotations
+        # Detection transforms and models require boxes and labels to be present with their canonical empty shapes
+        if "boxes" not in target:
+            canvas_size = F.get_size(image)
+            target = {
+                **target,
+                "boxes": tv_tensors.BoundingBoxes(
+                    torch.zeros((0, 4), dtype=torch.float32),
+                    format=tv_tensors.BoundingBoxFormat.XYXY,
+                    canvas_size=canvas_size,
+                ),
+                "labels": torch.zeros((0,), dtype=torch.int64),
+            }
+
+        if self.transforms is not None:
+            image, target = self.transforms(image, target)
+
+        return (image, target)
+
+
+class CocoBase(torch.utils.data.Dataset):
+    def __init__(
+        self, root: str | Path, ann_file: str, transforms: Optional[Callable[..., torch.Tensor]] = None
+    ) -> None:
+        super().__init__()
+        dataset = CocoDetection(root, ann_file, transforms=transforms)
+        self.class_to_idx = {
+            cat["name"]: cat["id"] for cat in sorted(dataset.coco.cats.values(), key=lambda item: item["id"])
+        }
+
+        # The transforms v2 wrapper causes open files count to "leak"
+        # It seems due to the Pythonic COCO objects, maybe related to
+        # https://ppwwyyxx.com/blog/2022/Demystify-RAM-Usage-in-Multiprocess-DataLoader/
+        self.dataset = wrap_dataset_for_transforms_v2(dataset)
+
+    def __getitem__(self, index: int) -> tuple[Any, ...]:
+        raise NotImplementedError
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __repr__(self) -> str:
+        return repr(self.dataset)
+
+    def remove_images_without_annotations(self, ignore_list: list[str], allow_empty: bool = True) -> None:
+        self.dataset = _remove_images_without_annotations(self.dataset, ignore_list, allow_empty=allow_empty)
+
+    def convert_to_binary_annotations(self, class_name: str = "Object") -> None:
+        self.dataset = _convert_to_binary_annotations(self.dataset)
+        self.class_to_idx = {class_name: 1}
+
+    def convert_annotations_with_label_mapping(
+        self, label_mapping: dict[str, str], target_class_to_idx: Optional[dict[str, int]] = None
+    ) -> dict[str, int]:
+        target_class_to_idx, source_idx_to_target_idx = build_label_mapping_indices(
+            self.class_to_idx, label_mapping, target_class_to_idx=target_class_to_idx
+        )
+        self.dataset = _map_annotations_to_targets(self.dataset, source_idx_to_target_idx)
+        self.class_to_idx = target_class_to_idx
+
+        return target_class_to_idx
+
+    def normalize_annotations(
+        self, target_class_to_idx: Optional[dict[str, int]] = None, use_class_file_ids: bool = False
+    ) -> dict[str, int]:
+        target_class_to_idx, source_idx_to_target_idx = build_coco_category_remap(
+            self.dataset.coco.cats, target_class_to_idx=target_class_to_idx, use_class_file_ids=use_class_file_ids
+        )
+        if any(source_idx != target_idx for source_idx, target_idx in source_idx_to_target_idx.items()):
+            self.dataset = _map_annotations_to_targets(self.dataset, source_idx_to_target_idx)
+
+        self.class_to_idx = target_class_to_idx
+
+        return target_class_to_idx
+
+
+class CocoTraining(CocoBase):
+    def __init__(
+        self,
+        root: str | Path,
+        ann_file: str,
+        transforms: Optional[Callable[..., torch.Tensor]] = None,
+        normalize_empty_targets: bool = False,
+    ) -> None:
+        if normalize_empty_targets is True:
+            transforms = _CocoDetectionTransform(transforms)
+
+        super().__init__(root, ann_file, transforms=transforms)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, Any]:
+        sample, labels = self.dataset[index]
+        return (sample, labels)
+
+
+class CocoInference(CocoBase):
+    def __getitem__(self, index: int) -> tuple[str, torch.Tensor, Any, list[int]]:
+        coco_id = self.dataset.ids[index]
+        img_info = self.dataset.coco.loadImgs(coco_id)[0]
+        path = img_info["file_name"]
+        sample, labels = self.dataset[index]
+
+        # Get original image size (height, width) before transforms
+        orig_size = [img_info["height"], img_info["width"]]
+
+        return (path, sample, labels, orig_size)
+
+
+class CocoMosaicTraining(CocoBase):
+    def __init__(
+        self,
+        root: str | Path,
+        ann_file: str,
+        transforms: Optional[Callable[..., torch.Tensor]],
+        mosaic_transforms: Optional[Callable[..., torch.Tensor]],
+        output_size: tuple[int, int],
+        fill_value: int | tuple[int, int, int],
+        mosaic_prob: float,
+        mosaic_type: MosaicType = "fixed_grid",
+        normalize_empty_targets: bool = False,
+    ) -> None:
+        dataset_transforms = _CocoDetectionTransform(None) if normalize_empty_targets is True else None
+        super().__init__(root, ann_file, transforms=dataset_transforms)
+        self.transforms = transforms
+        self.mosaic_transforms = mosaic_transforms
+        self.output_size = output_size
+        self.fill_value = fill_value
+        self.mosaic_prob = mosaic_prob
+        self.mosaic_fn = mosaic_fixed_grid if mosaic_type == "fixed_grid" else mosaic_random_center
+        self._mosaic_base_prob: Optional[float] = None
+        self._mosaic_decay_epochs: Optional[int] = None
+        self._mosaic_decay_start: Optional[int] = None
+
+    def configure_mosaic_linear_decay(self, base_prob: float, total_epochs: int, decay_fraction: float = 0.1) -> None:
+        if total_epochs <= 0:
+            raise ValueError("total_epochs must be positive")
+        if decay_fraction <= 0.0 or decay_fraction > 1.0:
+            raise ValueError("decay_fraction must be in (0.0, 1.0]")
+
+        decay_epochs = max(1, int(total_epochs * decay_fraction))
+        self._mosaic_base_prob = base_prob
+        self._mosaic_decay_epochs = decay_epochs
+        self._mosaic_decay_start = max(1, total_epochs - decay_epochs + 1)
+
+    def update_mosaic_prob(self, epoch: int) -> None:
+        self.mosaic_prob = self.mosaic_prob_for_epoch(epoch)
+
+    @property
+    def mosaic_decay_start(self) -> Optional[int]:
+        return self._mosaic_decay_start
+
+    def mosaic_prob_for_epoch(self, epoch: int) -> float:
+        if self._mosaic_base_prob is None or self._mosaic_decay_epochs is None or self._mosaic_decay_start is None:
+            return self.mosaic_prob
+
+        if epoch >= self._mosaic_decay_start:
+            if self._mosaic_decay_epochs <= 1:
+                return 0.0
+
+            progress = (epoch - self._mosaic_decay_start) / (self._mosaic_decay_epochs - 1)
+            return max(0.0, self._mosaic_base_prob * (1 - progress))
+
+        return self._mosaic_base_prob
+
+    def __getitem__(self, index: int | tuple[int, bool]) -> tuple[torch.Tensor, Any]:
+        if isinstance(index, tuple):
+            index, should_mosaic = index
+        else:
+            should_mosaic = bool(torch.rand(()) < self.mosaic_prob)
+
+        if should_mosaic is True:
+            indices = [index] + torch.randint(len(self), (3,)).tolist()
+            images = []
+            targets = []
+            for idx in indices:
+                img, target = self.dataset[idx]
+                images.append(img)
+                targets.append(target)
+
+            img, target = self.mosaic_fn(images, targets, self.output_size, self.fill_value)
+            if self.mosaic_transforms is not None:
+                img, target = self.mosaic_transforms(img, target)
+
+        else:
+            img, target = self.dataset[index]
+
+            if self.transforms is not None:
+                img, target = self.transforms(img, target)
+
+        return (img, target)

@@ -1,0 +1,447 @@
+import json
+import logging
+from collections import Counter
+from typing import Any
+from typing import Literal
+from typing import Optional
+
+import numpy as np
+import numpy.typing as npt
+import polars as pl
+import torch
+from rich.console import Console
+from rich.table import Table
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
+
+from birder.common.lib import class_list_from_class_to_idx
+from birder.conf import settings
+
+logger = logging.getLogger(__name__)
+
+MetricsType = dict[str, Any]
+
+
+def pairwise_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
+    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
+
+    width_height = torch.min(boxes1[:, None, 2:], boxes2[:, 2:]) - torch.max(boxes1[:, None, :2], boxes2[:, :2])
+
+    width_height.clamp_(min=0)
+    inter = width_height.prod(dim=2)
+    iou = torch.where(
+        inter > 0,
+        inter / (area1[:, None] + area2 - inter + 1e-8),
+        torch.zeros(1, dtype=inter.dtype, device=inter.device),
+    )
+
+    return iou
+
+
+class Results:
+    """
+    Detection result analysis class
+    """
+
+    def __init__(
+        self,
+        sample_paths: list[str],
+        targets: list[dict[str, Any]],
+        detections: list[dict[str, torch.Tensor]],
+        class_to_idx: dict[str, int],
+        max_detection_thresholds: Optional[list[int]] = None,
+    ):
+        assert len(sample_paths) == len(targets)
+        assert len(sample_paths) == len(detections)
+
+        detections = [{k: v.cpu() for k, v in detection.items()} for detection in detections]
+        targets = [{k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
+        for target in targets:
+            if "image_id" in target:
+                del target["image_id"]
+
+            # TorchMetrics requires empty targets to include correctly shaped tensors
+            if "boxes" not in target:
+                target["boxes"] = torch.empty((0, 4), dtype=torch.float, device=torch.device("cpu"))
+                target["labels"] = torch.tensor([], dtype=torch.int64, device=torch.device("cpu"))
+
+        if max_detection_thresholds is None:
+            max_detection_thresholds = list(settings.MAX_DETECTIONS)
+
+        if max_detection_thresholds != sorted(max_detection_thresholds):
+            raise ValueError("max_detection_thresholds must be sorted in ascending order")
+
+        max_detections = max_detection_thresholds[-1]
+        mar_per_class_key = f"mar_{max_detections}_per_class"
+        metrics = MeanAveragePrecision(
+            box_format="xyxy",
+            iou_type="bbox",
+            max_detection_thresholds=max_detection_thresholds,
+            class_metrics=True,
+            extended_summary=True,
+            average="macro",
+            backend="faster_coco_eval",
+        )
+        metrics(detections, targets)
+        metrics_dict = metrics.compute()
+
+        self._iou_thresholds = metrics.iou_thresholds
+        self._max_detection_thresholds = max_detection_thresholds
+        self._max_detections = max_detections
+        self._mar_key = f"mar_{max_detections}"
+        self._mar_per_class_key = mar_per_class_key
+        self._class_to_idx = class_to_idx
+        self._label_names = ["Background", *class_list_from_class_to_idx(class_to_idx)]
+        self._detections = detections
+        self._targets = targets
+        self._sample_paths = sample_paths
+
+        # metrics_dict types:
+        # {
+        #     "map": float,
+        #     "map_50": float,
+        #     "map_75": float,
+        #     "map_small": float,
+        #     "map_medium": float,
+        #     "map_large": float,
+        #     "mar_1": float,
+        #     "mar_10": float,
+        #     "mar_100": float,
+        #     "mar_small": float,
+        #     "mar_medium": float,
+        #     "mar_large": float,
+        #     "ious": dict[tuple[int, int], torch.Tensor],
+        #     "precision": torch.Tensor,
+        #     "recall": torch.Tensor,
+        #     "scores": torch.Tensor,
+        #     "map_per_class": list[float],
+        #     "mar_100_per_class": list[float],
+        #     "classes": list[int],
+        # }
+
+        self.metrics_dict: MetricsType = {
+            "map": metrics_dict["map"].item(),
+            "map_50": metrics_dict["map_50"].item(),
+            "map_75": metrics_dict["map_75"].item(),
+            "map_small": metrics_dict["map_small"].item(),
+            "map_medium": metrics_dict["map_medium"].item(),
+            "map_large": metrics_dict["map_large"].item(),
+        }
+        for threshold in max_detection_thresholds:
+            mar_key = f"mar_{threshold}"
+            self.metrics_dict[mar_key] = metrics_dict[mar_key].item()
+
+        self.metrics_dict.update(
+            {
+                "mar_small": metrics_dict["mar_small"].item(),
+                "mar_medium": metrics_dict["mar_medium"].item(),
+                "mar_large": metrics_dict["mar_large"].item(),
+                "ious": metrics_dict["ious"],
+                "precision": metrics_dict["precision"],
+                "recall": metrics_dict["recall"],
+                "scores": metrics_dict["scores"],
+                "map_per_class": torch.atleast_1d(metrics_dict["map_per_class"]).tolist(),
+                mar_per_class_key: torch.atleast_1d(metrics_dict[mar_per_class_key]).tolist(),
+                "classes": torch.atleast_1d(metrics_dict["classes"]).tolist(),
+            }
+        )
+
+    def __len__(self) -> int:
+        return len(self._sample_paths)
+
+    def __repr__(self) -> str:
+        head = self.__class__.__name__
+        body = [
+            f"Number of samples: {len(self)}",
+        ]
+        body.append(f"mAP: {self.map:.4f}")
+
+        lines = [head] + ["    " + line for line in body]
+
+        return "\n".join(lines)
+
+    @property
+    def label_names(self) -> list[str]:
+        return self._label_names
+
+    @property
+    def max_detection_thresholds(self) -> list[int]:
+        return self._max_detection_thresholds
+
+    @property
+    def max_detections(self) -> int:
+        return self._max_detections
+
+    @property
+    def mar_key(self) -> str:
+        return self._mar_key
+
+    @property
+    def mar_per_class_key(self) -> str:
+        return self._mar_per_class_key
+
+    @property
+    def map(self) -> float:
+        return self.metrics_dict["map"]  # type: ignore[no-any-return]
+
+    def confusion_matrix(self, score_threshold: float = 0.5, iou_threshold: float = 0.5) -> npt.NDArray[np.int_]:
+        """
+        Compute the confusion matrix for detections using greedy IoU matching
+
+        Parameters
+        ----------
+        score_threshold
+            Detection score threshold to keep predictions.
+        iou_threshold
+            IoU threshold to consider a match as positive.
+        """
+
+        num_classes = len(self._label_names)
+        cnf_matrix = np.zeros((num_classes, num_classes), dtype=np.int_)
+
+        for detection, target in zip(self._detections, self._targets):
+            scores = detection["scores"]
+            keep = scores >= score_threshold
+            det_boxes = detection["boxes"][keep]
+            det_labels = detection["labels"][keep]
+
+            tgt_boxes = target["boxes"]
+            tgt_labels = target["labels"]
+
+            det_matched = torch.zeros(det_boxes.size(0), dtype=torch.bool)
+            tgt_matched = torch.zeros(tgt_boxes.size(0), dtype=torch.bool)
+
+            if det_boxes.numel() > 0 and tgt_boxes.numel() > 0:
+                iou = pairwise_iou(det_boxes, tgt_boxes)
+                iou_flat = iou.view(-1)
+                sorted_idx = torch.argsort(iou_flat, descending=True)
+                num_tgt = tgt_boxes.size(0)
+
+                for flat_idx in sorted_idx:
+                    if iou_flat[flat_idx].item() < iou_threshold:
+                        break
+
+                    det_idx = int(flat_idx // num_tgt)
+                    tgt_idx = int(flat_idx % num_tgt)
+                    if det_matched[det_idx].item() is True or tgt_matched[tgt_idx].item() is True:
+                        continue
+
+                    det_matched[det_idx] = True
+                    tgt_matched[tgt_idx] = True
+
+                    tgt_label = int(tgt_labels[tgt_idx].item())
+                    det_label = int(det_labels[det_idx].item())
+                    cnf_matrix[tgt_label, det_label] += 1
+
+            if tgt_boxes.numel() > 0:
+                for tgt_idx in torch.where(~tgt_matched)[0]:
+                    tgt_label = int(tgt_labels[tgt_idx].item())
+                    cnf_matrix[tgt_label, 0] += 1
+
+            if det_boxes.numel() > 0:
+                for det_idx in torch.where(~det_matched)[0]:
+                    det_label = int(det_labels[det_idx].item())
+                    cnf_matrix[0, det_label] += 1
+
+        return cnf_matrix
+
+    def most_confused_pairs(
+        self, n: int = 10, score_threshold: float = 0.5, iou_threshold: float = 0.5
+    ) -> pl.DataFrame:
+        cnf_matrix = self.confusion_matrix(score_threshold=score_threshold, iou_threshold=iou_threshold)
+        np.fill_diagonal(cnf_matrix, -1)
+        top_indices = np.argsort(cnf_matrix.ravel())[-n:][::-1]
+
+        data = []
+        for flat_idx in top_indices:
+            idx = np.unravel_index(flat_idx, cnf_matrix.shape)
+            if cnf_matrix[idx] == 0:
+                break
+
+            data.append(
+                {
+                    "predicted": self._label_names[idx[1]],
+                    "actual": self._label_names[idx[0]],
+                    "amount": cnf_matrix[idx],
+                    "reverse": cnf_matrix[idx[::-1]],
+                }
+            )
+
+        return pl.DataFrame(data)
+
+    def detailed_report(self) -> pl.DataFrame:
+        """
+        Returns a detailed detection report with per-class metrics
+        """
+
+        object_count: Counter[int] = Counter()
+        for t in self._targets:
+            object_count.update(t["labels"].tolist())
+
+        row_list = []
+        for class_num, mean_ap in zip(self.metrics_dict["classes"], self.metrics_dict["map_per_class"]):
+            if mean_ap < 0:
+                continue
+
+            row_list.append(
+                {
+                    "Class": class_num,
+                    "Class name": self._label_names[class_num],
+                    "mAP": mean_ap,
+                    "Objects": object_count[class_num],
+                }
+            )
+
+        return pl.DataFrame(row_list)
+
+    def log_short_report(self) -> None:
+        """
+        Log using the Python logging module a short metrics summary
+        """
+
+        report_df = self.detailed_report()
+        total_objects = report_df["Objects"].sum()
+        lowest_map = report_df[report_df["mAP"].arg_min()]  # type: ignore[index]
+        highest_map = report_df[report_df["mAP"].arg_max()]  # type: ignore[index]
+
+        logger.info(
+            f"mAP {self.map:.4f} "
+            f"(mAP@0.50 {self.metrics_dict['map_50']:.4f}, mAP@0.75 {self.metrics_dict['map_75']:.4f}) "
+            f"on {len(self)} images with {total_objects} objects"
+        )
+        logger.info(f"Lowest mAP {lowest_map['mAP'][0]:.4f} for '{lowest_map['Class name'][0]}'")
+        logger.info(f"Highest mAP {highest_map['mAP'][0]:.4f} for '{highest_map['Class name'][0]}'")
+
+    def pretty_print(
+        self,
+        sort_by: Literal["class", "map"] = "class",
+        order: Literal["ascending", "descending"] = "ascending",
+        n: Optional[int] = None,
+    ) -> None:
+        console = Console()
+
+        table = Table(show_header=True, header_style="bold dark_magenta")
+        table.add_column("Class")
+        table.add_column("Class name", style="dim")
+        table.add_column("mAP", justify="right")
+        table.add_column("Objects", justify="right")
+
+        report_df = self.detailed_report()
+        total_objects = report_df["Objects"].sum()
+        if sort_by == "map":
+            sort_column = "mAP"
+        else:
+            sort_column = sort_by.capitalize()
+
+        report_df = report_df.sort(sort_column, descending=order == "descending")
+        if n is not None:
+            report_df = report_df[:n]
+
+        for row in report_df.iter_rows(named=True):
+            map_msg = f"{row['mAP']:.4f}"
+            if row["mAP"] < 0.4:
+                map_msg = "[red1]" + map_msg + "[/red1]"
+            elif row["mAP"] < 0.5:
+                map_msg = "[dark_orange]" + map_msg + "[/dark_orange]"
+
+            table.add_row(
+                f"{row['Class']}",
+                row["Class name"],
+                map_msg,
+                f"{row['Objects']}",
+            )
+
+        console.print(table)
+
+        summary_table = Table(title="Results", show_header=True, header_style="bold dark_magenta")
+        summary_table.add_column("Metric")
+        summary_table.add_column("Value", justify="right")
+        summary_table.add_row("mAP", f"{self.map:.4f}")
+        summary_table.add_row("mAP@0.50", f"{self.metrics_dict['map_50']:.4f}")
+        summary_table.add_row("mAP@0.75", f"{self.metrics_dict['map_75']:.4f}")
+        summary_table.add_row("mAP small", f"{self.metrics_dict['map_small']:.4f}")
+        summary_table.add_row("mAP medium", f"{self.metrics_dict['map_medium']:.4f}")
+        summary_table.add_row("mAP large", f"{self.metrics_dict['map_large']:.4f}")
+        for max_detections in self.max_detection_thresholds:
+            summary_table.add_row(f"mAR@{max_detections}", f"{self.metrics_dict[f'mar_{max_detections}']:.4f}")
+
+        summary_table.add_row("mAR small", f"{self.metrics_dict['mar_small']:.4f}")
+        summary_table.add_row("mAR medium", f"{self.metrics_dict['mar_medium']:.4f}")
+        summary_table.add_row("mAR large", f"{self.metrics_dict['mar_large']:.4f}")
+        summary_table.add_row("Samples", f"{len(self)}")
+        summary_table.add_row("Objects", f"{total_objects}")
+
+        console.print(summary_table)
+
+    def save(self, name: str) -> None:
+        """
+        Save results object to file
+
+        Parameters
+        ----------
+        name
+            output file name.
+        """
+
+        detections = [{k: v.tolist() for k, v in detection.items()} for detection in self._detections]
+        targets = [{k: v.tolist() for k, v in target.items()} for target in self._targets]
+        output = dict(zip(self._sample_paths, detections))
+        output["targets"] = dict(zip(self._sample_paths, targets))
+        output["class_to_idx"] = self._class_to_idx
+
+        if settings.RESULTS_DIR.exists() is False:
+            logger.info(f"Creating {settings.RESULTS_DIR} directory...")
+            settings.RESULTS_DIR.mkdir(parents=True)
+
+        results_path = settings.RESULTS_DIR.joinpath(name)
+        logger.info(f"Saving results at {results_path}")
+
+        with open(results_path, "w", encoding="utf-8") as handle:
+            json.dump(output, handle, indent=2)
+
+    @staticmethod
+    def load(path: str, max_detection_thresholds: Optional[list[int]] = None) -> "Results":
+        """
+        Load results object from file
+
+        Parameters
+        ----------
+        path
+            path to load from.
+        max_detection_thresholds
+            COCO max detection thresholds for result metrics.
+        """
+
+        # Read label names
+        with open(path, "r", encoding="utf-8") as handle:
+            data: dict[str, Any] = json.load(handle)
+
+        targets = data.pop("targets")
+        class_to_idx = data.pop("class_to_idx")
+
+        tensor_dtypes = {
+            "boxes": torch.float32,
+            "scores": torch.float32,
+            "labels": torch.int64,
+            "area": torch.float32,
+            "iscrowd": torch.int64,
+        }
+
+        def tensor_from_json(key: str, value: Any) -> torch.Tensor:
+            tensor = torch.tensor(value, dtype=tensor_dtypes.get(key))
+            if key == "boxes":
+                tensor = tensor.reshape((-1, 4))
+
+            return tensor
+
+        sample_paths = list(data.keys())
+        detections = [{k: tensor_from_json(k, v) for k, v in detection.items()} for detection in data.values()]
+        targets = [{k: tensor_from_json(k, v) for k, v in target.items()} for target in targets.values()]
+
+        return Results(
+            sample_paths,
+            targets,
+            detections,
+            class_to_idx=class_to_idx,
+            max_detection_thresholds=max_detection_thresholds,
+        )

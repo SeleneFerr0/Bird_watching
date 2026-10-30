@@ -1,0 +1,881 @@
+import argparse
+import json
+import logging
+from pathlib import Path
+from typing import Any
+from typing import Optional
+
+import onnx
+import onnx.checker
+import torch
+import torch.onnx
+from torch.utils.mobile_optimizer import optimize_for_mobile
+
+from birder.common import cli
+from birder.common import fs_ops
+from birder.common import lib
+from birder.data.transforms.classification import RGBType
+from birder.model_registry import Task
+from birder.model_registry import registry
+from birder.net.base import DetectorBackbone
+from birder.net.base import SignatureType
+from birder.net.base import reparameterize_available
+from birder.net.detection.base import DetectionSignatureType
+from birder.version import __version__
+
+try:
+    import onnxsim
+
+    _HAS_ONNXSIM = True
+except ImportError:
+    _HAS_ONNXSIM = False
+
+try:
+    import torch_tensorrt
+    import torch_tensorrt.dynamo
+
+    _HAS_TORCH_TENSORRT = True
+except (ImportError, RuntimeError):
+    _HAS_TORCH_TENSORRT = False
+
+try:
+    from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
+    from executorch.exir import to_edge_transform_and_lower
+
+    _HAS_EXECUTORCH = True
+except ImportError:
+    _HAS_EXECUTORCH = False
+
+logger = logging.getLogger(__name__)
+
+
+def reparameterize(
+    net: torch.nn.Module,
+    signature: SignatureType | DetectionSignatureType,
+    class_to_idx: dict[str, int],
+    rgb_stats: RGBType,
+    epoch: int,
+    network_name: str,
+    custom_config: Optional[dict[str, Any]],
+    backbone_custom_config: Optional[dict[str, Any]],
+) -> None:
+    if reparameterize_available(net) is False:
+        logger.error("Reparameterize not supported for this network")
+        raise SystemExit(1)
+
+    net.reparameterize_model()
+    fs_ops.checkpoint_model(
+        network_name,
+        epoch,
+        net,
+        signature=signature,
+        class_to_idx=class_to_idx,
+        rgb_stats=rgb_stats,
+        optimizer=None,
+        scheduler=None,
+        scaler=None,
+        model_base=None,
+        external_config=custom_config,
+        external_backbone_config=backbone_custom_config,
+    )
+
+
+def _pt2_export_input(
+    net: torch.nn.Module,
+    signature: SignatureType | DetectionSignatureType,
+    device: torch.device,
+    *,
+    dtype: torch.dtype = torch.float32,
+    dynamic_batch: bool = False,
+    dynamic_size: bool = False,
+    trace_size: Optional[tuple[int, int]] = None,
+    max_batch_size: Optional[int] = None,
+    max_size: Optional[tuple[int, int]] = None,
+) -> tuple[torch.Tensor, Optional[dict[str, Any]]]:
+    input_shape = signature["inputs"][0]["data_shape"]
+    if trace_size is None:
+        trace_size = (input_shape[2], input_shape[3])
+
+    dynamic_shapes = None
+    if net.task == Task.OBJECT_DETECTION:
+        logger.info("Exporting with constant batch size of 1")
+        signature["inputs"][0]["data_shape"][0] = 1  # Set batch size
+        batch_size = 1
+        if dynamic_size is True:
+            logger.info("Exporting with dynamic H x W")
+            if max_size is not None:
+                height_dim = 16 * torch.export.Dim("height_tokens", min=1, max=max_size[0] // 16)
+                width_dim = 16 * torch.export.Dim("width_tokens", min=1, max=max_size[1] // 16)
+            else:
+                height_dim = 16 * torch.export.Dim("height_tokens", min=1)
+                width_dim = 16 * torch.export.Dim("width_tokens", min=1)
+
+            net.set_dynamic_size()
+            dynamic_shapes = {"x": {2: height_dim, 3: width_dim}}
+    else:
+        if dynamic_batch is True:
+            logger.info("Exporting with dynamic batch size")
+            signature["inputs"][0]["data_shape"][0] = 2  # Set batch size
+            batch_size = 2
+            if max_batch_size is None:
+                batch_dim = torch.export.Dim.DYNAMIC
+            else:
+                batch_dim = torch.export.Dim("batch", min=1, max=max_batch_size)
+
+            dynamic_shapes = {"x": {0: batch_dim}}
+        else:
+            logger.info("Exporting with constant batch size of 1")
+            signature["inputs"][0]["data_shape"][0] = 1
+            batch_size = 1
+
+        if dynamic_size is True:
+            logger.info("Exporting with dynamic H x W")
+            net.set_dynamic_size()
+            if max_size is None:
+                height_dim = torch.export.Dim.DYNAMIC
+                width_dim = torch.export.Dim.DYNAMIC
+            else:
+                height_dim = torch.export.Dim.DYNAMIC(max=max_size[0])
+                width_dim = torch.export.Dim.DYNAMIC(max=max_size[1])
+
+            if dynamic_shapes is None:
+                dynamic_shapes = {"x": {}}
+
+            dynamic_shapes["x"][2] = height_dim
+            dynamic_shapes["x"][3] = width_dim
+
+    sample_shape = [batch_size, input_shape[1], trace_size[0], trace_size[1]]
+
+    return (torch.randn(*sample_shape, device=device, dtype=dtype), dynamic_shapes)
+
+
+def pt2_export(
+    net: torch.nn.Module,
+    signature: SignatureType | DetectionSignatureType,
+    class_to_idx: dict[str, int],
+    rgb_stats: RGBType,
+    device: torch.device,
+    model_path: str | Path,
+    *,
+    dtype: torch.dtype,
+    dynamic_batch: bool,
+    dynamic_size: bool,
+    trace_size: Optional[tuple[int, int]],
+) -> None:
+    sample_input, dynamic_shapes = _pt2_export_input(
+        net,
+        signature,
+        device,
+        dtype=dtype,
+        dynamic_batch=dynamic_batch,
+        dynamic_size=dynamic_size,
+        trace_size=trace_size,
+    )
+
+    with torch.no_grad():
+        exported_net = torch.export.export(net, (sample_input,), dynamic_shapes=dynamic_shapes, strict=True)
+        exported_net = exported_net.run_decompositions(decomp_table={})
+
+    fs_ops.save_pt2(exported_net, model_path, net.task, class_to_idx, signature, rgb_stats)
+
+
+def pte_export(
+    net: torch.nn.Module,
+    signature: SignatureType | DetectionSignatureType,
+    class_to_idx: dict[str, int],
+    rgb_stats: RGBType,
+    device: torch.device,
+    model_path: str | Path,
+    *,
+    dynamic_batch: bool,
+    dynamic_size: bool,
+    trace_size: Optional[tuple[int, int]],
+    max_batch_size: Optional[int] = None,
+    max_size: Optional[tuple[int, int]] = None,
+) -> None:
+    assert _HAS_EXECUTORCH, "'pip install executorch' to use --pte"
+    if dynamic_batch is True and max_batch_size is None:
+        raise cli.ValidationError("--pte --dynamic-batch requires --max-batch-size")
+    if dynamic_size is True and max_size is None:
+        raise cli.ValidationError("--pte --dynamic-size requires --max-size")
+
+    sample_input, dynamic_shapes = _pt2_export_input(
+        net,
+        signature,
+        device,
+        dynamic_batch=dynamic_batch,
+        dynamic_size=dynamic_size,
+        trace_size=trace_size,
+        max_batch_size=max_batch_size,
+        max_size=max_size,
+    )
+    metadata = {
+        "birder_version": __version__,
+        "task": net.task,
+        "class_to_idx": class_to_idx,
+        "signature": signature,
+        "rgb_stats": rgb_stats,
+    }
+
+    with torch.no_grad():
+        exported_net = torch.export.export(net, (sample_input,), dynamic_shapes=dynamic_shapes, strict=True)
+        edge_program = to_edge_transform_and_lower(
+            exported_net,
+            partitioner=[XnnpackPartitioner()],
+            constant_methods={"get_metadata": json.dumps(metadata)},
+        )
+        executorch_program = edge_program.to_executorch()
+
+    with open(model_path, "wb") as handle:
+        handle.write(executorch_program.buffer)
+
+    with open(f"{model_path}_metadata.json", "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2)
+
+
+def trt_export(
+    net: torch.nn.Module,
+    signature: SignatureType | DetectionSignatureType,
+    class_to_idx: dict[str, int],
+    rgb_stats: RGBType,
+    model_path: str | Path,
+    *,
+    dynamic_batch: bool,
+    dynamic_size: bool,
+    trace_size: Optional[tuple[int, int]],
+    require_full_compilation: bool,
+) -> None:
+    assert _HAS_TORCH_TENSORRT, "'pip install torch-tensorrt' to use --trt"
+
+    device = torch.device("cuda")
+    net.to(device)
+    sample_input, dynamic_shapes = _pt2_export_input(
+        net, signature, device, dynamic_batch=dynamic_batch, dynamic_size=dynamic_size, trace_size=trace_size
+    )
+
+    compile_kwargs: dict[str, Any] = {"require_full_compilation": require_full_compilation}
+
+    with torch.no_grad():
+        exported_net = torch.export.export(net, (sample_input,), dynamic_shapes=dynamic_shapes, strict=True)
+        exported_net = exported_net.run_decompositions(decomp_table={})
+        trt_net = torch_tensorrt.dynamo.compile(exported_net, (sample_input,), **compile_kwargs)
+
+    torch_tensorrt.save(
+        trt_net,
+        str(model_path),
+        output_format="exported_program",
+        arg_inputs=[sample_input],
+        dynamic_shapes=dynamic_shapes,
+        extra_files={
+            "birder_version": __version__,
+            "task": net.task,
+            "class_to_idx": json.dumps(class_to_idx),
+            "signature": json.dumps(signature),
+            "rgb_stats": json.dumps(rgb_stats),
+        },
+    )
+
+
+def onnx_export(
+    net: torch.nn.Module,
+    signature: SignatureType | DetectionSignatureType,
+    class_to_idx: dict[str, int],
+    rgb_stats: RGBType,
+    model_path: str | Path,
+    dtype: torch.dtype,
+    dynamic_size: bool,
+    trace_size: Optional[tuple[int, int]],
+    opset: int,
+    optimize: bool,
+    simplify: bool,
+) -> None:
+    signature["inputs"][0]["data_shape"][0] = 1  # Set batch size
+    input_shape = signature["inputs"][0]["data_shape"]
+    if trace_size is None:
+        trace_size = (input_shape[2], input_shape[3])
+
+    sample_shape = [1, input_shape[1], trace_size[0], trace_size[1]]
+
+    dynamic_shapes = None
+    if net.task == Task.OBJECT_DETECTION:
+        logger.info("Exporting with constant batch size of 1")
+        output_names = ["boxes", "scores", "labels"]
+        if dynamic_size is True:
+            logger.info("Exporting with dynamic H x W")
+            net.set_dynamic_size()
+            height_dim = 16 * torch.export.Dim("height_tokens", min=1)
+            width_dim = 16 * torch.export.Dim("width_tokens", min=1)
+            dynamic_shapes = {"x": {2: height_dim, 3: width_dim}}
+    else:
+        logger.info("Exporting with dynamic batch size")
+        output_names = ["output"]
+        batch_dim = torch.export.Dim.DYNAMIC
+        dynamic_shapes = {"x": {0: batch_dim}}
+        if dynamic_size is True:
+            logger.info("Exporting with dynamic H x W")
+            net.set_dynamic_size()
+            height_dim = torch.export.Dim.DYNAMIC
+            width_dim = torch.export.Dim.DYNAMIC
+            dynamic_shapes["x"][2] = height_dim
+            dynamic_shapes["x"][3] = width_dim
+
+    with torch.no_grad():
+        torch.onnx.export(
+            net,
+            torch.randn(sample_shape, dtype=dtype),
+            str(model_path),
+            export_params=True,
+            opset_version=opset,
+            input_names=["x"],
+            output_names=output_names,
+            dynamic_shapes=dynamic_shapes,
+            dynamo=True,
+            optimize=optimize,
+            external_data=False,
+        )
+
+    signature["inputs"][0]["data_shape"][0] = 0
+
+    logger.info("Saving model metadata json...")
+    with open(f"{model_path}_metadata.json", "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "birder_version": __version__,
+                "task": net.task,
+                "class_to_idx": class_to_idx,
+                "signature": signature,
+                "rgb_stats": rgb_stats,
+            },
+            handle,
+            indent=2,
+        )
+
+    if simplify is True:
+        # Simplify exported model
+        assert _HAS_ONNXSIM, "'pip install onnxsim onnxruntime' to use --simplify"
+        logger.info("Running ONNX-Simplifier...")
+        onnx_model, check = onnxsim.simplify(str(model_path))
+        if check is True:
+            logger.info("ONNX simplified successfully, overwriting model")
+            onnx.save(onnx_model, str(model_path))
+        else:
+            logger.warning("ONNX simplification failed, retaining original model")
+
+    # Test exported model
+    onnx_model = onnx.load(str(model_path))
+    onnx.checker.check_model(onnx_model, full_check=True)
+
+
+def config_export(
+    net: torch.nn.Module, signature: SignatureType | DetectionSignatureType, rgb_stats: RGBType, model_path: str | Path
+) -> None:
+    model_config = lib.get_network_config(net, signature, rgb_stats)
+    logger.info("Saving model config json...")
+    with open(f"{model_path}_config.json", "w", encoding="utf-8") as handle:
+        json.dump(model_config, handle, indent=2)
+
+
+def set_parser(subparsers: Any) -> None:
+    subparser = subparsers.add_parser(
+        "convert-model",
+        allow_abbrev=False,
+        help="convert PyTorch model to various formats",
+        description="convert PyTorch model to various formats",
+        epilog=(
+            "Usage examples:\n"
+            "python -m birder.tools convert-model --network shufflenet_v2_2_0 --epoch 200 --pts\n"
+            "python -m birder.tools convert-model --network squeezenet --epoch 100 --onnx\n"
+            "python -m birder.tools convert-model -n mobilevit_v2_1_5 -t intermediate -e 80 --pt2\n"
+            "python -m birder.tools convert-model -n efficientnet_v2_s -e 100 --trt --trt-full\n"
+            "python -m birder.tools convert-model -n efficientnet_v2_m -e 0 --lite\n"
+            "python -m birder.tools convert-model -n resnet_v1_50 -e 0 "
+            "--input-channels 1 --rgb-mean 0.45 --rgb-std 0.225\n"
+            "python -m birder.tools convert-model --network faster_rcnn --backbone resnext_101 -e 0 --pts\n"
+        ),
+        formatter_class=cli.ArgumentHelpFormatter,
+    )
+    subparser.add_argument(
+        "-n", "--network", type=str, required=True, help="the neural network to load (i.e. resnet_v2_50)"
+    )
+    subparser.add_argument(
+        "--model-config",
+        action=cli.FlexibleDictAction,
+        help=(
+            "override the model default configuration, accepts key-value pairs or JSON "
+            "('drop_path_rate=0.2' or '{\"units\": [3, 24, 36, 3], \"dropout\": 0.2}'"
+        ),
+    )
+    subparser.add_argument("--backbone", type=str, help="the neural network to used as backbone")
+    subparser.add_argument(
+        "--backbone-model-config",
+        action=cli.FlexibleDictAction,
+        help=(
+            "override the backbone default configuration, accepts key-value pairs or JSON "
+            "('drop_path_rate=0.2' or '{\"units\": [3, 24, 36, 3], \"dropout\": 0.2}'"
+        ),
+    )
+    subparser.add_argument("--backbone-tag", type=str, help="backbone training log tag (loading only)")
+    subparser.add_argument(
+        "--backbone-reparameterized", default=False, action="store_true", help="load reparameterized backbone"
+    )
+    subparser.add_argument("-e", "--epoch", type=int, metavar="N", help="model checkpoint to load")
+    subparser.add_argument("-t", "--tag", type=str, help="model tag (from the training phase)")
+    subparser.add_argument(
+        "-r", "--reparameterized", default=False, action="store_true", help="load reparameterized model"
+    )
+    subparser.add_argument(
+        "--trace",
+        default=False,
+        action="store_true",
+        help="trace instead of script (applies only to TorchScript conversions)",
+    )
+    subparser.add_argument(
+        "--dynamic-batch",
+        action="store_true",
+        help="export with dynamic batch size (classification --pt2, --pte and --trt)",
+    )
+    subparser.add_argument(
+        "--max-batch-size",
+        type=int,
+        metavar="N",
+        help="upper batch-size bound for --pte --dynamic-batch",
+    )
+    subparser.add_argument(
+        "--dynamic-size",
+        default=False,
+        action="store_true",
+        help="export with dynamic input H/W (applies to --pt2, --pte, --trt and --onnx)",
+    )
+    subparser.add_argument(
+        "--trace-size",
+        type=int,
+        nargs="+",
+        metavar=("H", "W"),
+        help="sample H/W used for export tracing, does not resize the model",
+    )
+    subparser.add_argument(
+        "--max-size", type=int, nargs="+", metavar=("H", "W"), help="upper H/W bounds for --pte --dynamic-size"
+    )
+    subparser.add_argument(
+        "--rgb-mean",
+        type=float,
+        nargs="+",
+        metavar=("R", "G"),
+        help="normalization mean values, one per channel (applies only to --input-channels)",
+    )
+    subparser.add_argument(
+        "--rgb-std",
+        type=float,
+        nargs="+",
+        metavar=("R", "G"),
+        help="normalization std values, one per channel (applies only to --input-channels)",
+    )
+    subparser.add_argument("--opset", type=int, default=20, help="ONNX opset version (applies only to --onnx)")
+    subparser.add_argument(
+        "--optimize", default=False, action="store_true", help="enable ONNX optimization (applies only to --onnx)"
+    )
+    subparser.add_argument(
+        "--simplify", default=False, action="store_true", help="enable ONNX simplification (applies only to --onnx)"
+    )
+    subparser.add_argument(
+        "--trt-full",
+        default=False,
+        action="store_true",
+        help="require full Torch-TensorRT compilation with no PyTorch fallback",
+    )
+    subparser.add_argument("-f", "--force", action="store_true", help="override existing model")
+    subparser.add_argument(
+        "--export-dtype",
+        choices=["float32", "float16", "bfloat16"],
+        default="float32",
+        help="floating-point dtype to save in the exported model",
+    )
+
+    format_group = subparser.add_mutually_exclusive_group(required=True)
+    format_group.add_argument("--resize", type=int, nargs="+", metavar=("H", "W"), help="resize model (pt)")
+    format_group.add_argument("--resize-patch", type=int, help="resize model flexivit style model patch size (pt)")
+    format_group.add_argument(
+        "--input-channels", type=int, metavar="N", help="adapt model input channels, e.g. 1 for grayscale (pt)"
+    )
+    format_group.add_argument(
+        "--add-config", action=cli.FlexibleDictAction, help=("add custom configuration to existing model (pt)")
+    )
+    format_group.add_argument(
+        "--add-backbone-config",
+        action=cli.FlexibleDictAction,
+        help=("add custom configuration to existing model's backbone (pt)"),
+    )
+    format_group.add_argument("--reparameterize", default=False, action="store_true", help="reparameterize model")
+    format_group.add_argument("--pts", default=False, action="store_true", help="convert to TorchScript model")
+    format_group.add_argument(
+        "--lite", default=False, action="store_true", help="convert to lite TorchScript interpreter version model"
+    )
+    format_group.add_argument(
+        "--pt2", default=False, action="store_true", help="convert to standardized model representation"
+    )
+    format_group.add_argument("--pte", default=False, action="store_true", help="convert to ExecuTorch PTE format")
+    format_group.add_argument(
+        "--trt", "--tensorrt", default=False, action="store_true", help="convert to Torch-TensorRT PT2 format"
+    )
+    format_group.add_argument(
+        "--st", "--safetensors", default=False, action="store_true", help="convert to Safetensors"
+    )
+    format_group.add_argument("--onnx", default=False, action="store_true", help="convert to ONNX format")
+    format_group.add_argument("--config", default=False, action="store_true", help="generate model config json")
+    format_group.add_argument(
+        "--head-only", default=False, action="store_true", help="extract and save only the network head weights"
+    )
+
+    subparser.set_defaults(func=main)
+
+
+def main(args: argparse.Namespace) -> None:
+    args.resize = cli.parse_size(args.resize)
+    args.trace_size = cli.parse_size(args.trace_size)
+    args.max_size = cli.parse_size(args.max_size)
+
+    if args.export_dtype != "float32" and not any((args.pts, args.lite, args.pt2, args.st, args.onnx)):
+        raise cli.ValidationError("--export-dtype float16/bfloat16 supports --pts, --lite, --pt2, --st and --onnx")
+
+    export_dtype: torch.dtype = getattr(torch, args.export_dtype)
+
+    if args.backbone is not None and registry.exists(args.backbone, net_type=DetectorBackbone) is False:
+        raise cli.ValidationError(
+            f"--backbone {args.backbone} not supported, see list-models tool for available options"
+        )
+    if args.trace is True and args.pts is False and args.lite is False and args.onnx is False:
+        raise cli.ValidationError("--trace requires one of --pts, --lite --onnx to be set")
+    if args.dynamic_batch is True and args.pt2 is False and args.pte is False and args.trt is False:
+        raise cli.ValidationError("--dynamic-batch applies only to --pt2, --pte and --trt")
+    if args.max_batch_size is not None and (args.pte is False or args.dynamic_batch is False):
+        raise cli.ValidationError("--max-batch-size requires --pte --dynamic-batch")
+    if args.pte is True and args.dynamic_batch is True:
+        if args.max_batch_size is None:
+            raise cli.ValidationError("--pte --dynamic-batch requires --max-batch-size")
+    if args.max_size is not None and (args.pte is False or args.dynamic_size is False):
+        raise cli.ValidationError("--max-size requires --pte --dynamic-size")
+    if args.pte is True and args.dynamic_size is True and args.max_size is None:
+        raise cli.ValidationError("--pte --dynamic-size requires --max-size")
+    if (
+        args.trace_size is not None
+        and args.pt2 is False
+        and args.pte is False
+        and args.trt is False
+        and args.onnx is False
+    ):
+        raise cli.ValidationError("--trace-size applies only to --pt2, --pte, --trt and --onnx")
+    if args.trace_size is not None and args.dynamic_size is False:
+        raise cli.ValidationError("--trace-size requires --dynamic-size")
+
+    if args.input_channels is not None:
+        if args.rgb_mean is None or args.rgb_std is None:
+            raise cli.ValidationError("--input-channels requires --rgb-mean and --rgb-std")
+        if len(args.rgb_mean) != args.input_channels:
+            raise cli.ValidationError(f"--rgb-mean must have {args.input_channels} values, got {len(args.rgb_mean)}")
+        if len(args.rgb_std) != args.input_channels:
+            raise cli.ValidationError(f"--rgb-std must have {args.input_channels} values, got {len(args.rgb_std)}")
+    elif args.rgb_mean is not None or args.rgb_std is not None:
+        raise cli.ValidationError("--rgb-mean and --rgb-std apply only to --input-channels")
+
+    # Load model
+    device = torch.device("cpu")
+    signature: SignatureType | DetectionSignatureType
+    backbone_custom_config = None
+    if args.backbone is None:
+        net, (class_to_idx, signature, rgb_stats, custom_config) = fs_ops.load_model(
+            device,
+            args.network,
+            config=args.model_config,
+            tag=args.tag,
+            epoch=args.epoch,
+            new_size=args.resize,
+            inference=True,
+            reparameterized=args.reparameterized,
+            dtype=export_dtype,
+        )
+        network_name = lib.get_network_name(args.network, tag=args.tag)
+
+    else:
+        net, (class_to_idx, signature, rgb_stats, custom_config, backbone_custom_config) = fs_ops.load_detection_model(
+            device,
+            args.network,
+            config=args.model_config,
+            tag=args.tag,
+            reparameterized=args.reparameterized,
+            backbone=args.backbone,
+            backbone_config=args.backbone_model_config,
+            backbone_tag=args.backbone_tag,
+            backbone_reparameterized=args.backbone_reparameterized,
+            epoch=args.epoch,
+            new_size=args.resize,
+            inference=True,
+            dtype=export_dtype,
+            export_mode=True,
+        )
+        network_name = lib.get_detection_network_name(
+            args.network, tag=args.tag, backbone=args.backbone, backbone_tag=args.backbone_tag
+        )
+
+    if args.dynamic_batch is True and net.task == Task.OBJECT_DETECTION:
+        raise cli.ValidationError("--dynamic-batch is not supported for detection models")
+    if args.input_channels is not None and args.input_channels == lib.get_channels_from_signature(signature):
+        raise cli.ValidationError(f"Model already has {args.input_channels} input channels")
+
+    if args.resize is not None:
+        network_name = f"{network_name}_{args.resize[0]}px"
+    elif args.add_config is not None or args.add_backbone_config is not None:
+        network_name = f"{network_name}_custom_config"
+    elif args.resize_patch is not None:
+        network_name = f"{network_name}_ip{args.resize_patch}"
+    elif args.input_channels is not None:
+        network_name = f"{network_name}_ic{args.input_channels}"
+
+    if args.reparameterize is True:
+        network_name = lib.get_network_name(network_name, tag="reparameterized")
+
+    model_path = fs_ops.model_path(
+        network_name,
+        epoch=args.epoch,
+        pts=args.pts,
+        lite=args.lite,
+        pt2=args.pt2,
+        trt=args.trt,
+        st=args.st,
+        onnx=args.onnx,
+    )
+    if args.pte is True:
+        model_path = model_path.with_suffix(".pte")
+    if args.head_only is True:
+        model_path = model_path.with_suffix(".head.pt")
+    if args.export_dtype != "float32":
+        model_path = model_path.with_name(f"{model_path.stem}_{args.export_dtype}{model_path.suffix}")
+
+    if model_path.exists() is True and args.force is False and args.config is False:
+        logger.warning("Converted model already exists... aborting")
+        raise SystemExit(1)
+
+    logger.info(f"Saving converted model {model_path}...")
+    if args.resize is not None:
+        net.adjust_size(args.resize)
+        signature["inputs"][0]["data_shape"][2] = args.resize[0]
+        signature["inputs"][0]["data_shape"][3] = args.resize[1]
+        fs_ops.checkpoint_model(
+            network_name,
+            args.epoch,
+            net,
+            signature,
+            class_to_idx,
+            rgb_stats,
+            optimizer=None,
+            scheduler=None,
+            scaler=None,
+            model_base=None,
+            external_config=custom_config,
+            external_backbone_config=backbone_custom_config,
+        )
+
+    elif args.resize_patch is not None:
+        net.adjust_patch_size(args.resize_patch)
+        resized_config = {
+            **(custom_config or {}),
+            **(args.model_config or {}),
+            "patch_size": args.resize_patch,
+        }
+        fs_ops.checkpoint_model(
+            network_name,
+            args.epoch,
+            net,
+            signature,
+            class_to_idx,
+            rgb_stats,
+            optimizer=None,
+            scheduler=None,
+            scaler=None,
+            model_base=None,
+            external_config=resized_config,
+            external_backbone_config=backbone_custom_config,
+        )
+
+    elif args.input_channels is not None:
+        net.adjust_input_channels(args.input_channels)
+        signature["inputs"][0]["data_shape"][1] = args.input_channels
+        rgb_stats = {"mean": tuple(args.rgb_mean), "std": tuple(args.rgb_std)}  # type: ignore[arg-type]
+        adapted_config = {
+            **(custom_config or {}),
+            **(args.model_config or {}),
+        }
+        fs_ops.checkpoint_model(
+            network_name,
+            args.epoch,
+            net,
+            signature,
+            class_to_idx,
+            rgb_stats,
+            optimizer=None,
+            scheduler=None,
+            scaler=None,
+            model_base=None,
+            external_config=adapted_config or None,
+            external_backbone_config=backbone_custom_config,
+        )
+
+    elif args.add_config is not None:
+        if custom_config is not None:
+            logger.warning("Custom config already exist, current action overrides it")
+
+        fs_ops.checkpoint_model(
+            network_name,
+            args.epoch,
+            net,
+            signature,
+            class_to_idx,
+            rgb_stats,
+            optimizer=None,
+            scheduler=None,
+            scaler=None,
+            model_base=None,
+            external_config=args.add_config,
+            external_backbone_config=backbone_custom_config,
+        )
+
+    elif args.add_backbone_config is not None:
+        if backbone_custom_config is not None:
+            logger.warning("Custom backbone config already exist, current action overrides it")
+
+        fs_ops.checkpoint_model(
+            network_name,
+            args.epoch,
+            net,
+            signature,
+            class_to_idx,
+            rgb_stats,
+            optimizer=None,
+            scheduler=None,
+            scaler=None,
+            model_base=None,
+            external_config=custom_config,
+            external_backbone_config=args.add_backbone_config,
+        )
+
+    elif args.reparameterize is True:
+        reparameterize(
+            net,
+            signature,
+            class_to_idx,
+            rgb_stats,
+            args.epoch,
+            network_name,
+            custom_config,
+            backbone_custom_config,
+        )
+
+    elif args.lite is True:
+        if args.trace is True:
+            sample_shape = [1] + signature["inputs"][0]["data_shape"][1:]  # C, H, W
+            scripted_module = torch.jit.trace(net, example_inputs=torch.randn(sample_shape, dtype=export_dtype))
+            optimized_scripted_module = scripted_module
+        else:
+            scripted_module = torch.jit.script(net)
+            optimized_scripted_module = optimize_for_mobile(scripted_module)
+
+        optimized_scripted_module._save_for_lite_interpreter(
+            str(model_path),
+            _extra_files={
+                "birder_version": __version__,
+                "task": net.task,
+                "class_to_idx": json.dumps(class_to_idx),
+                "signature": json.dumps(signature),
+                "rgb_stats": json.dumps(rgb_stats),
+            },
+        )
+
+    elif args.pt2 is True:
+        pt2_export(
+            net,
+            signature,
+            class_to_idx,
+            rgb_stats,
+            device,
+            model_path,
+            dtype=export_dtype,
+            dynamic_batch=args.dynamic_batch,
+            dynamic_size=args.dynamic_size,
+            trace_size=args.trace_size,
+        )
+
+    elif args.pte is True:
+        pte_export(
+            net,
+            signature,
+            class_to_idx,
+            rgb_stats,
+            device,
+            model_path,
+            dynamic_batch=args.dynamic_batch,
+            dynamic_size=args.dynamic_size,
+            trace_size=args.trace_size,
+            max_batch_size=args.max_batch_size,
+            max_size=args.max_size,
+        )
+
+    elif args.trt is True:
+        trt_export(
+            net,
+            signature,
+            class_to_idx,
+            rgb_stats,
+            model_path,
+            dynamic_batch=args.dynamic_batch,
+            dynamic_size=args.dynamic_size,
+            trace_size=args.trace_size,
+            require_full_compilation=args.trt_full,
+        )
+
+    elif args.st is True:
+        fs_ops.save_st(
+            net,
+            str(model_path),
+            net.task,
+            class_to_idx,
+            signature,
+            rgb_stats,
+            external_config=custom_config,
+            external_backbone_config=backbone_custom_config,
+        )
+
+    elif args.onnx is True:
+        onnx_export(
+            net,
+            signature,
+            class_to_idx,
+            rgb_stats,
+            model_path,
+            export_dtype,
+            args.dynamic_size,
+            args.trace_size,
+            args.opset,
+            args.optimize,
+            args.simplify,
+        )
+
+    elif args.config is True:
+        config_export(net, signature, rgb_stats, model_path)
+
+    elif args.head_only is True:
+        torch.save(
+            {
+                "state": net.classifier.state_dict(),
+                "birder_version": __version__,
+                "class_to_idx": class_to_idx,
+            },
+            model_path,
+        )
+
+    elif args.pts is True:
+        if args.trace is True:
+            sample_shape = [1] + signature["inputs"][0]["data_shape"][1:]  # C, H, W
+            scripted_module = torch.jit.trace(net, example_inputs=torch.randn(sample_shape, dtype=export_dtype))
+        else:
+            scripted_module = torch.jit.script(net)
+
+        fs_ops.save_pts(scripted_module, model_path, net.task, class_to_idx, signature, rgb_stats)

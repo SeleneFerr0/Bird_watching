@@ -1,0 +1,1120 @@
+# Changelog
+
+## 0.9.0 - 2026-10-29
+
+### Added
+
+- **Wildlife Pipeline**: Added `birder-predict-wildlife` / `birder.scripts.predict_wildlife` to connect animal detection to batched, padded-crop species classification.
+- **Optional YOLO Backend**: Added the `yolo` extra and a lazy Ultralytics adapter for compatible detection models, including YOLOv5u and YOLO26. Native Birder detectors remain supported without this dependency.
+- **Shared Tiled Detection**: Reused Birder's tile mapping and class-aware NMS with both detector backends, including a full-image pass.
+- **Selective Species Predictions**: Added minimum-score and top-two-margin review decisions, retained candidates, configurable temperature scaling, and held-out temperature fitting.
+- **Streaming Observations**: Added per-image UTF-8 JSONL with model identifiers, inference settings, original-image boxes, review reasons, and optional explicit error rows.
+- **Research and Usage**: Added an algorithm comparison, limitations, field-evaluation protocol, and reproducible pipeline examples. No newly trained weights or measured wildlife accuracy gains are claimed.
+
+### Fixed
+
+- **Unicode Paths**: Explicitly encode and decode filesystem paths in image-list datasets, preserving non-English directory names, filenames, and combining characters without renaming.
+- **Empty Inputs**: Raise a clear error when an image-list dataset has no supported images.
+- **Single-Image Inference**: Support path-like objects, consistently convert images to the model's one- or three-channel mode, close opened image files, and disable gradient recording in convenience inference calls.
+- **Spawned WebDataset Workers**: Preserve standard sized pipeline state in a serializable class so multiprocessing loaders work on macOS/Windows instead of failing to pickle dynamically generated length wrappers.
+
+## 0.8.4 - 2026-10-24
+
+### Added
+
+- **Input Channel Adaptation**: Added `convert-model --input-channels` for pretrained ResNet v1, ConvNeXt, Swin Transformer and ViT-family checkpoints, including normalization metadata and supported detection backbones.
+- **Dataset Packing**: Added `pack --format original` to preserve JPEG, PNG, and WebP images without resizing or re-encoding.
+
+### Changed
+
+- **Compatibility**: Raised the minimum supported Polars version to 2.0.
+
+### Fixed
+
+- **Model Resizing**: Preserved parameter trainability when resizing positional embeddings, attention biases and patch projections.
+- **Low-Precision Resizing**: Fixed low-precision resizing in Swin, MaxViT, Hiera and PiT.
+- **Swin Transformer v2**: Avoided NaN relative-position biases when either attention window dimension is one.
+- **LAMB and LARS**: Preserved parameter gradients during optimizer updates instead of modifying them in place.
+
+## 0.8.3 - 2026-10-03
+
+### Added
+
+- **ExecuTorch PTE Export**: Added `--pte` to `convert-model` for full-precision `.pte` exports, with metadata embedded via `get_metadata`.
+- **SimDINOv2 SSL**: Added [SimDINOv2](https://arxiv.org/abs/2502.10385) self-supervised pretraining with coding-rate regularization, prototype-free normalized heads and masked-patch cosine alignment.
+- **Sparse MoE iBOT**: Added opt-in MoE training support to iBOT pretraining with multi-crop routing outputs, auxiliary losses, accumulated expert-load balancing and synchronized student-teacher expert-bias updates.
+- **MESA Training**: Added optional BCE-based [MESA regularization](https://arxiv.org/abs/2205.14083) using EMA model predictions.
+- **CPUBone**: Added [CPUBone](https://arxiv.org/abs/2603.26425) image classification model.
+- **DDP Gradient Compression**: Added opt-in `--ddp-comm-dtype {float16,bfloat16}` support across all training scripts to reduce DistributedDataParallel gradient communication bandwidth using PyTorch's communication hooks.
+- **timm-Style RandAugment**: Added the `timm` classification augmentation type with increasing-severity transformations, Gaussian magnitude noise and independent `--timm-magnitude` control.
+- **Pretrained Models**:
+    - `naflex_vit_reg4_so150m_p14_ls_dino-v2-bio-intermediate-eu-common` and `naflex_vit_reg4_so150m_p14_ls_dino-v2-bio-intermediate-il-all`: Added Bio-DINO NaFlex SoViT Reg4 150M/14 pretrained weights with intermediate training on world bird species, then fine-tuned on the `eu-common` and `il-all` datasets, respectively.
+
+### Fixed
+
+- **Dataset Packing**: Fixed image-mode compatibility in `pack`, including full-range unsigned 16-bit grayscale scaling for JPEG/WebP and 16-bit PNG preservation.
+
+## 0.8.2 - 2026-09-14
+
+### Added
+
+- **MoE Active Parameter Counts**: Added nominal per-token active parameter counting for ViT and RoPE ViT MoE models with reporting in `model-info`.
+- **MoE Routing Introspection**: Added `MoERouting` to capture per-layer patch-by-expert scores, selections, dispatch assignments and combine weights for V-MoE, sigmoid top-k and expert-choice routing, with paginated expert-weight image overlays.
+- **Franca Compile Preset**: Added opt-in `--compile-preset` with script-local model and loss/Sinkhorn autotuning options.
+
+### Changed
+
+- **Franca Sinkhorn-Knopp Refactor (Breaking)**: Reworked DINO and iBOT Matryoshka normalization around dedicated tensor-only modules and one packed nesting-level queue per loss. The eager queue boundary fixes pointer-driven recompilation, while compact current-batch targets, bounded packed writes and per-epoch temperature staging reduce training memory and runtime. Franca loss APIs and queue state paths changed, so existing Franca checkpoints are not compatible.
+- **DINOv2 Sinkhorn-Knopp Optimization**: Split DINO and iBOT queue management from stateless, independently compiled normalization, return compact current-batch targets after queued normalization and stage teacher-temperature schedules as device tensors. These changes reduce retained target memory and per-step host overhead in DINOv2, DINOv2-Dist and CAPI-DINO training.
+
+## 0.8.1 - 2026-09-12
+
+### Added
+
+- **Franca Image Embedding Normalization**: Added opt-in `--image-embedding-norm` to apply LayerNorm to student and teacher image embeddings before the DINO head and KoLeo loss.
+- **Grouped Token-Choice MoE**: Added opt-in `moe_grouped_token_choice` support to ViT and RoPE ViT MoE models, using packed routed-expert parameters and grouped matrix multiplication for compatible CUDA BF16 execution.
+- **MoE Expert Layout Conversion**: Added public `group_experts()` and `ungroup_experts()` utilities for converting token-choice routed experts between grouped and individual-expert layouts.
+- **MoE Layer End Offset**: Added `moe_last_n_layers_offset` to ViT and RoPE ViT MoE models, leaving dense blocks after the selected MoE span. The optional `o{O}` suffix records the offset in model names, e.g. `last6o1` or `last3s2o1`.
+
+### Changed
+
+- **MoE Routed Expert Counts (Breaking)**: Renamed `moe_num_experts` to `moe_num_routed_experts` and redefined `e` in sparse MoE model names to count routed experts. Shared (`s`) and special-token (`p`) experts are now additive, so `32e1s` and `32e1s1p` configurations contain 33 and 34 total experts, respectively, while retaining 32 routed experts.
+- **Expert Choice MoE BMM (Breaking)**: Replaced per-expert loops with batched matrix multiplication (`torch.bmm`) for faster training and inference. Packed routed-expert parameters change `state_dict` keys and tensor shapes, breaking compatibility with existing expert-choice checkpoints.
+
+## 0.8.0 - 2026-09-06
+
+### Added
+
+- **MixUp/CutMix Batch Probability**: Added `--mixup-cutmix-prob` to control the probability that an enabled MixUp or CutMix augmentation is applied to each training batch.
+- **DeepSeek-v3-Style MoE**: Added configurable ViT and RoPE ViT MoE layers with routed and shared SwiGLU experts, normalized sigmoid top-k routing and auxiliary-loss-free load balancing through dynamically updated expert-routing biases.
+- **MoE Special-Token Experts**: Added configurable dedicated experts for CLS and register-token prefixes to DeepSeek-v3-style ViT and RoPE ViT MoE layers. Prefix tokens bypass routed experts, are processed by every configured special-token expert as well as the shared experts.
+- **Expert Choice Routing**: Added [Expert Choice routing](https://arxiv.org/abs/2202.09368) support.
+- **Sparse MoE CAPI**: Added opt-in MoE training support to CAPI pretraining with auxiliary routing losses, accumulated expert-load balancing and synchronized student-teacher expert-bias updates.
+- **Sparse MoE CAPI-DINO**: Added opt-in MoE training support to CAPI-DINO pretraining with auxiliary routing losses, accumulated expert-load balancing and synchronized student-teacher expert-bias updates.
+- **Sparse MoE BYOL**: Added opt-in MoE training support to BYOL pretraining with auxiliary routing losses, accumulated expert-load balancing and synchronized online-target expert-bias updates.
+- **Sparse MoE Data2Vec**: Added opt-in MoE training support to Data2Vec pretraining with auxiliary routing losses, accumulated expert-load balancing and synchronized student-teacher expert-bias updates.
+- **Sparse MoE Data2Vec2**: Added opt-in MoE training support to Data2Vec 2.0 pretraining with auxiliary routing losses, accumulated expert-load balancing and synchronized student-teacher expert-bias updates.
+- **Sparse MoE LeJEPA**: Added opt-in MoE training support to LeJEPA pretraining with multi-crop routing outputs, auxiliary losses and accumulated expert-load balancing.
+- **Sparse MoE RotNet**: Added opt-in MoE training support to rotation-prediction pretraining with auxiliary routing losses and accumulated expert-load balancing.
+- **Sparse MoE VICReg**: Added opt-in MoE training support to VICReg pretraining with combined two-view routing outputs, auxiliary losses and accumulated expert-load balancing.
+- **Sparse MoE Barlow Twins**: Added opt-in MoE training support to Barlow Twins pretraining with combined two-view routing outputs, auxiliary losses and accumulated expert-load balancing.
+- **Sparse MoE SimCLR**: Added opt-in MoE training support to SimCLR pretraining with concatenated two-view routing outputs, auxiliary losses and accumulated expert-load balancing.
+- **Sparse MoE MMCR**: Added opt-in MoE training support to MMCR pretraining with multi-view routing outputs, auxiliary losses, accumulated expert-load balancing and synchronized online-momentum expert-bias updates.
+- **Sparse MoE AIM v1**: Added MoE training-output propagation to AIM v1, enabling auxiliary routing losses and accumulated expert-load balancing through generic MIM training.
+- **NaFlex MMCR**: Added native-aspect-ratio and variable-patch-size MMCR pretraining with independently padded views for directory and WebDataset inputs.
+- **NaFlex VICReg**: Added variable-resolution and variable-patch-size VICReg pretraining for directory and WebDataset inputs.
+- **MobileOne and MobileViT Masked Token Retention**: Added masked token retention support to MobileOne, MobileViT v1 and MobileViT v2 encoders.
+- **Pretrained Models**:
+    - `naflex_vit_b16_nepa-generic`: Added NaFlex ViT B/16 image encoder pretrained using NEPA on multiple public datasets.
+
+### Changed
+
+- **Compatibility**: Tested with PyTorch 2.14.
+- **MoE Layer Organization (Breaking)**: Consolidated MoE specifications, routers and feed-forward layers in `birder.layers.moe`.
+- **MoE Model and Training Interface (Breaking)**: Reworked MoE capability discovery and training-output handling around explicit, stateless APIs, removed the legacy mutable output controls and replaced `--moe-aux-loss` with `--moe-training`.
+
+### Fixed
+
+- **MobileViT v2 Padded Outputs**: Restored block outputs to their original spatial dimensions after internal patch-grid alignment for non-divisible feature maps.
+
+## 0.7.3 - 2026-08-27
+
+### Added
+
+- **Simple ViT Masked Token Retention**: Added masked token retention support to Simple ViT encoders.
+- **NaFlex Masked Token Retention**: Added padding-aware masked token retention to NaFlex ViT and NaFlex RoPE ViT for mixed variable-size patch sequences while preserving dense image-input compatibility.
+- **NaFlex Masking**: Added NaFlex-aware mask generation for mixed variable-size patch grids.
+- **NaFlex Patch-Size Sampling**: Added opt-in `--naflex-patch-sizes` support with batch-level patch-size and resolution scheduling, patch-projection resampling.
+- **NaFlex Knowledge Distillation**: Added native-aspect-ratio knowledge distillation.
+- **NaFlex Barlow Twins**: Added native-aspect-ratio Barlow Twins pretraining with independently padded augmented views and end-to-end `--naflex` and multi-scale `--naflex-sizes` training support.
+- **NaFlex EVA**: Added native-aspect-ratio EVA pretraining for NaFlex teacher and student encoders with matching patch sizes, grid-aware masking, padding-aware loss and end-to-end `--naflex` and multi-scale `--naflex-sizes` training support.
+- **NaFlex RoPE ViT**: Added NaFlex RoPE ViT image classification variants with efficient batched rotary position embeddings for mixed variable-size patch grids.
+- **V-MoE Token Masks**: Added optional token-mask support to the V-MoE router, `SparseMoE_FFN`, and both ViT and RoPE encoder paths, excluding masked tokens from expert capacity allocation and auxiliary routing losses and zeroing their sparse FFN contribution.
+- **Pretrained Models**:
+    - `rope_vit_reg8_b14_nps_avg_capi-dino-bio`: Added CAPI-DINO RoPE ViT Reg8 B/14 NPS AVG image encoder pretrained weights on natural biological images.
+
+### Changed
+
+- **V-MoE ViT Feature Parity**: Aligned ViT-MoE and RoPE-ViT-MoE with their dense counterparts across applicable positional-embedding, transformer-normalization and attention-pooling configuration options.
+
+## 0.7.2 - 2026-08-17
+
+### Added
+
+- **Attention Pool Masks**: Added optional attention-mask support to `MultiHeadAttentionPool` and `EfficientProbing`.
+- **NaFlex ViT**: Added [NaViT](https://arxiv.org/abs/2307.06304)- and [SigLIP 2](https://arxiv.org/abs/2502.14786)-inspired NaFlex ViT image classification variants with efficient batched variable-grid position embeddings. Added end-to-end `--naflex` training and prediction, native-aspect transforms, padded patch-sequence collation with valid-token masks, regional MixUp and iterator visualization.
+- **NaFlex NEPA**: Added native-aspect-ratio NEPA pretraining with padded variable-length patch sequences, padding-aware prediction loss and end-to-end `--naflex` training support.
+- **RoPE Coordinate Augmentations**: Added shift, per-axis jitter and isotropic rescale augmentations for centered-separate RoPE coordinates.
+- **SSL Resume Resolution Adaptation**: Added `--adapt-size` to Franca and CAPI-DINO training to adapt model resolution after loading resumed checkpoints.
+- **UniRepLKNet**: Added [UniRepLKNet](https://arxiv.org/abs/2311.15599) image classification model variants with structural reparameterization.
+
+### Changed
+
+- **FlexiViT Configuration Support**: Expanded FlexiViT and RoPE FlexiViT support for compatible configuration options available in their corresponding ViT models.
+- **Training Preset APIs (Breaking)**: Made every classification and detection `training_preset()` argument after `rgv_values` keyword-only. Consumers must pass optional transform configuration by name.
+
+### Fixed
+
+- **FlexiViT ViT Weight Import**: Preserved special-token positional embeddings when importing ViT and RoPE ViT weights into FlexiViT and RoPE FlexiViT by folding them into the corresponding learned register and class tokens instead of discarding them.
+- **RoPE Attention Mixed Precision**: Cast rotary-transformed queries and keys to the value dtype before scaled dot-product attention, preserving Q/K/V dtype alignment under AMP.
+- **TQDM Environment Override**: Training commands now respect `TQDM_DISABLE` when stderr is attached to a TTY.
+
+## 0.7.1 - 2026-08-06
+
+### Added
+
+- **ACNet and Diverse Branch Block**: Added [ACNet](https://arxiv.org/abs/1908.03930) and [Diverse Branch Block](https://arxiv.org/abs/2103.13425) ResNet v1 image classification model variants with structural reparameterization.
+- **CSPNeXt**: Added [CSPNeXt](https://arxiv.org/abs/2212.07784) image classification model variants.
+- **Directory Environment Overrides**: Added environment-variable overrides for the model checkpoint, training run and results directories.
+- **MambaOut**: Added [MambaOut](https://arxiv.org/abs/2405.07992) image classification model variants.
+- **RTMDet**: Added [RTMDet](https://arxiv.org/abs/2212.07784) object detection model variants.
+- **Pretrained Models**:
+    - `resnet_v2_50_inat21` and `resnet_v2_50_inat21-256px`: Added ResNet v2 50 pretrained weights on the iNaturalist 2021 dataset.
+
+### Changed
+
+- **CAPI Upstream Fidelity**: Restored constant stochastic depth across the decoder blocks and aligned the final decoder RMSNorm epsilon with upstream.
+- **Feature-Path Network Stripping (Breaking)**: Standardized destructive network preparation on `strip_for_forward_features()` and `strip_for_detection_features()`. These APIs remove parameters and buffers outside their corresponding feature paths across all supported classification networks and detector backbones. Consumers must use the new feature-path-specific APIs.
+- **V-MoE Model Names (Breaking)**: Renamed the registered `vit_moe_*` and `rope_vit_moe_*` model configurations to `vit_vmoe_*` and `rope_vit_vmoe_*`, respectively, to distinguish V-MoE from other mixture-of-experts implementations.
+
+### Fixed
+
+- **Benchmark Failure Isolation**: Isolated individual model benchmarks in spawned workers so native failures, including `torch.compile` crashes, no longer abort the remaining run. Successful results are written to CSV immediately.
+
+## 0.7.0 - 2026-07-31
+
+### Added
+
+- **MViT v1**: Added [MViT v1](https://arxiv.org/abs/2104.11227) image classification model variants.
+- **RepLKNet**: Added [RepLKNet](https://arxiv.org/abs/2203.06717) image classification model variants.
+- **SE Wide ResNet**: Added Squeeze-and-Excitation Wide ResNet model variants.
+- **Selective Module Freezing**: Added repeatable `--freeze-module`, `--freeze-encoder-module` and `--freeze-backbone-module` training options for freezing exact module subtrees alongside existing freeze strategies.
+- **Sparse MoE Knowledge Distillation**: Added optional MoE auxiliary-loss support for knowledge-distillation students.
+- **Pretrained Models**:
+    - `rope_deit3_m14_dino-v2-dist-bio`: Added compact Bio-DINO-Dist RoPE DeiT3-M/14 image encoder pretrained weights distilled from the Bio-DINO SoViT-150M/14 model.
+
+### Changed
+
+- **AIM v1 Upstream Fidelity (Breaking)**: Corrected the prediction head to use pre-normalized residual MLP blocks, aligned LayerNorm epsilon and sinusoidal frequency spacing with upstream and sampled prefix lengths across the full patch sequence.
+- **CAPI Upstream Fidelity (Breaking)**: Preserved sampled prediction-token ordering in the decoder and removed unintended biases from decoder attention and MLP projections. CAPI-DINO inherits the correction through its shared student path.
+- **ConvMixer Upstream Fidelity (Breaking)**: Corrected the patch stem and mixer blocks to use upstream post-activation BatchNorm.
+- **FCMAE Upstream Fidelity**: Normalized reconstruction targets independently per patch before computing the masked-patch loss.
+- **MaxViT Upstream Fidelity (Breaking)**: Corrected attention scaling to use the per-head dimension and restored the canonical MaxViT-S stage widths.
+- **MobileNet v3 Upstream Fidelity (Breaking)**: Corrected sub-1.0 classifier hidden widths to follow the configured width multiplier.
+- **PVT v1 Upstream Fidelity (Breaking)**: Removed unintended stage-output LayerNorms.
+- **RepVGG D2se Upstream Fidelity (Breaking)**: Added the missing squeeze-and-excitation module to the stem.
+- **RepViT M0.6 Upstream Fidelity (Breaking)**: Corrected the first-stage width, stage depths and squeeze-excitation reduction width to match upstream.
+- **ResNet v2 Upstream Fidelity (Breaking)**: Corrected projection shortcuts to consume pre-activated inputs, removed post-addition activations.
+- **ShuffleNet v1 Upstream Fidelity (Breaking)**: Restored the Conv-BN-ReLU stem, corrected first-pointwise-convolution grouping and channel-shuffle placement and aligned residual and concatenation activation ordering with the intended architecture.
+- **SqueezeNext 23v5 Upstream Fidelity (Breaking)**: Restored the 5x5 v5 stem, alternating separable-convolution orientation, normalized and activated final bottleneck and upstream Xavier initialization.
+- **XCiT Upstream Fidelity (Breaking)**: Corrected the cross-covariance attention tensor layout, local-patch-interaction operation order and patch-embedding activations to match upstream.
+- **DETR Hungarian Matching**: Consolidated DETR-family matching into a shared lightweight matcher with conventional class, box and GIoU cost weights. Batched compatible decoder-layer and query-group assignments to reduce matching overhead.
+- **Weighted Boxes Fusion Confidence**: Aligned the `avg`, `max`, `box_and_model_avg` and `absent_model_aware_avg` confidence modes and weighted candidate ordering with upstream WBF, including unique source tracking for model-aware modes. Added cluster-local average and maximum modes.
+- **Linear Assignment and Soft-NMS Kernels**: Rewrote the custom CUDA implementations of the linear assignment and Soft-NMS operators.
+- **Custom Kernels**: Refined the native C++ and CUDA kernel infrastructure:
+    - Consolidated kernel loading and reorganized kernel sources.
+    - Standardized PyTorch and CUDA integration, validation and error handling.
+    - Added consistent formatting guidelines and CI checks.
+    - Improved the reliability and consistency of custom C++ and CUDA kernels and their fallbacks.
+- **Pretrained Models**:
+    - **Breaking**: Removed `maxvit_s_il-all` and `maxvit_s_il-all256px` because they are incompatible with the corrected MaxViT-S.
+    - **Breaking**: Removed `mobilenet_v3_large_0_75_il-common`.
+    - **Breaking**: Removed `repvit_m0_6_il-common` and `repvit_m0_6_il-common_reparameterized`.
+    - **Breaking**: Removed `resnet_v2_50_inat21` and `resnet_v2_50_inat21-256px` because they are incompatible with the corrected ResNet v2 architecture.
+    - **Breaking**: Removed `shufflenet_v1_4_il-common` because it is incompatible with the corrected ShuffleNet v1 architecture.
+    - **Breaking**: Removed `squeezenext_1_0_il-common`.
+    - **Breaking**: Updated `xcit_nano12_p16_il-common` and `xcit_nano12_p8_il-common` due to XCiT architecture corrections.
+
+### Fixed
+
+- **BiFormer Global Attention Layout**: Corrected the inverse token-to-feature-map layout conversion in the global-attention path.
+- **CSWin Transformer**: Preserved stage-specific stripe widths when adjusting input size.
+- **Swin Transformer Rectangular Attention and Resizing**: Corrected height/width shift suppression for rectangular windows in v1 and v2. Made v2 track padded stage resolutions and restore shifted-window offsets when resizing to non-multiple-of-32 inputs.
+- **Detection Result Loading**: Restored canonical bounding-box shapes and field dtypes when loading JSON detection results.
+- **EfficientDet Upstream Fidelity (Breaking)**: Restored half-stride floating-point anchors, canonical matching thresholds and BatchNorm settings and the batch-normalized focal/Huber training objective with the upstream localization weight.
+- **Faster R-CNN Anchor Schedule**: Derived RPN anchor sizes from backbone pyramid strides so nonstandard and stride-64 backbones use the correct per-level scales.
+- **RetinaNet Upstream Fidelity (Breaking)**: Derived anchor sizes from regular and Simple-FPN strides for nonstandard backbones, removed unintended regular-FPN BatchNorm and restored Simple-FPN LayerNorm.
+- **DETR Positional-Embedding Dtypes**: Cast DETR and Deformable DETR positional embeddings to the corresponding feature dtype for mixed-precision compatibility.
+- **FCOS FPN Normalization**: Removed unintended BatchNorm layers from FCOS lateral and output FPN convolutions to match upstream.
+- **RT-DETR v1 Upstream Fidelity (Breaking)**: Restored the decoder-side feature projections before query selection and deformable decoding.
+- **RT-DETR v2 Upstream Fidelity (Breaking)**: Restored the decoder-side feature projections and corrected large variants.
+- **LW-DETR Positional-Embedding Dtype**: Cast sine position embeddings to the decoder dtype for reduced-precision compatibility.
+- **LW-DETR and RF-DETR Upstream Fidelity**: Corrected Group-DETR loss normalization for all-negative and sparse distributed batches.
+- **LeJEPA Global-View Target**: Corrected the invariance target to average only global-crop projections while retaining all global and local crops as predictions.
+- **Plain DETR Upstream Fidelity**: Corrected all-negative one-to-many loss normalization, restored decoder self-attention initialization and finite attention-logit clamping and made positional and BoxRPB computations reduced-precision compatible.
+- **Download Cleanup**: Ensured download responses and temporary files are closed safely.
+- **FlexiViT PI-Resize**: Corrected FlexiViT and RoPE FlexiViT patch projection resizing to use the reference bilinear pseudoinverse transform instead of direct bicubic interpolation.
+- **LAMB Gradient Handling**: Made gradient-free optimizer steps no-ops and tracked bias-correction steps per parameter so intermittently active parameters use correct moment correction.
+- **RoPE ViT Rectangular XY Grids**: Corrected rotary-position grid ordering for rectangular inputs using `xy` indexing.
+- **ViT-Family Freezing**: Corrected stage freezing to follow configured output-stage boundaries. Made feature unfreezing restore terminal normalization, attention pooling, necks and class-attention feature modules across ViT-family models.
+- **ViT Parallel Causal Attention**: Propagated causal-attention settings to both parallel attention branches.
+- **XCiT Patch-8 Input Channels**: Made the patch-8 stem respect the configured input-channel count instead of assuming RGB input.
+
+## 0.6.8 - 2026-07-18
+
+### Added
+
+- **Packed MSDA CUDA Kernel**: Added forward and backward custom-kernel support for per-level sampling-point counts, enabling accelerated D-FINE variants with unequal decoder point counts.
+- **Benchmark Model Dtype**: Added `--model-dtype` support to model benchmarking.
+- **Selective EMA Resume**: Added `--load-ema` to classification, knowledge-distillation and detection training so EMA weights can be restored without optimizer or scaler state.
+- **Detection Background Images**: COCO detection training now keeps images without object annotations by default, use `--drop-empty` to exclude them.
+- **MaskFeat MIM**: Added [MaskFeat](https://arxiv.org/abs/2112.09133) masked image modeling.
+- **ViT hMLP Stem**: Added the optional [hMLP stem](https://arxiv.org/abs/2203.09795).
+- **Selective Custom Kernel Disabling**: Added environment variables and an API for disabling individual custom kernels.
+- **Pretrained Models**:
+    - `d_fine_l_objects365-coco_hgnet_v2_b4_pp-imagenet22k`: Added D-FINE large object detector with an HGNet v2 B4 backbone pretrained on Objects365-2020 and fine-tuned on COCO 2017.
+
+### Changed
+
+- **Optimizer Parameter Groups (Breaking)**: Coalesced parameters with identical learning-rate, weight-decay and layer-scale settings into shared optimizer groups, reducing optimizer and scheduler overhead and allowing foreach/fused optimizers to batch more parameters per group. Optimizer states saved with the previous one-group-per-parameter layout are not load-compatible.
+- **Sinkhorn Communication (Breaking)**: Simplified DINOv2 and Franca Sinkhorn-Knopp normalization by removing mathematically cancelling scalar operations and their associated distributed reductions. Removed the obsolete iBOT Sinkhorn masked-patch-count input from the loss API and training collators.
+- **Sinkhorn Queue State (Breaking)**: Moved DINOv2 and Franca queue ring metadata from device buffers to checkpointed Python state, eliminating pointer and fullness device-to-host synchronizations. Existing checkpoints using the previous queue-state buffers are not load-compatible.
+- **Transformer Detector Performance**: Reduced redundant computation and intermediate allocations across LW-DETR, RT-DETR v2 and D-FINE.
+- **Matched Box IoU Performance**: Replaced quadratic pairwise IoU and generalized-IoU matrices with aligned matched-pair calculations across D-FINE, LW-DETR, Plain DETR and RT-DETR.
+- **Detection Multiscale Augmentations**: Derived per-image and per-batch multiscale ranges and long-edge caps from the requested target size rather than hardcoded values.
+- **Pretrained Models**:
+    - **Breaking**: Updated `uniformer_s_eu-common` and `uniformer_s_eu-common256px` due to a UniFormer stage-layout change.
+
+### Fixed
+
+- **SSD Background Training**: Made SSD and SSDLite hard-negative mining produce a classification signal for images without objects.
+- **ConvNeXt V1 Isotropic Configurations**: Corrected the dimension key for the base and large model variants.
+- **Rectangular Detection Scale Jitter**: Corrected torchvision target-axis ordering to preserve the intended scale range for rectangular Birder and LSJ augmentations.
+- **RegionViT Padded Attention**: Combined bottom and right padding masks correctly for partially padded regional windows.
+- **ResMLP LayerScale Initialization**: Applied each model variant's configured initialization value.
+
+## 0.6.7 - 2026-07-15
+
+### Fixed
+
+- **Development Requirements**: Relaxed the `build` requirement from `~=1.5.1` to `~=1.5.0` because version 1.5.1 was yanked.
+
+## 0.6.6 - 2026-07-15
+
+### Added
+
+- **D-FINE Detection**: Added [D-FINE](https://arxiv.org/abs/2410.13842) object detection model.
+- **GhostNet v3**: Added [GhostNet v3](https://arxiv.org/abs/2404.11202) image classification model variants.
+- **Meta Device Initialization**: Added broad meta-device initialization support.
+- **Beyond CUDA**: As an initial step toward broader training-device support, removed several CUDA-only assumptions and added basic CPU DistributedDataParallel (DDP) support, primarily for development and testing.
+
+### Changed
+
+- **Dataset Packing**: Reworked the classification and object-detection packing pipelines for improved multiprocessing stability.
+- **RT-DETR Positional Embeddings (Breaking)**: Changed AIFI sinusoidal frequency spacing in RT-DETR v1 and v2 to exclude the frequency endpoint, matching upstream behavior.
+
+### Fixed
+
+- **Simple Crop**: Fixed rectangular crops to preserve aspect ratio and cover the target size before cropping.
+- **Tooling Reliability**:
+    - **Model Downloads**: Honor forced downloads when checksum verification is disabled.
+    - **VOC-to-COCO Conversion**: Abort when the target already exists instead of overwriting it.
+    - **Model Conversion**: Protect reparameterized checkpoints from unintended overwrites.
+
+## 0.6.5 - 2026-07-11
+
+### Added
+
+- **Fixed-Size Block Masking**: Added masking based on overlapping fixed-size square blocks, with exact mask-count adjustment, inverse masking and rectangular-grid support.
+- **Sparse MoE SSL**: Added opt-in `--moe-aux-loss` support to DINOv2, DINOv2 distillation and Franca training.
+- **Sparse MoE EVA MIM**: Added opt-in `--moe-aux-loss` support to EVA training.
+- **Sparse MoE NEPA**: Added opt-in `--moe-aux-loss` support to NEPA training.
+- **Sparse MoE ViT**: Added causal attention support to ViT-MoE.
+- **Sparse MoE ViT Attention Masks**: Added optional `attn_mask` support to ViT-MoE `forward_features()`.
+- **Sparse MoE ViT Gradient Checkpointing**: Added gradient checkpointing support to ViT-MoE and RoPE ViT-MoE.
+- **Sparse MoE RoPE ViT**: Added RoPE V-MoE model variants.
+
+### Changed
+
+- **Compatibility**: Tested with PyTorch 2.13.
+- **DINOv2 Distillation**: Interpolate teacher features, not input crops, for mixed-stride distillation.
+- **WebDataset Split Selection**: Repeated `--wds-split` options can now select splits individually for multiple `--wds-info` files during SSL and MIM training.
+
+### Fixed
+
+- **Attention Bias Interpolation**: Interpolate each attention head independently when resizing spatial attention-bias tables.
+- **Class Index Ordering**: Derive ordered class-name lists from assigned indices across evaluation, prediction, packing, metadata and visualization workflows instead of relying on mapping insertion order.
+- **Classification Result Metadata**: Preserve class names containing commas and quotes when saving and loading CSV results.
+- **Data2Vec2 Upstream Fidelity**: Aligned training behavior more closely with upstream:
+    - **CLS Prediction**: Removed the extra student projection head.
+    - **Decoder Residuals**: Restored the first residual when encoder and decoder shapes match.
+    - **Teacher EMA**: Linear annealing on optimizer steps, with optional end-step truncation.
+    - **Loss Scaling**: Applied dimension-normalized patch and CLS losses.
+    - **Masking**: Replaced rolled rectangles with exact-count fixed-size blocks.
+    - **Intentional Divergence**: CLS loss remains sample-averaged to keep its weight independent of batch and clone sizes.
+- **Detection Fixes**:
+    - **RetinaNet Simple-FPN Levels**: Generate P6 and P7 from the final Simple-FPN level to preserve distinct, successively downsampled pyramid scales.
+    - **RetinaNet L1 Regression**: Normalize the optional L1 bounding-box loss once per image instead of twice by its foreground-anchor count.
+    - **SSD Anchor Geometry**: Derive SSD and SSDLite default-box centers from their actual feature-map grids instead of incompatible fixed step sizes.
+    - **LW-DETR One-Stage References**: Use additive reference-logit box refinement for one-stage LW-DETR while preserving proposal-relative reparameterization for two-stage models.
+    - **Plain DETR Reference Gradients**: Keep current decoder reference points attached through BoxRPB and cross-attention, detaching only references passed to the next refinement layer.
+    - **RT-DETR Padded Coordinates**: Normalize encoder anchors to each image's valid feature extent, apply valid ratios during decoder sampling and clamp discrete samples to valid image edges, keeping mixed-size padded batches in a consistent coordinate system.
+    - **RT-DETR Zero-Noise Denoising**: Convert denoising reference boxes to logit space even when box perturbation is disabled.
+    - **YOLOv2 Ignore Mask**: Derive no-object ignore decisions from current decoded predictions instead of undeformed anchor priors.
+    - **YOLO Target Collisions**: Apply whole-slot replacement for YOLOv2 collisions and preserve accumulated regression assignments with batched, aggregated classes for YOLOv3 and YOLOv4.
+    - **YOLOv4 CIoU Precision**: Preserve float32 grid-coordinate arithmetic in the regression loss under mixed-precision training.
+    - **Detection TTA Confidence**: Account for augmentations without a matching box when averaging weighted-box-fusion confidence.
+- **Feature PCA**: Correctly ignore the channels-last flag because detection feature maps are always returned in NCHW format.
+- **Guided Backprop Restoration**: Restore the exact original activation modules after guided backpropagation.
+- **iBOT Delayed Prediction**: Fixed delayed masked image prediction and aligned per-view masks with view-major global crop batches.
+- **I-JEPA Block Masks**: Fixed block-sampling bounds so prediction and context masks can cover the bottom and right edges of the patch grid.
+- **Model Quantization**: Enable model dynamic-size behavior for dynamic H/W export.
+- **Model Averaging**: Preserve custom model configurations when averaging checkpoints.
+- **SimCLR Distributed Pairing**: Fixed positive-pair assignments in distributed training by gathering augmented views independently.
+- **Soft-NMS**: Return scores and indices in the documented order for empty detections.
+- **Sparse Classification Results**: Preserve sparse probabilities and class indices when sorting samples.
+- **Sparse MoE Router Initialization**: Fixed V-MoE router gate initialization.
+- **Transformer Attribution**: Weight each query token's attention row by its output-gradient importance instead of weighting key columns.
+- **VICReg Distributed Covariance**: Fixed covariance underweighting for unsynchronized distributed batches by normalizing with the number of participating embeddings.
+- **ViT Projection Dropout**: Fixed ViT and RoPE ViT attention projection dropout plumbing.
+- **RoPE ViT Resizing**: Preserve RoPE buffer dtype when resizing reduced-precision models.
+
+## 0.6.4 - 2026-07-06
+
+### Added
+
+- **Sparse MoE ViT**: Added [V-MoE](https://arxiv.org/abs/2106.05974)-style sparse mixture-of-experts Vision Transformer.
+- **Sparse MoE Training**: Added opt-in `--moe-aux-loss` support to classification training, enabling V-MoE auxiliary routing losses while logging classification and MoE auxiliary losses separately.
+- **Sparse MoE MIM**: Added ViT-MoE masked-token retention and omission encoder support, MoE auxiliary loss propagation through MIM heads and opt-in `--moe-aux-loss` support to MIM training.
+- **COCO Detection Tools**: Added `--coco-use-ids` to `predict_detection` for evaluating models that use raw COCO category ids and `--label-mapping` to `show-det-iterator`.
+
+### Changed
+
+- **Pretrained Models**:
+    - **Breaking**: Updated `lw_detr_2stg_objects365-coco_pe_spatial_s16` checkpoint metadata.
+    - **Breaking**: Updated `deformable_detr_boxref_binary_convnext_v2_tiny_imagenet21k` checkpoint metadata.
+
+### Fixed
+
+- **COCO Detection Annotation Remapping**: Fixed COCO category remapping across detection training, prediction, packing and iterator visualization for zero-based category ids, sparse COCO ids, class-file id mode and explicit label mappings.
+
+## 0.6.3 - 2026-07-04
+
+### Added
+
+- **Project Settings**: Added support for overriding public `birder.conf.settings` values from a project-level `birder.toml`.
+- **Detection Sliding-Window Inference**: Added native-image sliding-window inference to `predict_detection` with configurable tile size, overlap and merge mode.
+- **Detection Result Metrics**: Added configurable COCO max detection thresholds for detection prediction and result summarization.
+- **Pretrained Models**:
+    - `lw_detr_2stg_objects365-coco_pe_spatial_s16`: Added two-stage LW-DETR object detector with a PE-Spatial s16 backbone pretrained on Objects365-2020 and fine-tuned on COCO 2017.
+
+### Fixed
+
+- **Checkpoint Cleanup**: Fixed `--keep-last` checkpoint cleanup when `BASE_DIR` or `MODELS_DIR` is configured.
+- **Detection Training**: Fixed batch multiscale training size handling.
+- **Detection Results**: Fixed single-class detection report generation.
+- **Dynamic Size Export**: Fixed dynamic H/W export for DETR-style detectors by using symbolic-shape-friendly detection grids.
+- **ONNX Export**: Fixed dynamic H/W ONNX export.
+- **ViT Windowed Backbone Transform**: Added missing `transform_to_backbone()` override for ViT Windowed.
+
+## 0.6.2 - 2026-06-27
+
+### Added
+
+- **AIM v1**: Added [AIM v1](https://arxiv.org/abs/2401.08541) masked image modeling with autoregressive raster prefix masking.
+- **ViT Attention Masks**: Added optional `attn_mask` support to ViT-family `forward_features()` paths for custom token attention patterns.
+- **Pretrained Models**:
+    - `rope_vit_s14_swiglu_avg_eva-bio`: Added EVA MIM RoPE ViT-S/14 SwiGLU AVG image encoder pretrained weights distilled from a BioCLIP v2 ViT-L/14 teacher on natural biological images.
+    - `rope_vit_m14_swiglu_avg_eva-bio`: Added EVA MIM RoPE ViT-M/14 SwiGLU AVG image encoder pretrained weights distilled from a BioCLIP v2.5 ViT-H/14 teacher on natural biological images.
+    - `lw_detr_2stg_objects365_pe_spatial_s16`: Added two-stage LW-DETR object detector with a PE-Spatial s16 backbone pretrained weights on the Objects365-2020 dataset.
+
+### Fixed
+
+- **SSL Gradient Checkpointing**: Route DINOv2, DINOv2 distillation, Franca, CAPI and CAPI-DINO student checkpointing through their full student modules so post-backbone SSL heads/decoders participate where relevant.
+
+## 0.6.1 - 2026-06-22
+
+### Added
+
+- **ReXNet**: Added [ReXNet](https://arxiv.org/abs/2007.00992) and ReXNet Lite image classification model variants.
+- **SwiGLU FFN Normalization**: Added optional inner normalization to `SwiGLU_FFN`.
+- **NormFormer-Style ViTs**: Added optional [NormFormer](https://arxiv.org/abs/2110.09456)-style attention output normalization and normalized SwiGLU FFNs to ViT, FlexiViT, RoPE ViT and RoPE FlexiViT.
+- **Pretrained Models**:
+    - `rope_i_vit_l14_nf_swiglu_c1_eva02-clip`: Added BAAI-Vision [EVA-CLIP](https://arxiv.org/abs/2303.15389) RoPEi ViT-L/14 CLIP image encoder pretrained weights.
+
+### Fixed
+
+- **MIM Rectangular Inputs**: Fixed square-grid assumptions in MIM patchify/unpatchify helpers so non-square inputs work when dimensions are patch-divisible.
+
+## 0.6.0 - 2026-06-18
+
+### Added
+
+- **CLIP Training Augmentation**: Added a `clip` classification augmentation preset with configurable color-jitter and grayscale probabilities.
+- **Pretrained Models**:
+    - `rope_vit5_reg4_b16_nepa-bio`: Added NEPA RoPE ViT-5 Reg4 B/16 image encoder pretrained weights.
+
+### Changed
+
+- **BaseNet Feature API (Breaking)**: Added `feature_dim`, `flatten_features(include_special_tokens=True)` and `embedding_from_features()` to `BaseNet`, replacing pretraining-only `encoding_size` metadata and defining the `forward_features()` to embedding path for all classification models.
+
+## 0.5.6 - 2026-06-13
+
+### Added
+
+- **Gradient Checkpointing**: Added `--grad-checkpointing` / `--grad-checkpointing-segments` to supported training scripts and selected models.
+- **ViT Norm After Pooling**: Added `norm_after_pool` config for ViT-family models that apply final normalization after sequence pooling.
+- **Pretrained Models**:
+    - `vit_sam_b16_sam-sa1b`: Added Meta [Segment Anything](https://arxiv.org/abs/2304.02643) ViT SAM B/16 image encoder pretrained weights.
+
+### Changed
+
+- **SigLIP2 Weights Rename (Breaking)**: Renamed `vit_so400m_p14_ap_siglip-v2-webli` to `vit_so400m_p14_ap_c1_siglip-v2-webli` to use the SigLIP2-specific registered config.
+
+### Fixed
+
+- **ViT SAM Norm Epsilon**: Fixed ViT SAM block and neck normalization epsilon values to match the reference SAM.
+
+## 0.5.5 - 2026-06-12
+
+### Added
+
+- **Experimental CAPI-DINO SSL**: Added experimental CAPI-DINO self-supervised learning support.
+
+### Fixed
+
+- **WebDataset Relative Paths**: Fixed local WebDataset directory expansion for relative paths containing `..`, such as `../datasets/wds`.
+- **Classification Top-K Results**: Fixed classification result reporting for datasets with too few classes for the configured top-k value.
+
+## 0.5.4 - 2026-06-08
+
+### Added
+
+- **Prediction Compile Mode**: Added `--compile-mode` to `predict` and `predict_detection`.
+- **Training Directory Datasets**: Added `--allow-empty` to `train` and `train_kd` to allow empty classes in training directory datasets.
+- **Pretrained Models**:
+    - `se_resnext_50_arabian-peninsula`: Added SE ResNeXt 50 pretrained weights on the `arabian-peninsula` dataset.
+
+### Fixed
+
+- **SSL Non-Distributed Backward**: Fixed SimCLR and VICReg gather-layer gradients during non-distributed training.
+- **BYOL Backbone Checkpoints**: Fixed BYOL training checkpoint saves for backbones without a nested `backbone` attribute.
+
+## 0.5.3 - 2026-06-03
+
+### Added
+
+- **Torch-TensorRT Export**: Added `--trt` / `--tensorrt` support to `python -m birder.tools convert-model`, saving Torch-TensorRT exported-program artifacts as `.trt.pt2` files with Birder metadata.
+- **Pretrained Models**:
+    - `resnet_v2_50_inat21` and `resnet_v2_50_inat21-256px`: Added ResNet v2 50 pretrained weights on the iNaturalist 2021 dataset.
+    - `maxvit_s_il-all` and `maxvit_s_il-all256px`: Added MaxViT small pretrained weights on the `il-all` dataset.
+
+### Fixed
+
+- **Registered Model Configs**: Fixed registered model config handling so per-instance config overrides do not mutate shared registered defaults.
+- **CAPI FSDP Resume**: Fixed CAPI FSDP optimizer-state loading to use the same module root as checkpoint saving.
+
+## 0.5.2 - 2026-05-22
+
+### Added
+
+- **EVA MIM Training**: Added `train_eva.py` for EVA-style masked image modeling with a specified teacher.
+- **Feature Matching Tool**: Added `python -m birder.tools feature-matching` to visualize dense feature correspondences between two images.
+- **Pretrained Models**:
+    - `vit_reg4_so150m_p14_avg_mim-bio`: Added MIM SoViT-150M/14 image encoder pretrained weights.
+
+### Changed
+
+- **Compatibility**: Tested with PyTorch 2.12.
+- **RGB Mode Naming (Breaking)**: Renamed the `none` RGB normalization preset to `centered`. Use `--rgb-mode centered` or `get_rgb_stats("centered")` for the previous `(0.5, 0.5, 0.5)` mean/std behavior.
+
+### Fixed
+
+- **Pretraining Encoder Metadata**: Fixed `encoding_size` definitions for several retention-capable encoders.
+- **FSDP Compile Validation**: Reject `--compile-fullgraph` with `--distributed-mode fsdp` to avoid unsupported FSDP2 compiled-autograd behavior in PyTorch 2.12.
+- **Compiled Distributed Collectives**: Replaced `torch.distributed.nn.functional` collectives with functional collectives supported under `torch.compile` in PyTorch 2.12.
+
+## 0.5.1 - 2026-05-18
+
+### Added
+
+- **MicroViT v1 / v2**: Added [MicroViT v1](https://arxiv.org/abs/2502.05800) and [MicroViT v2](https://arxiv.org/abs/2605.10148) models.
+- **Training Script Customization**: Added `TrainOverrides` support across training scripts so users can replace selected defaults, such as transforms, filesystem image loading, WebDataset image decoding and custom batch collation, without copying training scripts.
+- **Channel-Aware Image Loading**: Added channel-aware `tv` and `pil` image loader selection for classification training, prediction, evaluation and related tools, including grayscale (`--channels 1`) directory loading.
+- **WebDataset Classification Decoding**: Added channel-aware WebDataset decoding for classification pipelines, including torchvision grayscale decoding and WebDataset's built-in grayscale PIL decoder.
+- **Pretrained Models**:
+    - `vit_reg1_s14_ls_dino-v2-dist-bio`: Added compact Bio-DINO-Dist ViT-S/14 image encoder pretrained weights distilled from the Bio-DINO SoViT-150M/14 model.
+
+## 0.5.0 - 2026-05-10
+
+### Added
+
+- **Training Runtime Knobs**: Added `--no-pin-memory`, `--persistent-workers` and `--compile-mode` to training scripts.
+- **Soft MoE FFN Layer**: Added `SoftMoE_FFN` for [soft mixture-of-experts](https://arxiv.org/abs/2308.00951) feed-forward blocks.
+- **Soft MoE ViT**: Added Soft MoE ViT variant.
+- **Pretrained Models**:
+    - `vit_reg4_so150m_p14_ls_dino-v2-bio-224px`: Added Birder Bio-DINO SoViT-150M/14 image encoder pretrained weights.
+    - `vit_reg4_so150m_p14_ls_dino-v2-bio-252px`: Added Birder Bio-DINO SoViT-150M/14 image encoder pretrained weights.
+    - `vit_reg4_so150m_p14_ls_dino-v2-bio-336px`: Added Birder Bio-DINO SoViT-150M/14 image encoder pretrained weights.
+
+## 0.4.15 - 2026-04-20
+
+### Changed
+
+- **Franca FSDP (Beta)**: Added `--distributed-mode fsdp` support to `train_franca` with two FSDP roots (student + teacher).
+
+### Fixed
+
+- **EMA Teacher Resume / Optimizer-State Loading**: Freeze EMA teachers earlier in `train_dino_v2`, `train_dino_v2_dist`, `train_franca` and `train_capi` so teacher-only parameters do not participate in optimizer-state matching or optimizer parameter-group construction during resume.
+- **NEPA Loss Precision**: Cast `pred` and `target` to float32 in `prediction_loss` so `F.normalize` and the cosine-similarity dot product run in full precision under autocast.
+- **SmoothedValue Count Reduction**: Use `round()` instead of `int()` on the reduced count to fix off-by-one from `ReduceOp.AVG` floating-point imprecision on non-power-of-2 world sizes.
+
+## 0.4.14 - 2026-04-10
+
+### Added
+
+- **EfficientMod**: Added [EfficientMod](https://arxiv.org/abs/2403.19963) classification models.
+- **Detection WDS Mosaic Support**: Added mosaic augmentation support for WebDataset detection.
+- **Predict Feature Exports**: Added `--save-features` and `--save-detection-features` to `python -m birder.scripts.predict` to save `forward_features()` and `detection_features()` outputs.
+- **Training Compile Recompile Limits**: Added `--compile-recompile-limit` and `--compile-accumulated-recompile-limit` to training scripts, plus `COMPILE_RECOMPILE_LIMIT` and `COMPILE_ACCUMULATED_RECOMPILE_LIMIT` environment-variable overrides.
+
+### Changed
+
+- **Compatibility**: Raised the minimum supported PyTorch version to 2.10.
+- **Similarity Tool CLI Overhaul**: Refactored `python -m birder.tools similarity` to use the modern inference CLI pattern with explicit runtime controls (`--batch-size`, worker/device/AMP and dtype flags), simplified embedding distance selection via `--distance-metric` and removed the legacy t-SNE-based path.
+
+### Fixed
+
+- **Detection Packing Ignore List**: Added `--ignore-file` to `python -m birder.tools pack-detection` so listed image file names are skipped while packing COCO-style detection datasets into WebDataset shards.
+
+## 0.4.13 - 2026-04-03
+
+### Added
+
+- **RF-DETR Detector**: Added [RF-DETR](https://arxiv.org/abs/2511.09554) detection models.
+- **Windowed ViT**: Added Windowed Vision Transformer variants with windowed attention and dynamic-size support.
+- **Linear Assignment Custom CUDA Op**: Added `birder.ops.linear_assignment` with a batched CUDA linear-assignment kernel adapted from [torch-linear-assignment](https://github.com/ivan-chai/torch-linear-assignment).
+- **Detection Packing Tool**: Added `python -m birder.tools pack-detection` to pack COCO-style detection datasets into WebDataset shards with packed annotation metadata.
+- **Detection WebDataset Support**: Added `--wds` support to `python -m birder.scripts.train_detection`, `python -m birder.scripts.predict_detection` and `python -m birder.tools show-det-iterator` for training, prediction and visualization on packed detection WebDataset shards.
+- **Detection Multiscale Max Size**: Added `--multiscale-max-size` to detection training and iterator tooling to let transform and batch multiscale ranges exceed the model's base `--size`.
+- **Pretrained Models**:
+    - `rope_i_vit_reg1_t16_pn_npn_avg_c1_pe-spatial`: Added Meta [Perception Encoder](https://arxiv.org/abs/2504.13181) ViT-T/16 CLIP image encoder pretrained weights.
+    - `rope_i_vit_reg1_b16_pn_npn_avg_c1_pe-spatial`: Added Meta [Perception Encoder](https://arxiv.org/abs/2504.13181) ViT-B/16 CLIP image encoder pretrained weights.
+
+### Changed
+
+- **Hungarian Matcher Batched Assignment**: Optimized `HungarianMatcher` in DETR and Deformable DETR by grouping batch items with the same target count and running linear assignment in a single batched call per group.
+- **DeiT3 API Consolidation (Breaking)**: Removed the `DeiT3` and `RoPE_DeiT3` classes and folded their model registrations into `ViT` and `RoPE_ViT`.
+- **Registry Registered-Config Naming (Breaking)**: Renamed registry terminology from "alias" to "registered name" / "registered config" for configured model entries. `ModelRegistry.aliases` is now `ModelRegistry.registered_configs`, `get_model_alias()` is now `get_registered_name()` and `register_model_config(...)` now uses `name` as its first parameter.
+- **Saved Model Config Keys (Breaking)**: Model config metadata emitted by `get_network_config()` and consumed by `load_model_with_cfg()` now uses `registered_name`, `backbone_registered_name`, `encoder_registered_name` and `base_net_registered_name` instead of the previous `alias`, `backbone_alias`, `encoder_alias` and `base_net_alias`. Existing saved configs using the old keys must be updated before calling `load_model_with_cfg()`.
+
+### Fixed
+
+- **COCO Mosaic Probability in Virtual-Epoch Mode**: Fixed mosaic probability decay not propagating to DataLoader workers in virtual-epoch mode with `num_workers > 0`.
+
+## 0.4.12 - 2026-03-23
+
+### Added
+
+- **Pack Start Number**: Added `--start-number` to `python -m birder.tools pack` to offset output file numbering.
+- **Train Layer Freezing**: Added `--freeze-layers` to freeze the first N layers using a model's `block_group_regex`.
+- **MIM Encoder Freezing**: Added `--freeze-encoder`, `--freeze-encoder-stages` and `--freeze-encoder-layers` to `train_mim.py`.
+- **Pretrained Models**:
+    - `vit_h14_pn_bioclip-v25`: Added [BioCLIP 2.5](https://arxiv.org/abs/2505.23883) ViT-H/14 pretrained weights.
+
+### Changed
+
+- **Compatibility**: Tested with PyTorch 2.11.
+
+### Fixed
+
+- **FSDP Teacher EMA Update**: Fixed mixed `torch.Tensor` / `DTensor` `_foreach_lerp_` crash in DINOv2 and CAPI FSDP training.
+- **DINOv2 / Franca Sinkhorn Mixed Dtypes**: Fixed `float32` teacher targets from Sinkhorn queueing / assignment colliding with student logits during DINO and iBOT loss computation under mixed-precision training.
+- **DINOv2 Distillation DDP EMA**: Fixed `student.backbone` attribute access through the DDP wrapper in `train_dino_v2_dist` EMA update.
+- **FCOS Anchor Schedule**: Fixed FCOS anchor sizes to follow the backbone-reported `max_stride`, including 16- and 32-stride backbones.
+- **RT-DETR v1/v2 Decoder Aux BBox Training**: Restored the upstream gradient path through previous reference-point refinements when forming deeper auxiliary bbox outputs during training.
+- **LW-DETR Upstream Fidelity**: Restored the upstream matcher class-cost weight, decoder output normalization, IA-BCE positive-target clamp, targeted decoder/query-position Xavier init and the projector's 0.5x ReLU downsample path.
+- **Plain-DETR Upstream Fidelity**: Restored the hybrid one-to-one/one-to-many self-attention mask, upstream-style stride-aligned backbone upsampling and input projection, global top-k inference selection and valid-ratio scaling for BoxRPB reference points.
+- **YOLO v4 / v4 Tiny Darknet Fidelity**: Updated target assignment, ignore-mask computation, box-loss weighting and per-class postprocessing to better match Darknet YOLOv4 behavior.
+- **YOLO v3 Darknet Fidelity**: Switched ignore-mask computation to decoded prediction boxes, restored YOLO-style box-area weighting in the coordinate loss, kept per-class detections at postprocess time and cleaned up `_build_targets()` to avoid repeated per-image ignore-box construction.
+
+## 0.4.11 - 2026-03-13
+
+### Added
+
+- **ViT-family No-APE Option**: Added `abs_pos_embed` config support.
+- **Axial RoPE Style**: Added `rope_style="axial"` support for RoPE backbones.
+- **Centered-Separate RoPE Style**: Added `rope_style="centered_separate"` support and `rope_cs_*` DINOv3-compatible RoPE ViT presets.
+- **Shared RoPE Module**: Added `birder.layers.rope` to centralize shared rotary position embedding across RoPE backbones.
+- **Butterflies and Moths Austria Datahub**: Added [Butterflies and Moths Austria](https://huggingface.co/datasets/birder-project/butterflies-moths-austria) dataset to `birder.datahub.classification` for butterfly and moth species classification.
+- **Butterflies Eval Benchmark**: Added `butterflies` benchmark to `birder.eval` for butterfly and moth species classification using KNN (macro F1 metric).
+- **SnakeCLEF2023 Datahub**: Added [SnakeCLEF2023](https://www.imageclef.org/SnakeCLEF2023) dataset helper to `birder.datahub.evaluation` for snake species classification.
+- **SnakeCLEF Eval Benchmark**: Added `snakeclef` benchmark to `birder.eval` for observation-level SnakeCLEF2023 species classification.
+- **CUB-200-2011 Eval Benchmark**: Added `cub200` benchmark to `birder.eval` for cross-split image retrieval using mAP and Recall@K.
+- **Retrieval Eval Method**: Added `birder.eval.methods.retrieval` for cosine-similarity embedding retrieval evaluation.
+- **Pretrained Models**:
+    - `vit_b16_pn_biotrove-clip-o`: Added [BioTrove](https://arxiv.org/abs/2406.17720) ViT-B/16 CLIP image encoder pretrained weights.
+    - `vit_reg4_b14_nps_ls_dino-v2-lvd142m`: Added Meta [DINOv2](https://arxiv.org/abs/2304.07193) ViT-B/14 with registers.
+    - `vit_reg4_s14_nps_ls_dino-v2-lvd142m`: Added Meta [DINOv2](https://arxiv.org/abs/2304.07193) ViT-S/14 with registers.
+
+### Changed
+
+- **Eval Benchmark Result Resumption**: Eval benchmark CLIs now reuse previously saved results for matching embedding/config combinations and skip recomputation on reruns.
+- **Multi-Manifest WebDataset Loading**: `--wds-info` now accepts multiple manifest files and merges their shard lists into one logical WebDataset, including relative-path resolution for remote `_info.json` URLs.
+
+## 0.4.10 - 2026-03-06
+
+### Added
+
+- **LeJEPA SSL**: Added [LeJEPA](https://arxiv.org/abs/2511.08544) self-supervised training via `birder.net.ssl.LeJEPA` and `train_lejepa`.
+- **Pretrained Models**:
+    - `vit_b16_ls_franca-bioscan5m`: Added [Franca](https://arxiv.org/abs/2507.14137) ViT-B/16 pretrained weights on the [BIOSCAN-5M](https://arxiv.org/abs/2406.12723) pretrain split.
+    - `shvit_s1_il-common`: Added [SHViT](https://arxiv.org/abs/2401.16456) S1 pretrained weights on the `il-common` dataset.
+- **Caltech Camera Traps Datahub**: Added [CaltechCameraTraps](https://beerys.github.io/CaltechCameraTraps/) dataset helper to `birder.datahub.evaluation`.
+- **CCT Eval Benchmark**: Added `cct` benchmark to `birder.eval` for Caltech Camera Traps cross-location evaluation with two scores: cross-location category accuracy and non-empty F1.
+
+### Fixed
+
+- **NEPA EMA Initialization Order**: Fixed an initialization-order bug in `train_nepa`.
+- **Transformer Embedding Decay for Registers**: Included `reg_tokens` in the `--transformer-embedding-decay` parameter key set so register-token parameters receive the configured embedding decay.
+- **ViT-family Input Embedding Semantics**: Updated `forward_features(..., return_input_embedding=True)` to return clean pre-APE input embeddings.
+
+## 0.4.9 - 2026-02-28
+
+### Changed
+
+- **FlexiViT Patch-Size Sampling**: Moved random patch-size selection from `forward()` to `forward_features()` in `flexivit` and `rope_flexivit`, so all feature-extraction paths (including NEPA pretraining) apply patch-size randomization consistently.
+
+## 0.4.8 - 2026-02-24
+
+### Added
+
+- **Efficient Probing Pooling Layer**: Added [EfficientProbing](https://arxiv.org/abs/2506.10178) attention-based pooling module in `birder.layers`.
+- **DINOv2 Resume Resolution Adaptation**: Added `--adapt-size` to `train_dino_v2` to adapt resolution after loading resumed checkpoints (high-res adaptation workflow).
+- **ViT Input Embedding Return**: Added `return_input_embedding=True` support to `forward_features` so it can optionally return input embeddings together with encoded features.
+- **NEPA SSL**: Added [NEPA](https://arxiv.org/abs/2512.16922) self-supervised training via `birder.net.ssl.NEPA` and `train_nepa`.
+- **DINOv2 Distillation Mixed Patch Sizes**: Added teacher global-crop interpolation in `train_dino_v2_dist` so distillation supports different teacher/student patch strides while keeping iBOT mask-token alignment.
+
+### Changed
+
+- **DINOv2 FSDP (Beta)**: Added `--distributed-mode fsdp` support to `train_dino_v2` with two FSDP roots (student + teacher).
+- **DDP No-Sync for Accumulation**: training scripts now use `DDP.no_sync()` on non-update iterations.
+
+### Fixed
+
+- **Gradient Accumulation Loss Scaling**: Fixed loss scaling during gradient accumulation in training so optimization behavior stays consistent across accumulation settings.
+
+## 0.4.7 - 2026-02-20
+
+### Added
+
+- **VOLO**: Added [VOLO](https://arxiv.org/abs/2106.13112) (Vision Outlooker) classification models with outlook attention and class attention.
+- **Cosine Scheduler Fraction**: Added `cosine_fraction` parameter to `cosine_scheduler` and `get_scheduler` for truncated cosine annealing.
+
+### Changed
+
+- **SimCLR FSDP (Beta)**: Improved reliability of the previously experimental `--distributed-mode fsdp` path in `train_simclr`.
+- **CAPI FSDP (Beta)**: Added `--distributed-mode fsdp` support to `train_capi` with two FSDP roots (student + teacher).
+- **FSDP Utility Mesh Reuse**: Extended `fsdp_utils.setup_fsdp` to accept an optional prebuilt device mesh, allowing multiple roots to share a single mesh/process-group setup.
+
+### Fixed
+
+- **Custom Kernel Memory Leak (PyTorch 2.10)**: Fixed memory leak in custom CUDA ops (MSDA, SWAttention) during training with PyTorch 2.10 by migrating C++ bindings from `PYBIND11_MODULE` to `TORCH_LIBRARY_EXPAND` for proper dispatcher integration.
+- **MSDA Pure Python Path**: Optimized the pure Python multi-scale deformable attention by removing GPU→CPU synchronization, reducing intermediate tensor allocations and accumulating output in-place.
+- **Compiled Models Layer-Decay + Custom WD**: Fixed layer-decay and custom weight-decay parameter grouping for `torch.compile`-wrapped models.
+- **Data2Vec / Data2Vec2 EMA Teacher Mode**: Keep the EMA backbone in eval mode during training.
+
+## 0.4.6 - 2026-02-14
+
+### Added
+
+- **Distributed DDP Buffer Sync Toggle**: Added `--no-broadcast-buffers` to training CLIs to disable `DistributedDataParallel` buffer broadcasting from rank 0.
+- **Detection Label Mapping**: Added `--label-mapping` support to `train_detection` and `predict_detection` for remapping labels to groups.
+- **Predict Raw Labels Flag**: Added `--save-labels` to `predict` to include a `label` metadata column in raw outputs (`embeddings`, `logits`, `output`).
+- **ImageNet-1K Eval Benchmark**: Added `imagenet1k` benchmark to `birder.eval` using SimpleShot with k-shot sampling (`--k`).
+- **RoPE ViT-5**: Added [ViT-5](https://arxiv.org/abs/2602.08071) style RoPE model.
+- **SHViT**: Added [SHViT](https://arxiv.org/abs/2401.16456) model variants with reparameterization support.
+- **PNASNet**: Added [PNASNet](https://arxiv.org/abs/1712.00559) classification models (`pnasnet_large` and `pnasnet_mobile`).
+- **Spatial Robustness Eval**: Added `spatial` command to `birder.eval` for robustness evaluation under spatial transforms.
+- **Experimental FSDP (ZeRO-2/3) for SimCLR**: Added experimental PyTorch FSDP support to `train_simclr` via `--distributed-mode fsdp` (ZeRO-2/3). This path is not yet stable.
+
+### Fixed
+
+- **Custom Kernel Memory Leak (PyTorch 2.10)**: Attempted fix for memory leak in custom CUDA ops (MSDA, SWAttention) during training with PyTorch 2.10.
+- **RA Sampler Epoch Length**: Fixed `RASampler` so `--ra-sampler` no longer inflates epoch length by `--ra-reps`.
+- **Detection Parallel Inference**: Fixed multi-GPU `predict_detection --parallel` handling.
+- **Detection Parallel + Compile**: `predict_detection` now supports `--parallel` with `--compile` (replica compilation), `--compile-backbone` remains unsupported with `--parallel`.
+
+## 0.4.5 - 2026-02-08
+
+### Added
+
+- **Reciprocal Square-Root Scheduler**: Added `reciprocal-sqrt` learning rate scheduler option (`--lr-scheduler reciprocal-sqrt`).
+- **Base MLP Head Option**: Added `mlp_head` config option to `BaseNet` classifiers to enable a MLP classification head (`Linear -> GELU -> LayerNorm -> Linear`) instead of a single linear layer.
+
+### Changed
+
+- **EfficientNet Dropout Consolidation (Breaking)**: Moved dropout from the classifier head into the feature pipeline for EfficientNet Lite, EfficientNet v1 and EfficientNet v2. This changes `state_dict` key names and breaks existing checkpoints.
+- **Pretrained Models**:
+    - **Breaking**: Updated `efficientnet_v2_s_arabian-peninsula`
+
+### Fixed
+
+- **Plankton Benchmark**: Fixed validation accuracy bug in eval benchmarks where unlabeled samples were included during evaluation.
+
+## 0.4.4 - 2026-02-06
+
+### Fixed
+
+- **Release pipeline**: Fixed an issue preventing package publication due to CI configuration mismatch.
+
+## 0.4.3 - 2026-02-06
+
+### Added
+
+- **Eval Module**: New `birder.eval` module for model evaluation with subcommand-based CLI (`python -m birder.eval <command>`).
+    - `classification`: Evaluate pretrained classification models (migrated from `evaluate.py` with WebDataset support and configurable `--num-workers`).
+    - `adversarial`: Evaluate adversarial robustness with FGSM, PGD, DeepFool and SimBA attacks.
+    - `awa2`: Run [AwA2](https://arxiv.org/abs/1707.00600) benchmark using MLP probe for 85-attribute multi-label classification (macro F1 metric).
+    - `fishnet`: Run [FishNet](https://fishnet-2023.github.io/) benchmark using MLP probe for 9-trait multi-label classification (macro F1 metric).
+    - `flowers102`: Run [Flowers102](https://www.robots.ox.ac.uk/~vgg/data/flowers/102/) benchmark using SimpleShot with full training set.
+    - `bioscan5m`: Run [BIOSCAN-5M](https://arxiv.org/abs/2406.12723) benchmark - unsupervised embedding evaluation using UMAP + Agglomerative Clustering + Adjusted Mutual Information.
+    - `fungiclef`: Run [FungiCLEF2023](https://www.imageclef.org/FungiCLEF2023) benchmark - 1,604 species classification using KNN.
+    - `nabirds`: Run [NABirds](https://dl.allaboutbirds.org/nabirds) benchmark using KNN with configurable k neighbors.
+    - `newt`: Run [NeWT](https://arxiv.org/abs/2103.16483) benchmark (164 binary tasks with SVM, micro-averaged accuracy, per-cluster breakdown).
+    - `plankton`: Run [SYKE-plankton_IFCB_2022](https://b2share.eudat.eu/records/xvnrp-7ga56) benchmark - 50 class phytoplankton classification using linear probing.
+    - `plantdoc`: Run [PlantDoc](https://arxiv.org/abs/1911.10317) benchmark using SimpleShot few-shot learning with configurable k-shot sampling.
+    - `plantnet`: Run [PlantNet-300K](https://openreview.net/forum?id=eLYinD0TtIt) benchmark using SimpleShot few-shot learning with configurable k-shot sampling.
+- **Eval Methods**: Added evaluation methods to `birder.eval.methods`:
+    - `simpleshot`: [SimpleShot](https://arxiv.org/abs/1911.04623) few-shot classifier using nearest centroid with mean centering and L2 normalization.
+    - `knn`: K-nearest neighbors with temperature-scaled softmax voting.
+    - `mlp`: MLP probe for multi-label classification following AwA2 design (Linear -> Dropout -> Linear).
+    - `ami`: AMI clustering using UMAP + Agglomerative Clustering + Adjusted Mutual Information.
+    - `linear`: Linear probing on frozen embeddings - trains a single linear layer with cross-entropy loss.
+    - `svm`: SVM classifier with StandardScaler preprocessing and RandomizedSearchCV hyperparameter tuning.
+- **AwA2 Datahub**: Added [AwA2](https://arxiv.org/abs/1707.00600) (Animals with Attributes 2) dataset to `birder.datahub.evaluation` for attribute prediction benchmark.
+- **FishNet Datahub**: Added [FishNet](https://fishnet-2023.github.io/) dataset to `birder.datahub.evaluation` for trait prediction benchmark.
+- **FungiCLEF2023 Datahub**: Added [FungiCLEF2023](https://www.imageclef.org/FungiCLEF2023) dataset to `birder.datahub.evaluation` for fungi species classification benchmark.
+- **NABirds Datahub**: Added [NABirds](https://dl.allaboutbirds.org/nabirds) dataset to `birder.datahub.evaluation` for bird species classification benchmark.
+- **NeWT Datahub**: Added [NeWT](https://arxiv.org/abs/2103.16483) (Natural World Tasks) dataset to `birder.datahub.evaluation` for benchmark evaluation.
+- **Plankton Datahub**: Added [SYKE-plankton_IFCB_2022](https://b2share.eudat.eu/records/xvnrp-7ga56) dataset to `birder.datahub.evaluation` for phytoplankton classification benchmark.
+- **PlantDoc Datahub**: Added [PlantDoc](https://arxiv.org/abs/1911.10317) dataset to `birder.datahub.evaluation` for plant disease classification benchmark.
+- **PlantNet Datahub**: Added [PlantNet-300K](https://openreview.net/forum?id=eLYinD0TtIt) dataset to `birder.datahub.evaluation` for plant species classification benchmark.
+- **Convenience Loader**: Added `load_pretrained_model_and_transform` to return a pretrained model and its default inference transform.
+- **Detection PT2 Export**: All detection models now support `torch.export`, except Faster R-CNN, which is currently unsupported due to data-dependent control flow in the RPN.
+- **Model Conversion**: Added `--opset` and `--simplify` arguments to `convert-model` for better control over ONNX export.
+- **Image Loader Selection**: Added `--img-loader` to `predict` CLI to select the image decoding backend (`tv` or `pil`), matching the existing training option.
+- **Channels-Last Inference**: Added `--channels-last` to `predict`, `predict_detection`, `birder.eval classification` and `benchmark` CLIs to opt into channels-last memory format.
+- **Channels-Last Training**: Added `--channels-last` to `train`, `train_detection` and `train_kd` CLIs to opt into channels-last memory format during training.
+
+### Changed
+
+- **Detection ImageList**: Changed `ImageList.image_sizes` from `list[tuple[int, int]]` to `torch.Tensor` with shape `(B, 2)`.
+- **Sinkhorn Queues (SSL)**: Queue tensors, pointers and full-state are now registered buffers so they save/load with the model state dict.
+
+### Fixed
+
+- **MAE Hiera Unpatchify**: Fixed incorrect pixel order in `unpatchify` to match the `[C, H, W]` order from `get_pixel_label_2d`.
+- **CSWin Transformer PT2 Export**: Fixed dynamic batch shape specialization caused by Python `int()` casting during window reconstruction. All classification models are now exportable.
+
+## 0.4.2 - 2026-01-30
+
+### Added
+
+- **LW-DETR Detection**: Added [LW-DETR](https://arxiv.org/abs/2406.03459) object detection model.
+- **Backbone Layer Decay**: Added `--backbone-layer-decay` CLI argument to apply layer-wise learning rate decay (LLRD) specifically to backbone parameters during detection training.
+- **Pretrained Models**:
+    - `vit_b16_pn_bioclip-v1`: Added [BioCLIP](https://arxiv.org/abs/2311.18803) ViT-B/16 pretrained weights.
+
+### Changed
+
+- **BioCLIP v2 Weights (Breaking)**: Updated `vit_l14_pn_bioclip-v2` model weights to include visual projection layer (head).
+- **Compatibility**: Tested with PyTorch 2.10.
+
+## 0.4.1 - 2026-01-23
+
+### Added
+
+- **Plain DETR Detection**: Added [Plain DETR](https://arxiv.org/abs/2308.01904) object detection model with Box-to-Pixel Relative Position Bias (BoxRPB).
+- **RT-DETR v2 Detection**: Added [RT-DETR v2](https://arxiv.org/abs/2407.17140) object detection model.
+- **Detection Multiscale Step**: Added `--multiscale-step` to control multiscale size increments and collator `size_divisible` padding for detection training.
+- **ConvNeXt v1 Isotropic**: Added isotropic ConvNeXt v1 variants.
+- **Training Top-K Accuracy**: Added optional top-k accuracy tracking during classification training.
+
+### Changed
+
+- **ViT-family Detection Outputs**: ViT, Simple ViT, DeiT, DeiT3, FlexiViT, ViT_Parallel and RoPE variants now support `out_indices` for multi-stage detection features.
+- **DINOv2 Loss Vectorization**: Vectorized `DINOLoss.forward` using einsum, improving training throughput.
+- **Franca Loss Vectorization**: Vectorized `DINOLossMRL.forward` using einsum, improving training throughput.
+- **Benchmark CLI**: `benchmark.py` can now benchmark detection networks.
+
+### Fixed
+
+- **Training Metrics Per-Epoch Reset**: Updated all training scripts to reset metrics at the beginning of each epoch, ensuring per-epoch statistics are independent.
+
+## 0.4.0 - 2026-01-18
+
+### Changed
+
+- **ViT Attention Consolidation (Breaking)**:
+    - Dropped the `nn.MultiheadAttention` path, ViT now always uses the custom attention implementation.
+    - Renamed ViT block attributes `self_attention` → `attn` and `ln1/ln2` → `norm1/norm2` (affects hooks, tooling and checkpoint key names).
+- **Checkpoint States Filenames (Breaking)**: Training state checkpoints now use a `.pt` extension (e.g., `_states.pt`).
+- **Network Architecture Consolidation (Breaking)**:
+    - Merged `MobileNet_v3_Large` and `MobileNet_v3_Small` into a unified `MobileNet_v3` class. Use model configs (`mobilenet_v3_large_*` and `mobilenet_v3_small_*`) instead of separate classes.
+    - Merged `SE_ResNet_v1`, `SE_ResNet_v2` and `SE_ResNeXt` into their respective base classes (`ResNet_v1`, `ResNet_v2`, `ResNeXt`). SE variants are now configured via the `squeeze_excitation` config parameter rather than separate classes.
+- **Pretrained Models**:
+    - **Breaking**: Dropped `tiny_vit_5m_il-common`
+    - **Breaking**: Dropped `efficientformer_v2_s0_il-common` and `efficientformer_v2_s1_il-common`
+    - **Breaking**: Dropped `mobilenet_v2_1_0_il-common`
+    - **Breaking**: Dropped `mobilevit_v1_xxs_il-common` and `mobilevit_v1_xs_il-common`
+    - **Breaking**: Dropped `mobilevit_v2_1_0_il-common` and `mobilevit_v2_1_5_il-common`
+    - **Breaking**: Dropped `repghost_1_0_il-common`
+    - **Breaking**: Dropped `squeezenext_1_0_il-common`
+
+### Fixed
+
+- **CaiT LayerNorm eps**: Fixed an incorrect LayerNorm `eps` in the CaiT init.
+- **MaxViT Downsampling Projection**: Fixed an incorrect AvgPool kernel size.
+- **HGNet v1/v2**: Fixed an incorrect padding.
+- **TinyViT MBConv Activation**: Fixed incorrect activation order at MBConv.
+- **DenseNet Final Normalization**: Added the missing terminal BatchNorm + ReLU to the final DenseNet stage.
+- **DPN Activation**: Fixed incorrect activation function in DPN norm_act (ELU -> ReLU).
+- **EfficientFormer v2 ConvMLP Activation**: Fixed incorrect activation function in ConvMLP (ReLU -> GELU).
+- **MobileNet v2**: Restored upstream parity by removing the redundant 1×1 expand conv in `t=1` inverted residual blocks.
+- **MobileViT v1**: Removed stem and final convolutional layers biases.
+- **MobileViT v2**: Removed stem bias and removed the extra SiLU activation after the `conv_proj` to match upstream.
+- **NFNet Final Activation**: Added missing terminal `GammaAct`.
+- **RepGhostNet Squeeze-Excite Activation**: Fixed incorrect SE activation configuration to match original.
+- **DETR Matchers**: Penalize non-finite costs in Hungarian matching to avoid invalid assignments.
+
+## 0.3.3 - 2026-01-16
+
+### Added
+
+- **Pretrained Models**:
+    - `hieradet_small_sam2_1`: Added Meta SAM 2.1 HieraDet small pretrained weights.
+
+### Changed
+
+- **HieraDet Dynamic Window Naming (Breaking)**: Renamed HieraDet models using dynamic window sizes from `hieradet_*` to `hieradet_d_*`.
+    - Affected models:
+        - `hieradet_d_small_dino-v2` (previously `hieradet_small_dino-v2`)
+        - `hieradet_d_small_dino-v2-imagenet12k` (previously `hieradet_small_dino-v2-imagenet12k`)
+        - `hieradet_d_small_dino-v2-inat21` (previously `hieradet_small_dino-v2-inat21`)
+
+### Fixed
+
+- **Hieradet Forward Padding**: Fixed an incorrect padding in the HieraDet forward pass.
+
+## 0.3.2 - 2026-01-15
+
+### Added
+
+- **ViT QK Normalization**: Added optional QK normalization support (`qk_norm` config option) to all ViT variants (ViT, FlexiViT, RoPE ViT, RoPE FlexiViT).
+- **Extended DINOv2 Metrics**: Added target entropy and center drift tracking to training and distillation (`--no-extended-metrics` to disable).
+- **Feature PCA Visualization**: Added Feature PCA method for visualizing feature maps using Principal Component Analysis.
+
+### Fixed
+
+- **Avg Model Tool**: Avoid averaging non-floating `state_dict` entries (e.g. `num_batches_tracked`, `relative_position_index`).
+- **Model Registry**: Fixed model config registration to consistently register on the active registry instance.
+
+## 0.3.1 - 2026-01-14
+
+### Added
+
+- **Detection Confusion Matrix**: Added detection confusion matrix (background class, score/IoU thresholds) with CLI flags in `det-results`.
+- **Fused Optimizer Flag**: Added `--opt-fused` CLI flag to request fused optimizer implementations when supported.
+- **Sinkhorn Queueing (SSL)**: Added optional Sinkhorn queueing for DINOv2, DINOv2 distillation, Franca and CAPI training.
+- **Pretrained Models**:
+    - `gc_vit_xxt_il-common`
+
+### Fixed
+
+- **CAPI Global Sinkhorn**: Fixed the non-position-wise Sinkhorn-Knopp path to keep assignments aligned with logits.
+
+## 0.3.0 - 2026-01-11
+
+### Added
+
+- **Infinite Samplers**: Added `InfiniteSampler`, `InfiniteDistributedSampler` and `InfiniteRASampler` for continuous dataset iteration.
+- **Virtual Epochs**: Added `--steps-per-epoch` virtual epoch support across training scripts.
+- **Agreement Metrics**: Added prototype/patch agreement tracking for applicable SSL training (DINO v1/v2 and iBOT).
+- **Custom Kernel Toggle API**: Added `set_custom_kernels_enabled` / `is_custom_kernels_enabled` to control custom kernel loading in code.
+- **Pretrained Models**:
+    - `lit_v1_t_il-common`
+
+### Changed
+
+- **Detection Results CLI**: Expanded `det-results` to support multi-file comparison tables, per-class filtering, short summaries and summary CSV output.
+- **Quantize Model Tool**: Updated `quantize-model` to use PT2E/TorchAO quantization instead of deprecated FX/TorchScript.
+- **SWAttention/MSDA Custom Ops**: Routed custom kernels through `torch.library.custom_op` to allow full-graph `torch.compile` capture.
+
+### Fixed
+
+- **Adjust Size Device / Grad**: Ensure `adjust_size` updates run without grad tracking and keep buffers/parameters on the active device.
+- **Sampler Seeding**: Ensure training samplers consistently honor `--seed` across distributed and non-distributed modes.
+- **Soft-NMS GPU Sync**: Removed host-side `.item()` synchronization from the soft-nms kernel implementation.
+
+## 0.2.3 - 2026-01-09
+
+### Added
+
+- **LIT v2**: Added [LIT v2](https://arxiv.org/abs/2205.13213) classification models with HiLo attention.
+- **LIT v1**: Added [LIT v1](https://arxiv.org/abs/2105.14217) classification models.
+- **GC-ViT**: Added [Global Context Vision Transformer](https://arxiv.org/abs/2206.09959) classification models with dynamic size support (adapted from timm).
+- **YOLO Custom Anchors**: Allow YOLO models to consume user-provided anchor specs or auto-anchors JSON.
+- **Detection TTA (WBF)**: Added test time augmentations with Weighted Boxes Fusion in detection inference.
+- **EfficientDet Dynamic Size**: Support dynamic multiscale inputs for EfficientDet.
+- **Embedding Distillation**: Added embedding matching distillation to `train_kd.py` via `--type embedding`.
+- **Custom Layer LR Scaling**: Added `--custom-layer-lr-scale` CLI argument to apply custom learning rate scales to specific layers by name (e.g., `--custom-layer-lr-scale offset_conv=0.01,attention=0.5`).
+- **Custom Layer Weight Decay**: Added `--custom-layer-wd` CLI argument to apply custom weight decay to specific layers by name (e.g., `--custom-layer-wd offset_conv=0.0`).
+- **Pretrained Models**:
+    - `vovnet_v2_19_il-common`
+    - `vovnet_v2_39_il-common`
+    - **Breaking**: Dropped `vit_l16_eu-common`
+
+### Fixed
+
+- **Layer-wise LR Decay**: Fixed critical bug where `lr_scale` from layer decay and custom layer LR scaling was not being applied to actual learning rates.
+- **CocoInference Bounding Boxes**: Fixed incorrect bounding box coordinates in detection inference.
+- **Pack Tool**: Fixed multiprocessing reliability issues, hangs and signal handling.
+
+## 0.2.2 - 2026-01-01
+
+### Added
+
+- **ResNet-D Variants**: Added ResNet-D support to ResNet v1 based on the ["Bag of Tricks for Image Classification with Convolutional Neural Networks"](https://arxiv.org/abs/1812.01187) paper, featuring deep stem and average pooling downsample.
+- **DeepFool Attack**: Added [DeepFool](https://arxiv.org/abs/1511.04599) adversarial attack support.
+- **SimBA Attack**: Added [SimBA](https://arxiv.org/abs/1905.07121) (Simple Black-box Attack) adversarial support.
+- **YOLO Auto Anchors**: Added a k-means anchor fitting tool for YOLO models.
+- **Transformer Attribution**: Added [Transformer Attribution](https://arxiv.org/abs/2012.09838) for transformer interpretability.
+
+### Changed
+
+- **Data2Vec2 Target Normalization**: Align target normalization more closely with the paper (per-layer instance norm before averaging).
+- **EMA Step Alignment**: Align EMA updates and warmup to optimizer steps (including grad accumulation).
+- **Adversarial Attack Refactor**: Major refactor of adversarial attack implementations and CLI wiring.
+- **Introspection Module Refactor**: Major refactor of interpretability methods.
+- **Detection Training Loss Logging**: Enhanced detection training to log individual loss components (e.g., `loss_objectness`, `loss_rpn_box_reg`, `labels`, `giou`, etc.).
+
+### Fixed
+
+- **YOLO v3 / v4 Dynamic Anchor Scaling**: Removed automatic anchor scaling during multiscale training/inference as it caused prediction instability.
+- **MultiStepLR Absolute Milestones**: Fixed MultiStepLR scheduler to treat `--lr-steps` as absolute epoch/step positions rather than relative to warmup end.
+- **DINOv2 Distillation Teacher Mode**: Keep the teacher in eval mode during distillation training.
+- **Data2Vec Mask Selection**: Use keep tokens rather than masked tokens when selecting targets for loss computation.
+
+## 0.2.1 - 2025-12-28
+
+### Added
+
+- **YOLO Augmentation**: Added a `yolo` detection augmentation preset for YOLO-style training pipelines.
+
+### Fixed
+
+- **YOLO v3 / v4 Dynamic Anchors**: Scale anchors per input size when running in dynamic-size mode.
+- **Detection Batch Multiscale Targets**: Fixed batch multiscale resizing to rescale target boxes alongside images.
+
+## 0.2.0 - 2025-12-27
+
+### Added
+
+- **Mosaic Schedule**: Added `--mosaic-stop-epoch` for linear mosaic decay and disabling mosaic after the specified epoch.
+- **Detection Batch Multiscale**: Added `--batch-multiscale` for per-batch square resizing in detection training and show-det-iterator.
+- **RT-DETR v1 Detection**: Added [RT-DETR v1](https://arxiv.org/abs/2304.08069) object detection model.
+- **ViT Causal Attention**: Added optional causal attention support to ViT encoder blocks via `set_causal_attention()` method across all ViT variants (ViT, Simple ViT, DeiT, DeiT3, FlexiViT, ViT Parallel, ViT SAM and RoPE variants).
+- **CSPNet DropBlock Regularization**: Added optional DropBlock2d support to CSPNet backbone blocks (`DarkBlock`, `BottleneckBlock`) for YOLO v4-style training regularization.
+- **MAE ViT Learnable Positional Embedding**: Added optional `learnable_pos_embed` support for MAE ViT decoder, enabling learnable positional embeddings as an alternative to fixed sin-cos embeddings.
+
+### Changed
+
+- **Training Scheduler CLI**: Renamed `--warmup-iters/--cooldown-iters` to `--warmup-steps/--cooldown-steps` and replaced `--lr-scheduler-update iter` with `--lr-scheduler-update step` to align with optimizer-step terminology.
+
+### Fixed
+
+- **YOLO v2 / v3 / v4 Loss Normalization**: Fixed loss normalization to use consistent scaling across all loss terms.
+
+## 0.1.8 - 2025-12-20
+
+### Added
+
+- **MobileClip v2**: Added [MobileClip v2](https://arxiv.org/abs/2508.20691) image encoders (i3, i4) featuring a 5-stage architecture.
+- **MIM Training Options**: Added `--mask-ratio` and `--min-mask-size` CLI arguments to `train_mim.py` for configurable masking during Masked Image Modeling training.
+- **MAE ViT Normalized Pixel Loss**: Added optional `norm_pix_loss` support for MAE ViT.
+
+### Changed
+
+- **MobileClip v1 Naming**: Renamed MobileClip models to use explicit v1 naming (`mobileclip_i0` -> `mobileclip_v1_i0`, etc.) for clarity and future extensibility.
+
+### Fixed
+
+- **YOLO v4 Loss Coefficients**: Adjusted YOLO v4 and YOLO v4 Tiny loss coefficients to better balance box regression and background losses.
+
+## 0.1.7 - 2025-12-15
+
+### Added
+
+- **VoVNet v1**: Added [VoVNet v1 (One-Shot Aggregation)](https://arxiv.org/abs/1904.09730) classification models.
+- **VoVNet v2**: Added [VoVNet v2 (ESE-VoVNet)](https://arxiv.org/abs/1911.06667) classification models.
+- **YOLO v2 Detection**: Added [YOLO v2](https://arxiv.org/abs/1612.08242) object detection models.
+- **YOLO v3 Detection**: Added [YOLO v3](https://arxiv.org/abs/1804.02767) object detection models.
+- **YOLO v4 / YOLO v4 Tiny Detection**: Added [YOLO v4](https://arxiv.org/abs/2004.10934) and [YOLO v4 Tiny](https://arxiv.org/abs/2011.08036) object detection models.
+- **Mosaic Augmentation**: Added mosaic data augmentation for object detection with `fixed_grid` and `random_center` modes.
+- **Default Channels Configuration**: Added a centralized `DEFAULT_NUM_CHANNELS` setting for consistent default input channel configuration.
+
+### Fixed
+
+- **FocalNet Input Channels**: Fixed hardcoded input channels in the FocalNet stem to correctly use the `input_channels` parameter.
+- **NextViT Input Channels**: Fixed hardcoded input channels in the NextViT stem to correctly use the `input_channels` parameter.
+- **MIM Input Channels**: Fixed hardcoded channel values in MIM models to use the `input_channels` parameter, enabling support for non-RGB inputs.
+
+## 0.1.6 - 2025-12-10
+
+### Fixed
+
+- **DINOv2 / Franca Weight Decay Scheduling**: Updated weight decay scheduling from per-epoch to per-step updates to match the original implementations.
+- **Optimizer Compilation Detection**: Fixed the `compile_opt` condition in `get_optimizer` to correctly detect when optimizer compilation is enabled.
+
+## 0.1.5 - 2025-12-08
+
+### Added
+
+- **Franca SSL**: Added [Franca](https://arxiv.org/abs/2507.14137), a self-supervised learning method based on Nested Matryoshka Clustering.
+
+### Fixed
+
+- **MMCR TrainTransform**: Fixed view generation to correctly produce `n_aug` augmented views instead of using integer division.
+- **Distributed Training Initialization**: Fixed `init_distributed_mode` to correctly pass the `device_id` parameter and simplified barrier synchronization.
+
+## 0.1.4 - 2025-12-04
+
+### Fixed
+
+- **DINOv2 Freeze Last Layer (Distillation)**: Implemented the missing `--freeze-last-layer-epochs` functionality for DINOv2 distillation training.
+
+## 0.1.3 - 2025-12-03
+
+### Fixed
+
+- **DINOv2 iBOT Center Update**: Fixed incorrect tensor slicing in the iBOT patch loss center update when using the "centering" strategy.
+- **Freeze Last Layer Gradient Handling**: Fixed `--freeze-last-layer-epochs` to cancel gradients after the backward pass (previously applied before backward and ineffective). Affects DINOv1, DINOv2 and iBOT training.
+- **DINOv2 Freeze Last Layer**: Implemented the missing `--freeze-last-layer-epochs` functionality for standard DINOv2 training.
+- **CAPI Loss Precision**: Updated CAPI loss computation to use double precision, matching the original implementation.
+
+## 0.1.2 - 2025-10-14
+
+### Added
+
+- **ConvNeXt v1 SSL**: Added self-supervised pretraining support for ConvNeXt v1 models.
+
+## 0.1.1 - 2025-10-08
+
+### Added
+
+- **Pretrained Models**:
+    - `rdnet_t_ibot-bioscan5m`: RDNet-T encoder pretrained with iBOT on the [BIOSCAN-5M](https://biodiversitygenomics.net/projects/5m-insects/) dataset.
+    - `convnext_v1_tiny_eu-common`
+    - `convnext_v2_tiny_eu-common`
+    - `mvit_v2_s_yellowstone`
+
+### Fixed
+
+- **DINOv1 Backbone Loading**: Fixed an issue where the `--backbone-epoch` flag was ignored during DINOv1 model initialization.
+
+## 0.1.0 - 2025-10-02
+
+### Added
+
+- Initial beta release

@@ -1,0 +1,337 @@
+import copy
+import json
+import logging
+import unittest
+
+import torch
+from parameterized import parameterized
+
+from birder.conf.settings import DEFAULT_NUM_CHANNELS
+from birder.model_registry import registry
+from birder.net.mim import base  # pylint: disable=unused-import # noqa: F401
+
+logging.disable(logging.CRITICAL)
+
+
+class TestNetMIM(unittest.TestCase):
+    @parameterized.expand(  # type: ignore[untyped-decorator]
+        [
+            ("aim_v1_dec512d4", "deit3_t16"),
+            ("aim_v1_dec512d4", "rope_vit_b32"),
+            ("aim_v1_dec512d4", "simple_vit_b32"),
+            ("aim_v1_dec512d4", "vit_t32"),
+            ("aim_v1_dec512d4", "vit_reg4_b32"),
+            ("crossmae", "deit3_t16"),
+            ("crossmae", "deit3_reg4_t16"),
+            ("crossmae", "rope_vit_b32"),
+            ("crossmae", "rope_vit_reg4_b32"),
+            ("crossmae", "rope_vit_so150m_p14_ap"),
+            ("crossmae", "rope_vit_reg4_so150m_p14_ap"),
+            ("crossmae", "rope_vit5_reg4_s16"),
+            ("crossmae", "simple_vit_b32"),
+            ("crossmae", "vit_b32"),
+            ("crossmae", "vit_reg4_b32"),
+            ("crossmae", "vit_so150m_p14_ap"),
+            ("crossmae", "vit_reg4_so150m_p14_ap"),
+            ("crossmae", "vit_parallel_s16_18x2_ls"),
+            ("fcmae", "convnext_v2_atto"),
+            ("fcmae", "regnet_y_200m"),
+            ("fcmae", "regnet_z_500m"),
+            ("mae_hiera", "hiera_tiny"),
+            ("mae_hiera", "hiera_abswin_tiny"),
+            ("mae_vit", "deit3_t16"),
+            ("mae_vit", "deit3_reg4_t16"),
+            ("mae_vit", "rope_vit_b32"),
+            ("mae_vit", "rope_vit_reg4_b32"),
+            ("mae_vit", "rope_vit_so150m_p14_ap"),
+            ("mae_vit", "rope_vit_reg4_so150m_p14_ap"),
+            ("mae_vit", "rope_vit5_reg4_s16"),
+            ("mae_vit", "simple_vit_b32"),
+            ("mae_vit", "vit_b32"),
+            ("mae_vit", "vit_reg4_b32"),
+            ("mae_vit", "vit_so150m_p14_ap"),
+            ("mae_vit", "vit_reg4_so150m_p14_ap"),
+            ("mae_vit", "vit_parallel_s16_18x2_ls"),
+            ("mae_vit_dec512d12_npl", "vit_t32"),
+            ("mae_vit_dec512d12_npl_lpe", "vit_s32"),
+            ("maskfeat", "regnet_y_200m"),
+            ("maskfeat", "vit_t16"),
+            ("simmim", "hieradet_tiny"),
+            ("simmim", "maxvit_t"),
+            ("simmim", "nextvit_s"),
+            ("simmim", "regnet_y_800m"),
+            ("simmim", "swin_transformer_v2_t"),
+            ("simmim", "swin_transformer_v2_w2_t"),
+            ("simmim", "vit_b32"),
+            ("simmim", "vit_reg4_b32"),
+            ("simmim", "vit_so150m_p14_ap"),
+            ("simmim", "vit_reg4_so150m_p14_ap"),
+            ("simmim", "vit_parallel_s16_18x2_ls"),
+        ]
+    )
+    def test_net_mim(self, network_name: str, encoder: str) -> None:
+        encoder = registry.net_factory(encoder, 10)
+        size = (encoder.max_stride * 6, encoder.max_stride * 6)
+        encoder.adjust_size(size)
+        encoder_state = copy.deepcopy(encoder.state_dict())
+        n = registry.mim_net_factory(network_name, encoder, size=size)
+
+        # MIM construction must not replace the encoder or modify its state
+        self.assertIs(n.encoder, encoder)
+        mim_encoder_state = n.encoder.state_dict()
+        unexpected_keys = mim_encoder_state.keys() - encoder_state.keys()
+        self.assertSetEqual(set(unexpected_keys), set())
+        for name, value in mim_encoder_state.items():
+            torch.testing.assert_close(
+                value,
+                encoder_state[name],
+                rtol=0,
+                atol=0,
+                equal_nan=True,
+                msg=lambda msg, name=name: (
+                    f"{network_name} modified encoder state '{name}' during construction:\n{msg}"
+                ),
+            )
+
+        del encoder_state
+
+        # Ensure config is serializable
+        _ = json.dumps(n.config)
+
+        # Test network
+        out = n(torch.rand((1, DEFAULT_NUM_CHANNELS, *size)))
+        for key in ["loss", "pred", "mask"]:
+            self.assertFalse(torch.isnan(out[key]).any())
+
+        self.assertEqual(out["loss"].ndim, 0)
+
+        # Test with custom min_mask_size
+        n = registry.mim_net_factory(network_name, encoder, size=size, min_mask_size=2)
+
+        out = n(torch.rand((1, DEFAULT_NUM_CHANNELS, *size)))
+        for key in ["loss", "pred", "mask"]:
+            self.assertFalse(torch.isnan(out[key]).any())
+
+        self.assertEqual(out["loss"].ndim, 0)
+
+    @parameterized.expand(  # type: ignore[untyped-decorator]
+        [
+            ("maskfeat", "vit_vmoe_vs32_8e_2k_last2s2"),
+            ("simmim", "rope_vit_vmoe_vs32_8e_2k_last2s2"),
+            ("simmim", "rope_vit_vmoe_reg1_vs32_8e_2k_last2s2"),
+            ("simmim", "vit_vmoe_vs32_8e_2k_last2s2"),
+            ("simmim", "vit_vmoe_reg1_vs32_8e_2k_last2s2"),
+        ]
+    )
+    def test_net_mim_retention_moe_training_output(self, network_name: str, encoder_name: str) -> None:
+        size = (64, 64)
+        encoder = registry.net_factory(encoder_name, 0, size=size)
+        n = registry.mim_net_factory(network_name, encoder, size=size)
+        n.train()
+
+        out = n(torch.rand((8, DEFAULT_NUM_CHANNELS, *size)), return_moe_training_output=True)
+        for key in ["loss", "pred", "mask"]:
+            self.assertFalse(torch.isnan(out[key]).any())
+
+        moe_training_output = out["moe_training_output"]
+        for value in moe_training_output.values():
+            self.assertFalse(torch.isnan(value).any())
+
+        self.assertEqual(out["loss"].ndim, 0)
+        self.assertEqual(moe_training_output["auxiliary_loss"].ndim, 0)
+        self.assertIn("expert_loads", moe_training_output)
+
+    @parameterized.expand(  # type: ignore[untyped-decorator]
+        [
+            ("crossmae", "rope_vit_vmoe_vs32_8e_2k_last2s2"),
+            ("mae_vit", "rope_vit_vmoe_vs32_8e_2k_last2s2"),
+            ("crossmae", "vit_vmoe_vs32_8e_2k_last2s2"),
+            ("mae_vit", "vit_vmoe_vs32_8e_2k_last2s2"),
+        ]
+    )
+    def test_net_mim_omission_moe_training_output(self, network_name: str, encoder_name: str) -> None:
+        size = (64, 64)
+        encoder = registry.net_factory(encoder_name, 0, size=size)
+        n = registry.mim_net_factory(network_name, encoder, size=size)
+        n.train()
+
+        out = n(torch.rand((8, DEFAULT_NUM_CHANNELS, *size)), return_moe_training_output=True)
+        for key in ["loss", "pred", "mask"]:
+            self.assertFalse(torch.isnan(out[key]).any())
+
+        moe_training_output = out["moe_training_output"]
+        for value in moe_training_output.values():
+            self.assertFalse(torch.isnan(value).any())
+
+        self.assertEqual(out["loss"].ndim, 0)
+        self.assertEqual(moe_training_output["auxiliary_loss"].ndim, 0)
+        self.assertIn("expert_loads", moe_training_output)
+
+    def test_net_mim_aim_v1_moe_training_output(self) -> None:
+        batch_size = 8
+        size = (32, 32)
+        encoder = registry.net_factory(
+            "vit_moe_t16_4e1s1p_2k_last1o1",
+            0,
+            config={
+                "num_layers": 2,
+                "num_heads": 2,
+                "hidden_dim": 16,
+                "mlp_dim": 32,
+                "drop_path_rate": 0.0,
+                "moe_expert_width": 8,
+                "moe_last_n_layers": 1,
+            },
+            size=size,
+        )
+        n = registry.mim_net_factory(
+            "aim_v1_dec512d4",
+            encoder,
+            config={"decoder_embed_dim": 16, "decoder_depth": 1},
+            size=size,
+        )
+        n.train()
+
+        out = n(
+            torch.rand(batch_size, DEFAULT_NUM_CHANNELS, *size),
+            return_moe_training_output=True,
+        )
+        for key in ["loss", "pred", "mask"]:
+            self.assertTrue(torch.isfinite(out[key]).all().item())
+
+        moe_training_output = out["moe_training_output"]
+        for value in moe_training_output.values():
+            self.assertTrue(torch.isfinite(value).all().item())
+
+        seq_len = (size[0] // encoder.max_stride) * (size[1] // encoder.max_stride)
+        self.assertEqual(out["loss"].ndim, 0)
+        self.assertEqual(moe_training_output["auxiliary_loss"].ndim, 0)
+        self.assertEqual(moe_training_output["expert_loads"].size(), (1, 4))
+        self.assertEqual(moe_training_output["expert_loads"].sum(), batch_size * seq_len * 2)
+
+        (out["loss"] + moe_training_output["auxiliary_loss"]).backward()
+        router_grad = encoder.encoder.block[0].mlp.router.gate.weight.grad
+        self.assertIsNotNone(router_grad)
+        self.assertTrue(torch.isfinite(router_grad).all().item())
+
+    def test_aim_v1_prefix_mask(self) -> None:
+        size = (64, 64)
+        encoder = registry.net_factory("vit_t32", 0, size=size)
+        n = registry.mim_net_factory(
+            "aim_v1_dec512d4",
+            encoder,
+            config={"decoder_embed_dim": 16, "decoder_depth": 1},
+            size=size,
+        )
+
+        prefix_lengths = torch.tensor([1, 3])
+        mask = n._make_prefix_mask(prefix_lengths, 5)
+        expected = torch.tensor(
+            [
+                [False, True, True, True, True],
+                [False, False, False, True, True],
+            ]
+        )
+
+        self.assertTrue(torch.equal(mask, expected))
+
+        prefix_lengths = n._sample_prefix_lengths(1024, 300, torch.device("cpu"))
+        self.assertGreaterEqual(prefix_lengths.min().item(), 1)
+        self.assertLessEqual(prefix_lengths.max().item(), 299)
+
+        prefix_lengths = n._sample_prefix_lengths(1024, 7, torch.device("cpu"))
+        self.assertGreaterEqual(prefix_lengths.min().item(), 1)
+        self.assertLessEqual(prefix_lengths.max().item(), 6)
+
+    @parameterized.expand(  # type: ignore[untyped-decorator]
+        [
+            ("efficientnet_v1_b0", "vit_t32"),
+            ("swin_transformer_v2_t", "poolformer_v1_s12"),
+            ("vit_t16", "vit_t16"),
+            ("vit_t32", "vit_reg1_t32"),
+            ("vit_t32", "convnext_v2_atto"),
+        ]
+    )
+    def test_net_eva(self, student_name: str, teacher_name: str) -> None:
+        student = registry.net_factory(student_name, 0)
+        teacher = registry.net_factory(teacher_name, 0)
+        size = (student.max_stride * 6, student.max_stride * 6)
+        student.adjust_size(size)
+        teacher.adjust_size(size)
+
+        self.assertEqual(student.max_stride, teacher.max_stride)
+
+        inputs = torch.rand((1, DEFAULT_NUM_CHANNELS, *size))
+        with torch.no_grad():
+            target_tokens = teacher.flatten_features(teacher.forward_features(inputs), include_special_tokens=False)
+
+        student_state = copy.deepcopy(student.state_dict())
+        n = registry.mim_net_factory("eva", student, config={"teacher_dim": target_tokens.size(-1)}, size=size)
+
+        # EVA construction must not replace the student encoder or modify its state
+        self.assertIs(n.encoder, student)
+        eva_encoder_state = n.encoder.state_dict()
+        unexpected_keys = eva_encoder_state.keys() - student_state.keys()
+        self.assertSetEqual(set(unexpected_keys), set())
+        for name, value in eva_encoder_state.items():
+            torch.testing.assert_close(
+                value,
+                student_state[name],
+                rtol=0,
+                atol=0,
+                equal_nan=True,
+                msg=lambda msg, name=name: f"EVA modified encoder state '{name}' during construction:\n{msg}",
+            )
+
+        del student_state
+
+        mask = torch.zeros((inputs.size(0), target_tokens.size(1)))
+        mask[:, ::2] = 1
+
+        # Ensure config is serializable
+        _ = json.dumps(n.config)
+
+        # Test network
+        out = n(inputs, target_tokens, mask)
+        for key in ["loss", "pred", "mask"]:
+            self.assertFalse(torch.isnan(out[key]).any())
+
+        self.assertEqual(out["loss"].ndim, 0)
+
+        # Test with custom min_mask_size
+        n = registry.mim_net_factory(
+            "eva", student, config={"teacher_dim": target_tokens.size(-1)}, size=size, min_mask_size=2
+        )
+
+        out = n(inputs, target_tokens, mask)
+        for key in ["loss", "pred", "mask"]:
+            self.assertFalse(torch.isnan(out[key]).any())
+
+        self.assertEqual(out["loss"].ndim, 0)
+
+    def test_net_eva_retention_moe_training_output(self) -> None:
+        size = (64, 64)
+        student = registry.net_factory("vit_vmoe_vs32_8e_2k_last2s2", 0, size=size)
+        teacher = registry.net_factory("vit_t32", 0, size=size)
+
+        inputs = torch.rand((8, DEFAULT_NUM_CHANNELS, *size))
+        with torch.no_grad():
+            target_tokens = teacher.flatten_features(teacher.forward_features(inputs), include_special_tokens=False)
+
+        n = registry.mim_net_factory("eva", student, config={"teacher_dim": target_tokens.size(-1)}, size=size)
+        n.train()
+
+        mask = torch.zeros((inputs.size(0), target_tokens.size(1)))
+        mask[:, ::2] = 1
+
+        out = n(inputs, target_tokens, mask, return_moe_training_output=True)
+        for key in ["loss", "pred", "mask"]:
+            self.assertFalse(torch.isnan(out[key]).any())
+
+        moe_training_output = out["moe_training_output"]
+        for value in moe_training_output.values():
+            self.assertFalse(torch.isnan(value).any())
+
+        self.assertEqual(out["loss"].ndim, 0)
+        self.assertEqual(moe_training_output["auxiliary_loss"].ndim, 0)
+        self.assertIn("expert_loads", moe_training_output)

@@ -1,0 +1,97 @@
+---
+tags:
+- {% if num_outputs > 0 %}image-classification{% else %}image-feature-extraction{% endif %}
+- birder
+- pytorch
+library_name: birder
+license: apache-2.0
+---
+
+# Model Card for {{ model_name }}
+
+<SHORT_DESCRIPTION>
+
+## Model Details
+
+- **Model Type:** {% if num_outputs > 0 %}Image classification{% else %}Image encoder{% endif %}{% if detector_backbone %} and detection backbone{% endif %}
+- **Model Stats:**
+    - Params (M): {{ num_params }}
+    - Input image size: {{ size[0] }} x {{ size[1] }}
+- **Dataset:** <DATASET_NAME> ({{ num_outputs }} classes)
+
+- **Papers:**
+    - <PAPER_TITLE>: <PAPER_LINK>
+
+## Model Usage
+{% if num_outputs > 0 %}
+### Image Classification
+
+```python
+import birder
+from birder.inference.classification import infer_image
+
+# Option 1: manual setup (more control over preprocessing)
+net, model_info = birder.load_pretrained_model("{{ model_name }}", inference=True)
+
+# Get the image size the model was trained on
+size = birder.get_size_from_signature(model_info.signature)
+
+# Create an inference transform
+transform = birder.classification_transform(size, model_info.rgb_stats)
+
+# Option 2: helper (quick start with default preprocessing)
+net, model_info, transform = birder.load_pretrained_model_and_transform("{{ model_name }}", inference=True)
+
+image = "path/to/image.jpeg"  # or a PIL image, must be loaded in RGB format
+out, _ = infer_image(net, image, transform)
+# out is a NumPy array with shape of (1, {{ num_outputs }}), representing class probabilities.
+```
+{% endif %}
+### Image Embeddings
+
+```python
+import birder
+from birder.inference.classification import infer_image
+
+# Option 1: manual setup (more control over preprocessing)
+net, model_info = birder.load_pretrained_model("{{ model_name }}", inference=True)
+
+# Get the image size the model was trained on
+size = birder.get_size_from_signature(model_info.signature)
+
+# Create an inference transform
+transform = birder.classification_transform(size, model_info.rgb_stats)
+
+# Option 2: helper (quick start with default preprocessing)
+net, model_info, transform = birder.load_pretrained_model_and_transform("{{ model_name }}", inference=True)
+
+image = "path/to/image.jpeg"  # or a PIL image
+out, embedding = infer_image(net, image, transform, return_embedding=True)
+# embedding is a NumPy array with shape of (1, {{ embedding_size }})
+```
+
+{% if detector_backbone -%}
+### Detection Feature Map
+
+```python
+from PIL import Image
+import birder
+
+net, model_info, transform = birder.load_pretrained_model_and_transform("{{ model_name }}", inference=True)
+
+image = Image.open("path/to/image.jpeg")
+features = net.detection_features(transform(image).unsqueeze(0))
+# features is a dict (stage name -> torch.Tensor)
+print([(k, v.size()) for k, v in features.items()])
+# Output example:
+{% for stage_name, size in feature_map_shapes -%}
+# {% if loop.first %}[{% else %} {% endif %}('{{ stage_name }}', {{ size }}){% if not loop.last %},{% else %}]{% endif %}
+{% endfor -%}
+```
+{%- endif %}
+
+## Citation
+
+```bibtex
+<BibTeX>
+```

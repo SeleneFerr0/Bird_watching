@@ -1,0 +1,134 @@
+import argparse
+import logging
+import os
+from typing import Any
+from typing import get_args
+
+import torch
+from torch.utils.data import DataLoader
+from torchvision.datasets import CocoDetection
+from torchvision.datasets import wrap_dataset_for_transforms_v2
+from torchvision.transforms import v2
+from tqdm import tqdm
+
+from birder.common import cli
+from birder.conf import settings
+from birder.data.collators.detection import collate_fn
+from birder.data.datasets.directory import ImageLoaderName
+from birder.data.datasets.directory import get_image_loader
+
+logger = logging.getLogger(__name__)
+
+
+def verify_coco(args: argparse.Namespace) -> None:
+    batch_size = 32
+    has_errors = False
+
+    transform = v2.Compose(
+        [
+            v2.ToImage(),
+            v2.Resize((256, 256), interpolation=v2.InterpolationMode.BILINEAR),
+            v2.ToDtype(torch.float32, scale=True),
+        ]
+    )
+
+    dataset = CocoDetection(args.data_path, args.coco_json_path, transforms=transform)
+    dataset = wrap_dataset_for_transforms_v2(dataset)
+    total = len(dataset)
+
+    data_loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=8,
+        collate_fn=collate_fn,
+        drop_last=False,
+    )
+
+    with tqdm(total=total, initial=0, unit="images", unit_scale=True, leave=False) as progress:
+        if args.fast is True:
+            idx = 0
+            try:
+                for idx, (_, _) in enumerate(data_loader):
+                    progress.update(batch_size)
+
+            except (OSError, RuntimeError) as e:
+                logger.warning(
+                    f"File at batch no. {idx} (batch size = {batch_size}, "
+                    f"{(idx-1) * batch_size}) failed to load {e}"
+                )
+                raise
+
+        else:
+            for img_id in dataset.coco.imgs:
+                try:
+                    img_path = dataset.coco.loadImgs(img_id)[0]["file_name"]
+                    img_path = os.path.join(dataset.root, img_path)
+                    img = get_image_loader(args.img_loader, args.channels)(img_path)
+                    img = transform(img)
+                    if img.size(0) != args.channels:
+                        has_errors = True
+                        logger.warning(f"File {img_path} failed to load {img.size()}")
+
+                except (OSError, RuntimeError) as e:
+                    has_errors = True
+                    logger.warning(f"File {img_path} failed to load {e}")
+
+                progress.update(1)
+
+    if has_errors is True:
+        raise RuntimeError("COCO verification failed")
+
+    logger.info("Finished")
+
+
+def set_parser(subparsers: Any) -> None:
+    subparser = subparsers.add_parser(
+        "verify-coco",
+        allow_abbrev=False,
+        help="loads every image in the dataset and raises exception on corrupted or missing files",
+        description="loads every image in the dataset and raises exception on corrupted or missing files",
+        epilog=(
+            "Usage examples:\n"
+            "python -m birder.tools verify-coco\n"
+            "python -m birder.tools verify-coco --coco-json-path "
+            "data/detection_data/training_annotations_coco.json --data-path data/detection_data\n"
+            "python -m birder.tools verify-coco --fast --coco-json-path "
+            "~/Datasets/Objects365-2020/train/zhiyuan_objv2_train.json --data-path ~/Datasets/Objects365-2020/train\n"
+        ),
+        formatter_class=cli.ArgumentHelpFormatter,
+    )
+    subparser.add_argument(
+        "--fast", default=False, action="store_true", help="use parallel loading and stop at the first error"
+    )
+    subparser.add_argument(
+        "--data-path",
+        type=str,
+        default=str(settings.DETECTION_DATA_PATH),
+        help="image directory path",
+    )
+    subparser.add_argument(
+        "--coco-json-path",
+        type=str,
+        default=f"{settings.TRAINING_DETECTION_ANNOTATIONS_PATH}_coco.json",
+        help="training COCO json path",
+    )
+    subparser.add_argument(
+        "--img-loader",
+        type=str,
+        choices=get_args(ImageLoaderName),
+        default="tv",
+        help="backend to load and decode images in slow mode",
+    )
+    subparser.add_argument(
+        "--channels",
+        type=int,
+        default=settings.DEFAULT_NUM_CHANNELS,
+        metavar="N",
+        help="no. of image channels in slow mode",
+    )
+    subparser.set_defaults(func=main)
+
+
+def main(args: argparse.Namespace) -> None:
+    verify_coco(args)

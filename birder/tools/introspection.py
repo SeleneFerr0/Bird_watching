@@ -1,0 +1,280 @@
+import argparse
+import logging
+from collections.abc import Callable
+from typing import Any
+
+import torch
+
+from birder.common import cli
+from birder.common import fs_ops
+from birder.common import lib
+from birder.data.transforms.classification import RGBType
+from birder.data.transforms.classification import inference_preset
+from birder.introspection import AttentionRollout
+from birder.introspection import FeaturePCA
+from birder.introspection import GradCAM
+from birder.introspection import GuidedBackprop
+from birder.introspection import MoERouting
+from birder.introspection import TransformerAttribution
+from birder.net.base import BaseNet
+
+logger = logging.getLogger(__name__)
+
+
+def _nhwc_reshape_transform(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.permute(0, 3, 1, 2).contiguous()
+
+
+def _show_attn_rollout(
+    args: argparse.Namespace,
+    net: BaseNet,
+    transform: Callable[..., torch.Tensor],
+    rgb_stats: RGBType,
+    device: torch.device,
+) -> None:
+    ar = AttentionRollout(net, device, transform, rgb_stats, args.attn_layer_name, args.discard_ratio, args.head_fusion)
+    result = ar(args.image_path)
+    result.show()
+
+
+def _show_transformer_attribution(
+    args: argparse.Namespace,
+    net: BaseNet,
+    class_to_idx: dict[str, int],
+    transform: Callable[..., torch.Tensor],
+    rgb_stats: RGBType,
+    device: torch.device,
+) -> None:
+    if args.target is not None:
+        target = class_to_idx[args.target]
+    else:
+        target = None
+
+    ta = TransformerAttribution(net, device, transform, rgb_stats, args.attn_layer_name)
+    result = ta(args.image_path, target_class=target)
+    result.show()
+
+
+def _show_guided_backprop(
+    args: argparse.Namespace,
+    net: BaseNet,
+    class_to_idx: dict[str, int],
+    transform: Callable[..., torch.Tensor],
+    rgb_stats: RGBType,
+    device: torch.device,
+) -> None:
+    if args.target is not None:
+        target = class_to_idx[args.target]
+    else:
+        target = None
+
+    guided_bp = GuidedBackprop(net, device, transform, rgb_stats)
+    result = guided_bp(args.image_path, target_class=target)
+    result.show()
+
+
+def _show_grad_cam(
+    args: argparse.Namespace,
+    net: BaseNet,
+    class_to_idx: dict[str, int],
+    transform: Callable[..., torch.Tensor],
+    rgb_stats: RGBType,
+    device: torch.device,
+) -> None:
+    if args.channels_last is True:
+        reshape_transform = _nhwc_reshape_transform
+    else:
+        reshape_transform = None
+
+    block = getattr(net, args.block_name)
+    target_layer = block[args.layer_num]
+
+    if args.target is not None:
+        target = class_to_idx[args.target]
+    else:
+        target = None
+
+    grad_cam = GradCAM(net, device, transform, rgb_stats, target_layer, reshape_transform=reshape_transform)
+    result = grad_cam(args.image_path, target_class=target)
+    result.show()
+
+
+def _show_feature_pca(
+    args: argparse.Namespace,
+    net: BaseNet,
+    transform: Callable[..., torch.Tensor],
+    rgb_stats: RGBType,
+    device: torch.device,
+) -> None:
+    feature_pca = FeaturePCA(net, device, transform, rgb_stats, args.normalize_features, stage=args.stage)
+    result = feature_pca(args.image_path)
+    result.show()
+
+
+def _show_moe_routing(
+    args: argparse.Namespace,
+    net: BaseNet,
+    transform: Callable[..., torch.Tensor],
+    rgb_stats: RGBType,
+    device: torch.device,
+) -> None:
+    moe_routing = MoERouting(net, device, transform, rgb_stats)
+    result = moe_routing(args.image_path)
+    result.show(layer_idx=args.moe_layer, page=args.moe_page, experts_per_page=args.moe_experts_per_page)
+
+
+def set_parser(subparsers: Any) -> None:
+    subparser = subparsers.add_parser(
+        "introspection",
+        allow_abbrev=False,
+        help="computer vision introspection and explainability",
+        description="computer vision introspection and explainability",
+        epilog=(
+            "Usage examples:\n"
+            "python -m birder.tools introspection --network efficientnet_v2_m -e 200 --method gradcam "
+            "'data/training/European goldfinch/000300.jpeg'\n"
+            "python -m birder.tools introspection -n convnext_v2_tiny -t vicreg --method feature-pca "
+            "--normalize-features --stage stage2 data/validation/Mallard/000015.jpeg\n"
+            "python -m birder.tools introspection -n resnest_50 --epoch 300 --method gradcam "
+            "data/index5.jpeg --target 'Grey heron'\n"
+            "python -m birder.tools introspection -n efficientnet_v2_s --method guided-backprop "
+            "'data/training/European goldfinch/000300.jpeg'\n"
+            "python -m birder.tools introspection -n swin_transformer_v1_b -e 85 --layer-num -4 --method gradcam "
+            "--channels-last data/training/Fieldfare/000002.jpeg\n"
+            "python -m birder.tools introspection -n vit_reg4_b16 -t mim -e 100 --method attn-rollout "
+            " data/validation/Bluethroat/000013.jpeg\n"
+            "python -m birder.tools introspection -n deit3_t16 -t il-common --method transformer-attribution "
+            "--target 'Black-crowned night heron' data/detection_data/training/0002/000544.jpeg\n"
+            "python -m birder.tools introspection -n vit_moe_reg1_m16_32e1s_2c_last6_ls_ap --method moe-routing "
+            "data/validation/Bluethroat/000013.jpeg\n"
+        ),
+        formatter_class=cli.ArgumentHelpFormatter,
+    )
+    subparser.add_argument("-n", "--network", type=str, required=True, help="the neural network to use")
+    subparser.add_argument(
+        "--model-config",
+        action=cli.FlexibleDictAction,
+        help=(
+            "override the model default configuration, accepts key-value pairs or JSON "
+            "('drop_path_rate=0.2' or '{\"units\": [3, 24, 36, 3], \"dropout\": 0.2}'"
+        ),
+    )
+    subparser.add_argument("-e", "--epoch", type=int, metavar="N", help="model checkpoint to load")
+    subparser.add_argument("-t", "--tag", type=str, help="model tag (from the training phase)")
+    subparser.add_argument(
+        "-r", "--reparameterized", default=False, action="store_true", help="load reparameterized model"
+    )
+    subparser.add_argument("--gpu", default=False, action="store_true", help="use gpu")
+    subparser.add_argument("--gpu-id", type=int, metavar="ID", help="gpu id to use")
+    subparser.add_argument(
+        "--method",
+        type=str,
+        choices=["attn-rollout", "feature-pca", "gradcam", "guided-backprop", "moe-routing", "transformer-attribution"],
+        help="introspection method",
+    )
+    subparser.add_argument(
+        "--size", type=int, nargs="+", metavar=("H", "W"), help="image size for inference (defaults to model signature)"
+    )
+    subparser.add_argument(
+        "--simple-crop",
+        default=False,
+        action="store_true",
+        help="use a simple crop that preserves aspect ratio but may trim parts of the image",
+    )
+    subparser.add_argument(
+        "--target",
+        type=str,
+        help="target class, leave empty to use predicted class (gradcam, guided-backprop and transformer-attribution)",
+    )
+    subparser.add_argument("--block-name", type=str, default="body", help="target block (gradcam only)")
+    subparser.add_argument(
+        "--layer-num", type=int, default=-1, help="target layer, index for target block (gradcam only)"
+    )
+    subparser.add_argument(
+        "--channels-last",
+        default=False,
+        action="store_true",
+        help="channels last model, like swin (gradcam only)",
+    )
+    subparser.add_argument(
+        "--normalize-features",
+        default=False,
+        action="store_true",
+        help="normalize feature vectors before PCA (feature-pca only)",
+    )
+    subparser.add_argument(
+        "--stage",
+        type=str,
+        help="stage to visualize, e.g., 'stage1', 'neck', etc. (feature-pca only, defaults to last stage)",
+    )
+    subparser.add_argument(
+        "--attn-layer-name",
+        type=str,
+        default="attn",
+        help="attention layer name (attn-rollout and transformer-attribution)",
+    )
+    subparser.add_argument(
+        "--head-fusion",
+        type=str,
+        choices=["mean", "max", "min"],
+        default="max",
+        help="how to fuse the attention heads for attention rollout (attn-rollout only)",
+    )
+    subparser.add_argument(
+        "--discard-ratio",
+        type=float,
+        default=0.9,
+        help="how many of the lowest attention paths should be discarded (attn-rollout only)",
+    )
+    subparser.add_argument(
+        "--moe-layer", type=int, help="zero-based encoder layer index (moe-routing only, defaults to last MoE layer)"
+    )
+    subparser.add_argument(
+        "--moe-page", type=int, help="show only this one-based expert page (moe-routing only, defaults to all pages)"
+    )
+    subparser.add_argument(
+        "--moe-experts-per-page", type=int, default=18, help="number of experts per page (moe-routing only)"
+    )
+    subparser.add_argument("image_path", type=str, help="input image path")
+    subparser.set_defaults(func=main)
+
+
+def main(args: argparse.Namespace) -> None:
+    args.size = cli.parse_size(args.size)
+    if args.gpu is True:
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+
+    if args.gpu_id is not None:
+        torch.cuda.set_device(args.gpu_id)
+
+    logger.info(f"Using device {device}")
+
+    net, model_info = fs_ops.load_model(
+        device,
+        args.network,
+        config=args.model_config,
+        tag=args.tag,
+        epoch=args.epoch,
+        new_size=args.size,
+        inference=False,
+        reparameterized=args.reparameterized,
+    )
+    if args.size is None:
+        args.size = lib.get_size_from_signature(model_info.signature)
+
+    transform = inference_preset(args.size, model_info.rgb_stats, 1.0, args.simple_crop)
+
+    if args.method == "attn-rollout":
+        _show_attn_rollout(args, net, transform, model_info.rgb_stats, device)
+    elif args.method == "feature-pca":
+        _show_feature_pca(args, net, transform, model_info.rgb_stats, device)
+    elif args.method == "gradcam":
+        _show_grad_cam(args, net, model_info.class_to_idx, transform, model_info.rgb_stats, device)
+    elif args.method == "guided-backprop":
+        _show_guided_backprop(args, net, model_info.class_to_idx, transform, model_info.rgb_stats, device)
+    elif args.method == "moe-routing":
+        _show_moe_routing(args, net, transform, model_info.rgb_stats, device)
+    elif args.method == "transformer-attribution":
+        _show_transformer_attribution(args, net, model_info.class_to_idx, transform, model_info.rgb_stats, device)

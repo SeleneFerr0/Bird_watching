@@ -1,0 +1,52 @@
+site_name: Birder
+site_dir: public/
+repo_url: https://gitlab.com/birder/birder
+
+nav:
+  - Home: README.md
+  - Getting Started: getting_started.md
+  - Pretrained Models: pretrained_models.md
+  - Training: training_scripts.md
+  - Inference: inference.md
+  - Wildlife Pipeline: wildlife_pipeline.md
+  - Algorithm Research: research/birder-0.9.0.md
+  - Release Validation: research/validation-0.9.0.md
+  - Evaluation: evaluation.md
+  - Tools:
+      - Overview: tools/index.md
+      - Adversarial: tools/adversarial.md
+      - Convert Model: tools/convert-model.md
+      - Ensemble Model: tools/ensemble-model.md
+      - Introspection: tools/introspection.md
+      - Pack: tools/pack.md
+      - Pack Detection: tools/pack-detection.md
+      - Results: tools/results.md
+  - API:
+      - Overview: api/index.md
+      - Model Loading: api/model_loading.md
+      - Transforms and Signatures: api/transforms_and_signatures.md
+      - Inference Workflows: api/inference_workflows.md
+      - Model Registry: api/model_registry.md
+  # - Deployment:
+  #     - TorchServe: torchserve.md
+  - Other:
+      - Configuration: configuration.md
+      - Public Datasets: public_datasets.md
+      - About: about.md
+
+theme:
+  name: readthedocs
+  color_mode: auto
+
+extra:
+  social:
+    - icon: fontawesome/brands/gitlab
+      link: https://gitlab.com/birder/birder
+
+markdown_extensions:
+  - footnotes
+
+plugins:
+  - exclude:
+      glob:
+        - internal/* # Just bloats the documentation

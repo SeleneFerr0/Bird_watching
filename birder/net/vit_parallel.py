@@ -1,0 +1,775 @@
+"""
+ViT Parallel, adapted from
+https://github.com/facebookresearch/deit/blob/main/models_v2.py
+and
+https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py
+
+Paper "Three things everyone should know about Vision Transformers", https://arxiv.org/abs/2203.09795
+"""
+
+# Reference license: Apache-2.0 (both)
+
+import logging
+import math
+from collections.abc import Callable
+from functools import partial
+from typing import Any
+from typing import Literal
+from typing import Optional
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.utils.checkpoint import checkpoint_sequential
+from torchvision.ops import StochasticDepth
+
+from birder.common.masking import mask_tensor
+from birder.layers import FFN
+from birder.layers import LayerScale
+from birder.model_registry import registry
+from birder.net.base import DetectorBackbone
+from birder.net.base import MaskedTokenOmissionMixin
+from birder.net.base import MaskedTokenRetentionMixin
+from birder.net.base import PreTrainEncoder
+from birder.net.base import TokenOmissionResultType
+from birder.net.base import TokenRetentionResultType
+from birder.net.base import normalize_out_indices
+from birder.net.base import stochastic_depth_rates
+from birder.net.vit import PatchEmbed
+from birder.net.vit import adjust_position_embedding
+
+logger = logging.getLogger(__name__)
+
+
+class Attention(nn.Module):
+    def __init__(self, dim: int, num_heads: int, attn_drop: float, proj_drop: float, qkv_bias: bool = True) -> None:
+        super().__init__()
+        assert dim % num_heads == 0, "dim should be divisible by num_heads"
+
+        self.is_causal = False
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim**-0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, C = x.size()
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+
+        x = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0, is_causal=self.is_causal, scale=self.scale
+        )
+
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return x
+
+    def set_causal_attention(self, is_causal: bool = True) -> None:
+        self.is_causal = is_causal
+
+
+class EncoderParallelBlock(nn.Module):
+    def __init__(
+        self,
+        num_heads: int,
+        hidden_dim: int,
+        mlp_dim: Optional[int],
+        num_parallel: int,
+        dropout: float,
+        attention_dropout: float,
+        drop_path: float,
+        activation_layer: Callable[..., nn.Module],
+        layer_scale_init_value: Optional[float] = None,
+        norm_layer: Callable[..., nn.Module] = nn.LayerNorm,
+        norm_layer_eps: float = 1e-6,
+        qkv_bias: bool = True,
+    ) -> None:
+        super().__init__()
+        if mlp_dim is None:
+            mlp_dim = hidden_dim * 4
+
+        # Attention blocks
+        self.attn_blocks = nn.ModuleList()
+        for _ in range(num_parallel):
+            self.attn_blocks.append(
+                nn.Sequential(
+                    norm_layer(hidden_dim, eps=norm_layer_eps),
+                    Attention(hidden_dim, num_heads, attn_drop=attention_dropout, proj_drop=dropout, qkv_bias=qkv_bias),
+                    (
+                        LayerScale(hidden_dim, layer_scale_init_value)
+                        if layer_scale_init_value is not None
+                        else nn.Identity()
+                    ),
+                    StochasticDepth(drop_path, mode="row"),
+                )
+            )
+
+        # MLP blocks
+        self.mlp_blocks = nn.ModuleList()
+        for _ in range(num_parallel):
+            self.mlp_blocks.append(
+                nn.Sequential(
+                    norm_layer(hidden_dim, eps=norm_layer_eps),
+                    FFN(
+                        hidden_dim,
+                        mlp_dim,
+                        act_layer=activation_layer,
+                        dropout=dropout,
+                    ),
+                    (
+                        LayerScale(hidden_dim, layer_scale_init_value)
+                        if layer_scale_init_value is not None
+                        else nn.Identity()
+                    ),
+                    StochasticDepth(drop_path, mode="row"),
+                )
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + torch.stack([attn(x) for attn in self.attn_blocks]).sum(dim=0)
+        x = x + torch.stack([mlp(x) for mlp in self.mlp_blocks]).sum(dim=0)
+
+        return x
+
+    def set_causal_attention(self, is_causal: bool = True) -> None:
+        for module in self.attn_blocks.modules():
+            if isinstance(module, Attention):
+                module.set_causal_attention(is_causal)
+
+
+class Encoder(nn.Module):
+    def __init__(
+        self,
+        num_layers: int,
+        num_heads: int,
+        hidden_dim: int,
+        mlp_dim: int,
+        num_parallel: int,
+        dropout: float,
+        attention_dropout: float,
+        dpr: list[float],
+        qkv_bias: bool = True,
+        layer_scale_init_value: Optional[float] = None,
+        norm_layer: Callable[..., nn.Module] = nn.LayerNorm,
+        norm_layer_eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.grad_checkpointing = False
+        self.grad_checkpointing_segments: Optional[int] = None
+        self.grad_checkpointing_preserve_rng_state = True
+        self.grad_checkpointing_use_reentrant = False
+
+        pre_layers = []
+        if dropout > 0.0:
+            pre_layers.append(nn.Dropout(dropout))
+
+        self.pre_block = nn.Sequential(*pre_layers)
+
+        layers = []
+        for i in range(num_layers):
+            layers.append(
+                EncoderParallelBlock(
+                    num_heads,
+                    hidden_dim,
+                    mlp_dim,
+                    num_parallel,
+                    dropout,
+                    attention_dropout,
+                    dpr[i],
+                    activation_layer=nn.GELU,
+                    layer_scale_init_value=layer_scale_init_value,
+                    norm_layer=norm_layer,
+                    norm_layer_eps=norm_layer_eps,
+                    qkv_bias=qkv_bias,
+                )
+            )
+
+        self.block = nn.Sequential(*layers)
+
+    def _checkpoint_blocks(self, x: torch.Tensor) -> torch.Tensor:
+        if self.grad_checkpointing_segments is None:
+            segments = len(self.block)
+        else:
+            segments = min(self.grad_checkpointing_segments, len(self.block))
+
+        return checkpoint_sequential(
+            self.block,
+            segments,
+            x,
+            use_reentrant=self.grad_checkpointing_use_reentrant,
+            preserve_rng_state=self.grad_checkpointing_preserve_rng_state,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # torch._assert(x.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {x.size()}")
+        x = self.pre_block(x)
+        if self.grad_checkpointing is True and torch.is_grad_enabled() is True and not torch.jit.is_scripting():
+            return self._checkpoint_blocks(x)
+
+        x = self.block(x)
+
+        return x
+
+    def forward_features(self, x: torch.Tensor, out_indices: Optional[list[int]] = None) -> list[torch.Tensor]:
+        x = self.pre_block(x)
+        xs = []
+        out_indices_set = set(out_indices) if out_indices is not None else None
+        for idx, blk in enumerate(self.block):
+            x = blk(x)
+            if out_indices_set is None or idx in out_indices_set:
+                xs.append(x)
+
+        return xs
+
+    def set_grad_checkpointing(
+        self,
+        enable: bool = True,
+        *,
+        segments: Optional[int] = None,
+        preserve_rng_state: bool = True,
+        use_reentrant: bool = False,
+    ) -> None:
+        if enable is True:
+            logger.debug(
+                f"Enabling gradient checkpointing: segments={segments}, "
+                f"preserve_rng_state={preserve_rng_state}, use_reentrant={use_reentrant}"
+            )
+        else:
+            logger.debug("Disabling gradient checkpointing")
+
+        self.grad_checkpointing = enable
+        self.grad_checkpointing_segments = segments
+        self.grad_checkpointing_preserve_rng_state = preserve_rng_state
+        self.grad_checkpointing_use_reentrant = use_reentrant
+
+    def set_causal_attention(self, is_causal: bool = True) -> None:
+        for b in self.block:
+            b.set_causal_attention(is_causal)
+
+
+class ViT_Parallel(DetectorBackbone, PreTrainEncoder, MaskedTokenOmissionMixin, MaskedTokenRetentionMixin):
+    block_group_regex = r"encoder\.block\.(\d+)"
+
+    def __init__(
+        self,
+        input_channels: int,
+        num_classes: int,
+        *,
+        config: Optional[dict[str, Any]] = None,
+        size: Optional[tuple[int, int]] = None,
+    ) -> None:
+        super().__init__(input_channels, num_classes, config=config, size=size)
+        assert self.config is not None, "must set config"
+
+        image_size = self.size
+        attention_dropout = 0.0
+        dropout = 0.0
+        pos_embed_antialias: bool = self.config.get("pos_embed_antialias", False)  # Controls forward pass only
+        patch_size: int = self.config["patch_size"]
+        num_layers: int = self.config["num_layers"]
+        num_heads: int = self.config["num_heads"]
+        hidden_dim: int = self.config["hidden_dim"]
+        mlp_dim: int = self.config["mlp_dim"]
+        num_parallel: int = self.config["num_parallel"]
+        layer_scale_init_value: Optional[float] = self.config.get("layer_scale_init_value", None)
+        qkv_bias: bool = self.config.get("qkv_bias", True)
+        num_reg_tokens: int = self.config.get("num_reg_tokens", 0)
+        class_token: bool = self.config.get("class_token", True)
+        norm_layer_type: str = self.config.get("norm_layer_type", "LayerNorm")
+        norm_layer_eps: float = self.config.get("norm_layer_eps", 1e-6)
+        out_indices: Optional[list[int]] = self.config.get("out_indices", None)
+        drop_path_rate: float = self.config["drop_path_rate"]
+        drop_path_uniform: bool = self.config.get("drop_path_uniform", False)
+
+        if norm_layer_type == "LayerNorm":
+            norm_layer = nn.LayerNorm
+        elif norm_layer_type == "RMSNorm":
+            norm_layer = nn.RMSNorm
+        else:
+            raise ValueError(f"Unknown norm_layer_type '{norm_layer_type}'")
+
+        torch._assert(image_size[0] % patch_size == 0, "Input shape indivisible by patch size!")
+        torch._assert(image_size[1] % patch_size == 0, "Input shape indivisible by patch size!")
+        torch._assert(hidden_dim % num_heads == 0, "Hidden dim indivisible by num heads!")
+        self.pos_embed_antialias = pos_embed_antialias
+        self.patch_size = patch_size
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self.num_reg_tokens = num_reg_tokens
+        self.out_indices = normalize_out_indices(out_indices, num_layers)
+        dpr = stochastic_depth_rates(drop_path_rate, num_layers, constant=drop_path_uniform)
+
+        self.conv_proj = nn.Conv2d(
+            self.input_channels,
+            hidden_dim,
+            kernel_size=(patch_size, patch_size),
+            stride=(patch_size, patch_size),
+            padding=(0, 0),
+        )
+        self.patch_embed = PatchEmbed()
+
+        seq_length = (image_size[0] // patch_size) * (image_size[1] // patch_size)
+        self.num_special_tokens = 0
+
+        # Add a class token
+        if class_token is True:
+            self.class_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+            seq_length += 1
+            self.num_special_tokens += 1
+        else:
+            self.class_token = None
+
+        # Add optional register tokens
+        if self.num_reg_tokens > 0:
+            self.reg_tokens = nn.Parameter(torch.zeros(1, self.num_reg_tokens, hidden_dim))
+            seq_length += self.num_reg_tokens
+            self.num_special_tokens += self.num_reg_tokens
+        else:
+            self.reg_tokens = None
+
+        # Add positional embedding
+        self.pos_embedding = nn.Parameter(torch.empty(1, seq_length, hidden_dim).normal_(std=0.02))  # from BERT
+
+        self.encoder = Encoder(
+            num_layers,
+            num_heads,
+            hidden_dim,
+            mlp_dim,
+            num_parallel,
+            dropout,
+            attention_dropout,
+            dpr,
+            qkv_bias=qkv_bias,
+            layer_scale_init_value=layer_scale_init_value,
+            norm_layer=norm_layer,
+            norm_layer_eps=norm_layer_eps,
+        )
+        self.norm = norm_layer(hidden_dim, eps=norm_layer_eps)
+
+        num_return_stages = len(self.out_indices) if self.out_indices is not None else 1
+        self.return_stages = [f"stage{stage_idx + 1}" for stage_idx in range(num_return_stages)]
+        self.return_channels = [hidden_dim] * num_return_stages
+        self.embedding_size = hidden_dim
+        self.classifier = self.create_classifier()
+
+        self.max_stride = patch_size
+        self.stem_stride = patch_size
+        self.stem_width = hidden_dim
+        self.feature_dim = hidden_dim
+        self.decoder_block = partial(
+            EncoderParallelBlock,
+            16,
+            mlp_dim=None,
+            num_parallel=num_parallel,
+            dropout=0.0,
+            attention_dropout=0.0,
+            drop_path=0.0,
+            activation_layer=nn.GELU,
+            norm_layer=norm_layer,
+            norm_layer_eps=norm_layer_eps,
+        )
+
+        # Weight initialization
+        if isinstance(self.conv_proj, nn.Conv2d):
+            # Init the patchify stem
+            fan_in = self.conv_proj.in_channels * self.conv_proj.kernel_size[0] * self.conv_proj.kernel_size[1]
+            nn.init.trunc_normal_(self.conv_proj.weight, std=math.sqrt(1 / fan_in))
+            if self.conv_proj.bias is not None:
+                nn.init.zeros_(self.conv_proj.bias)
+
+        if isinstance(self.classifier, nn.Linear):
+            nn.init.zeros_(self.classifier.weight)
+            if self.classifier.bias is not None:
+                nn.init.zeros_(self.classifier.bias)
+
+    def _get_pos_embed(self, H: int, W: int) -> torch.Tensor:
+        if self.dynamic_size is False:
+            return self.pos_embedding
+
+        if H == self.size[0] and W == self.size[1]:
+            return self.pos_embedding
+
+        return adjust_position_embedding(
+            self.pos_embedding,
+            (self.size[0] // self.patch_size, self.size[1] // self.patch_size),
+            (H // self.patch_size, W // self.patch_size),
+            self.num_special_tokens,
+            antialias=self.pos_embed_antialias,
+        )
+
+    def freeze(self, freeze_classifier: bool = True, unfreeze_features: bool = False) -> None:
+        for param in self.parameters():
+            param.requires_grad_(False)
+
+        if freeze_classifier is False:
+            for param in self.classifier.parameters():
+                param.requires_grad_(True)
+
+        if unfreeze_features is True:
+            for param in self.norm.parameters():
+                param.requires_grad_(True)
+
+    def set_grad_checkpointing(
+        self,
+        enable: bool = True,
+        *,
+        segments: Optional[int] = None,
+        preserve_rng_state: bool = True,
+        use_reentrant: bool = False,
+    ) -> None:
+        self.encoder.set_grad_checkpointing(
+            enable=enable,
+            segments=segments,
+            preserve_rng_state=preserve_rng_state,
+            use_reentrant=use_reentrant,
+        )
+
+    def set_causal_attention(self, is_causal: bool = True) -> None:
+        self.encoder.set_causal_attention(is_causal)
+
+    def strip_for_detection_features(self) -> None:
+        super().strip_for_detection_features()
+        self.norm = nn.Identity()
+
+    def detection_features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        H, W = x.shape[-2:]
+        x = self.conv_proj(x)
+        x = self.patch_embed(x)
+
+        # Expand special tokens to batch size and prepend in order [REG..., CLS, PATCH...]
+        special_tokens: list[torch.Tensor] = []
+        if self.reg_tokens is not None:
+            special_tokens.append(self.reg_tokens.expand(x.size(0), -1, -1))
+        if self.class_token is not None:
+            special_tokens.append(self.class_token.expand(x.size(0), -1, -1))
+        if len(special_tokens) > 0:
+            x = torch.concat(special_tokens + [x], dim=1)
+
+        x = x + self._get_pos_embed(H, W)
+
+        if self.out_indices is None:
+            xs = [self.encoder(x)]
+        else:
+            xs = self.encoder.forward_features(x, out_indices=self.out_indices)
+
+        out: dict[str, torch.Tensor] = {}
+        for stage_name, stage_x in zip(self.return_stages, xs, strict=True):
+            stage_x = stage_x[:, self.num_special_tokens :]
+            stage_x = stage_x.permute(0, 2, 1)
+            B, C, _ = stage_x.size()
+            stage_x = stage_x.reshape(B, C, H // self.patch_size, W // self.patch_size)
+            out[stage_name] = stage_x
+
+        return out
+
+    def freeze_stages(self, up_to_stage: int) -> None:
+        for param in self.conv_proj.parameters():
+            param.requires_grad_(False)
+
+        self.pos_embedding.requires_grad_(False)
+
+        if up_to_stage <= 0:
+            return
+
+        if self.out_indices is None:
+            stage_boundaries = [self.num_layers - 1]
+        else:
+            stage_boundaries = sorted(set(self.out_indices))
+
+        last_block = stage_boundaries[min(up_to_stage, len(stage_boundaries)) - 1]
+        for block in self.encoder.block[: last_block + 1]:
+            for param in block.parameters():
+                param.requires_grad_(False)
+
+    def masked_encoding_omission(
+        self,
+        x: torch.Tensor,
+        ids_keep: Optional[torch.Tensor] = None,
+        return_all_features: bool = False,
+        return_keys: Literal["all", "tokens", "embedding"] = "tokens",
+    ) -> TokenOmissionResultType:
+        H, W = x.shape[-2:]
+
+        # Reshape and permute the input tensor
+        x = self.conv_proj(x)
+        x = self.patch_embed(x)
+
+        # Add pos embedding without special tokens
+        pos_embedding = self._get_pos_embed(H, W)
+        x = x + pos_embedding[:, self.num_special_tokens :, :]
+
+        # Mask tokens
+        if ids_keep is not None:
+            x = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, x.size(2)))
+
+        # Expand special tokens to batch size and prepend in order [REG..., CLS, PATCH...]
+        special_tokens: list[torch.Tensor] = []
+        if self.reg_tokens is not None:
+            reg_tokens = self.reg_tokens + pos_embedding[:, 0 : self.num_reg_tokens, :]
+            special_tokens.append(reg_tokens.expand(x.size(0), -1, -1))
+
+        if self.class_token is not None:
+            cls_token = self.class_token + pos_embedding[:, self.num_reg_tokens : self.num_reg_tokens + 1, :]
+            special_tokens.append(cls_token.expand(x.size(0), -1, -1))
+
+        if len(special_tokens) > 0:
+            x = torch.concat(special_tokens + [x], dim=1)
+
+        # Apply transformer
+        if return_all_features is True:
+            xs = self.encoder.forward_features(x)
+            xs[-1] = self.norm(xs[-1])
+            x = torch.stack(xs, dim=-1)
+        else:
+            x = self.encoder(x)
+            x = self.norm(x)
+
+        result: TokenOmissionResultType = {}
+        if return_keys in ("all", "tokens"):
+            result["tokens"] = x
+
+        if return_keys in ("all", "embedding"):
+            if return_all_features is True:
+                x = x[..., -1]
+
+            result["embedding"] = self.embedding_from_features(x)
+
+        return result
+
+    def masked_encoding_retention(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        mask_token: Optional[torch.Tensor] = None,
+        return_keys: Literal["all", "features", "embedding"] = "features",
+    ) -> TokenRetentionResultType:
+        H, W = x.shape[-2:]
+
+        x = self.conv_proj(x)
+        x = mask_tensor(x, mask, mask_token=mask_token, patch_factor=self.max_stride // self.stem_stride)
+
+        # Reshape and permute the input tensor
+        x = self.patch_embed(x)
+
+        # Expand special tokens to batch size and prepend in order [REG..., CLS, PATCH...]
+        special_tokens: list[torch.Tensor] = []
+        if self.reg_tokens is not None:
+            special_tokens.append(self.reg_tokens.expand(x.size(0), -1, -1))
+        if self.class_token is not None:
+            special_tokens.append(self.class_token.expand(x.size(0), -1, -1))
+        if len(special_tokens) > 0:
+            x = torch.concat(special_tokens + [x], dim=1)
+
+        x = x + self._get_pos_embed(H, W)
+        x = self.encoder(x)
+        x = self.norm(x)
+
+        result: TokenRetentionResultType = {}
+        if return_keys in ("all", "features"):
+            features = x[:, self.num_special_tokens :]
+            features = features.permute(0, 2, 1)
+            B, C, _ = features.size()
+            features = features.reshape(B, C, H // self.patch_size, W // self.patch_size)
+            result["features"] = features
+
+        if return_keys in ("all", "embedding"):
+            result["embedding"] = self.embedding_from_features(x)
+
+        return result
+
+    def forward_features(self, x: torch.Tensor, return_input_embedding: bool = False) -> torch.Tensor:
+        H, W = x.shape[-2:]
+
+        # Reshape and permute the input tensor
+        x = self.conv_proj(x)
+        x = self.patch_embed(x)
+
+        # Expand special tokens to batch size and prepend in order [REG..., CLS, PATCH...]
+        special_tokens: list[torch.Tensor] = []
+        if self.reg_tokens is not None:
+            special_tokens.append(self.reg_tokens.expand(x.size(0), -1, -1))
+        if self.class_token is not None:
+            special_tokens.append(self.class_token.expand(x.size(0), -1, -1))
+        if len(special_tokens) > 0:
+            x = torch.concat(special_tokens + [x], dim=1)
+
+        if return_input_embedding is True:
+            input_embedding = x
+        else:
+            input_embedding = None  # For TorchScript compatibility
+
+        x = x + self._get_pos_embed(H, W)
+        x = self.encoder(x)
+        x = self.norm(x)
+
+        if return_input_embedding is True and input_embedding is not None:
+            return torch.stack([input_embedding, x], dim=-1)
+
+        return x
+
+    def flatten_features(self, features: torch.Tensor, include_special_tokens: bool = True) -> torch.Tensor:
+        if include_special_tokens is False:
+            return features[:, self.num_special_tokens :]
+
+        return features
+
+    def embedding_from_features(self, features: torch.Tensor) -> torch.Tensor:
+        if self.class_token is None:
+            features = features[:, self.num_special_tokens :]
+            return features.mean(dim=1)
+
+        # Classifier "token" as used by standard language architectures
+        return features[:, self.num_reg_tokens]
+
+    def adjust_size(self, new_size: tuple[int, int]) -> None:
+        if new_size == self.size:
+            return
+
+        assert new_size[0] % self.patch_size == 0, "Input shape indivisible by patch size!"
+        assert new_size[1] % self.patch_size == 0, "Input shape indivisible by patch size!"
+
+        old_size = self.size
+        super().adjust_size(new_size)
+
+        # Add back class tokens
+        with torch.no_grad():
+            pos_embedding = adjust_position_embedding(
+                # On rounding error see: https://github.com/facebookresearch/dino/issues/8
+                self.pos_embedding,
+                (old_size[0] // self.patch_size, old_size[1] // self.patch_size),
+                (new_size[0] // self.patch_size, new_size[1] // self.patch_size),
+                self.num_special_tokens,
+            )
+
+        self.pos_embedding = nn.Parameter(pos_embedding, requires_grad=self.pos_embedding.requires_grad)
+
+
+registry.register_model_config(
+    "vit_parallel_s16_18x2_ls",
+    ViT_Parallel,
+    config={
+        "patch_size": 16,
+        "num_layers": 18,
+        "num_heads": 6,
+        "hidden_dim": 384,
+        "mlp_dim": 1536,
+        "num_parallel": 2,
+        "layer_scale_init_value": 1e-5,
+        "drop_path_rate": 0.05,
+    },
+)
+registry.register_model_config(
+    "vit_parallel_s16_18x2_ls_avg",
+    ViT_Parallel,
+    config={
+        "patch_size": 16,
+        "num_layers": 18,
+        "num_heads": 6,
+        "hidden_dim": 384,
+        "mlp_dim": 1536,
+        "num_parallel": 2,
+        "layer_scale_init_value": 1e-5,
+        "class_token": False,
+        "drop_path_rate": 0.05,
+    },
+)
+registry.register_model_config(
+    "vit_parallel_b16_18x2_ls",
+    ViT_Parallel,
+    config={
+        "patch_size": 16,
+        "num_layers": 18,
+        "num_heads": 12,
+        "hidden_dim": 768,
+        "mlp_dim": 3072,
+        "num_parallel": 2,
+        "layer_scale_init_value": 1e-5,
+        "drop_path_rate": 0.2,
+    },
+)
+registry.register_model_config(
+    "vit_parallel_b16_18x2_ls_avg",
+    ViT_Parallel,
+    config={
+        "patch_size": 16,
+        "num_layers": 18,
+        "num_heads": 12,
+        "hidden_dim": 768,
+        "mlp_dim": 3072,
+        "num_parallel": 2,
+        "layer_scale_init_value": 1e-5,
+        "class_token": False,
+        "drop_path_rate": 0.2,
+    },
+)
+
+registry.register_weights(
+    "vit_parallel_s16_18x2_ls_avg_data2vec-intermediate-il-all",
+    {
+        "url": (
+            "https://huggingface.co/birder-project/"
+            "vit_parallel_s16_18x2_ls_avg_data2vec-intermediate-il-all/resolve/main"
+        ),
+        "description": (
+            "ViT Parallel S/16 18x2 model with average pooling, data2vec pretraining, and intermediate training, then "
+            "fine-tuned on the il-all dataset"
+        ),
+        "resolution": (384, 384),
+        "formats": {
+            "pt": {
+                "file_size": 246.8,
+                "sha256": "aaf3963ea12373a358cce77c46ee5aa2a5ca58bcb799e8748e84605b82c9b81b",
+            },
+        },
+        "net": {"network": "vit_parallel_s16_18x2_ls_avg", "tag": "data2vec-intermediate-il-all"},
+    },
+)
+registry.register_weights(
+    "vit_parallel_s16_18x2_ls_avg_data2vec-intermediate-eu-common",
+    {
+        "url": (
+            "https://huggingface.co/birder-project/"
+            "vit_parallel_s16_18x2_ls_avg_data2vec-intermediate-eu-common/resolve/main"
+        ),
+        "description": (
+            "ViT Parallel S/16 18x2 model with average pooling, data2vec pretraining, and intermediate training, then "
+            "fine-tuned on the eu-common dataset"
+        ),
+        "resolution": (384, 384),
+        "formats": {
+            "pt": {
+                "file_size": 247.1,
+                "sha256": "1c697b42eac7150121325335b0d41ab5643ecab7afd04216b5088a538fcf94bb",
+            },
+        },
+        "net": {"network": "vit_parallel_s16_18x2_ls_avg", "tag": "data2vec-intermediate-eu-common"},
+    },
+)
+registry.register_weights(
+    "vit_parallel_s16_18x2_ls_avg_data2vec-intermediate-arabian-peninsula",
+    {
+        "url": (
+            "https://huggingface.co/birder-project/"
+            "vit_parallel_s16_18x2_ls_avg_data2vec-intermediate-arabian-peninsula/resolve/main"
+        ),
+        "description": (
+            "ViT Parallel S/16 18x2 model with average pooling, data2vec pretraining, and intermediate training, then "
+            "fine-tuned on the arabian-peninsula dataset"
+        ),
+        "resolution": (384, 384),
+        "formats": {
+            "pt": {
+                "file_size": 247.1,
+                "sha256": "561734d8271eff9831ab4fa8a0e8f80b6bfeb17ea456ea0fc184315b9aa2d837",
+            },
+        },
+        "net": {"network": "vit_parallel_s16_18x2_ls_avg", "tag": "data2vec-intermediate-arabian-peninsula"},
+    },
+)

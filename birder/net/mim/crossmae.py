@@ -1,0 +1,254 @@
+"""
+CrossMAE, adapted from
+https://github.com/TonyLianLong/CrossMAE/blob/main/models_cross.py
+
+Paper "Rethinking Patch Dependence for Masked Autoencoders",
+https://arxiv.org/abs/2401.14391
+
+Changes from original:
+* Only supports the use_input=False variant
+"""
+
+# Reference license: Attribution-NonCommercial 4.0 International
+
+from typing import Any
+from typing import Optional
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torchvision.ops import MLP
+
+from birder.common.masking import uniform_mask
+from birder.model_registry import registry
+from birder.net.base import MaskedTokenOmissionMixin
+from birder.net.base import PreTrainEncoder
+from birder.net.base import pos_embedding_sin_cos_2d
+from birder.net.mim.base import MIMBaseNet
+
+
+class WeightedFeatureMaps(nn.Module):
+    def __init__(self, k: int, decoder_depth: int) -> None:
+        super().__init__()
+        self.linear = nn.Linear(k, decoder_depth, bias=False)
+
+    def forward(self, stacked_feature_maps: torch.Tensor) -> torch.Tensor:
+        output = self.linear(stacked_feature_maps)
+
+        return output
+
+
+class CrossAttention(nn.Module):
+    def __init__(self, encoder_dim: int, decoder_dim: int, num_heads: int) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = decoder_dim // num_heads
+        self.scale = head_dim**-0.5
+        self.q = nn.Linear(decoder_dim, decoder_dim)
+        self.kv = nn.Linear(encoder_dim, decoder_dim * 2)
+        self.proj = nn.Linear(decoder_dim, decoder_dim)
+
+    def forward(self, tgt: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        B, N, C = tgt.size()
+        n_kv = memory.size(1)
+        q = self.q(tgt).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        kv = self.kv(memory).reshape(B, n_kv, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        k, v = kv.unbind(0)
+
+        attn = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        x = attn.transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+
+        return x
+
+
+class CrossAttentionBlock(nn.Module):
+    def __init__(self, encoder_dim: int, decoder_dim: int, num_heads: int, mlp_ratio: float) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(decoder_dim, eps=1e-6)
+        self.cross_attn = CrossAttention(encoder_dim, decoder_dim, num_heads=num_heads)
+        self.norm2 = nn.LayerNorm(decoder_dim, eps=1e-6)
+        self.mlp = MLP(decoder_dim, [int(decoder_dim * mlp_ratio), decoder_dim], activation_layer=nn.GELU)
+
+    def forward(self, tgt: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        x = tgt + self.cross_attn(self.norm1(tgt), memory)
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class CrossMAE(MIMBaseNet):
+    default_size = (224, 224)
+    default_mask_ratio = 0.75
+    auto_register = False
+
+    def __init__(
+        self,
+        encoder: PreTrainEncoder,
+        *,
+        config: Optional[dict[str, Any]] = None,
+        size: Optional[tuple[int, int]] = None,
+        mask_ratio: Optional[float] = None,
+        min_mask_size: int = 1,
+    ) -> None:
+        super().__init__(encoder, config=config, size=size, mask_ratio=mask_ratio, min_mask_size=min_mask_size)
+        assert self.config is not None, "must set config"
+        assert isinstance(self.encoder, MaskedTokenOmissionMixin)
+
+        self.kept_mask_ratio = 0.25
+        self.patch_size = self.encoder.stem_stride
+        encoder_dim = self.encoder.feature_dim
+        decoder_embed_dim: int = self.config["decoder_embed_dim"]
+        decoder_depth: int = self.config["decoder_depth"]
+
+        self.wfm = WeightedFeatureMaps(self.encoder.num_layers, decoder_depth=decoder_depth)
+        self.decoder_norms = nn.ModuleList()
+        for _ in range(decoder_depth - 1):
+            self.decoder_norms.append(nn.LayerNorm(encoder_dim, eps=1e-6))
+
+        self.decoder_norms.append(nn.Identity())  # Last norm uses the encoder native norm
+
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
+
+        # Fixed sin-cos embedding
+        pos_embedding = pos_embedding_sin_cos_2d(
+            h=self.size[0] // self.patch_size,
+            w=self.size[1] // self.patch_size,
+            dim=decoder_embed_dim,
+            num_special_tokens=0,
+        ).unsqueeze(0)
+        self.decoder_pos_embed = nn.Buffer(pos_embedding)
+
+        self.decoder_layers = nn.ModuleList()
+        for _ in range(decoder_depth):
+            self.decoder_layers.append(CrossAttentionBlock(encoder_dim, decoder_embed_dim, num_heads=16, mlp_ratio=4.0))
+
+        self.decoder_norm = nn.LayerNorm(decoder_embed_dim, eps=1e-6)
+        self.pred = nn.Linear(decoder_embed_dim, self.patch_size**2 * self.input_channels)
+
+        # Weight initialization
+        nn.init.xavier_uniform_(self.wfm.linear.weight)
+
+        for norm in self.decoder_norms:
+            if isinstance(norm, nn.LayerNorm):
+                nn.init.ones_(norm.weight)
+                nn.init.zeros_(norm.bias)
+
+        for m in self.decoder_layers.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+        nn.init.ones_(self.decoder_norm.weight)
+        nn.init.zeros_(self.decoder_norm.bias)
+        nn.init.xavier_uniform_(self.pred.weight)
+        nn.init.zeros_(self.pred.bias)
+        nn.init.normal_(self.mask_token, std=0.02)
+
+    def patchify(self, imgs: torch.Tensor) -> torch.Tensor:
+        """
+        imgs: (N, C, H, W)
+        x: (N, L, patch_size**2 * C)
+        """
+
+        p = self.patch_size
+        c = self.input_channels
+        assert imgs.shape[2] % p == 0 and imgs.shape[3] % p == 0
+
+        h = imgs.shape[2] // p
+        w = imgs.shape[3] // p
+        x = imgs.reshape(shape=(imgs.shape[0], c, h, p, w, p))
+        x = torch.einsum("nchpwq->nhwpqc", x)
+        x = x.reshape(shape=(imgs.shape[0], h * w, p**2 * c))
+
+        return x
+
+    def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (N, L, patch_size**2 * C)
+        imgs: (N, C, H, W)
+        """
+
+        p = self.patch_size
+        c = self.input_channels
+        h = self.size[0] // p
+        w = self.size[1] // p
+        assert h * w == x.shape[1]
+
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
+        x = torch.einsum("nhwpqc->nchpwq", x)
+        imgs = x.reshape(shape=(x.shape[0], c, h * p, w * p))
+
+        return imgs
+
+    def fill_pred(self, mask: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
+        N, L = mask.shape[0:2]
+        combined = torch.zeros(N, L, pred.shape[2], device=pred.device, dtype=pred.dtype)
+        combined[mask.bool()] = pred.view(-1, pred.shape[2])
+
+        return combined
+
+    def mask_tokens_grid(self, mask: torch.Tensor) -> torch.Tensor:
+        N = mask.size(0)
+        x = self.decoder_pos_embed.masked_select(mask.bool().unsqueeze(-1)).reshape(N, -1, self.mask_token.size(-1))
+        x = x + self.mask_token
+
+        return x
+
+    def forward_decoder(self, memory: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        x = self.mask_tokens_grid(mask)
+        memory = self.wfm(memory)
+
+        for i, layer in enumerate(self.decoder_layers):
+            x = layer(x, self.decoder_norms[i](memory[..., i]))
+
+        x = self.decoder_norm(x)
+        x = self.pred(x)
+
+        return x
+
+    def forward_loss(self, x: torch.Tensor, pred: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        target = self.patchify(x)
+
+        target = target.masked_select(mask.bool().unsqueeze(-1)).reshape(target.size(0), -1, target.size(-1))
+
+        # Normalize pixels per-patch
+        mean = target.mean(dim=-1, keepdim=True)
+        var = target.var(dim=-1, keepdim=True)
+        target = (target - mean) / (var + 1.0e-6) ** 0.5
+
+        loss = (pred - target) ** 2
+        loss = loss.mean()
+
+        return loss
+
+    def forward(self, x: torch.Tensor, *, return_moe_training_output: bool = False) -> dict[str, Any]:
+        h = self.size[0] // self.encoder.stem_stride
+        w = self.size[1] // self.encoder.stem_stride
+        mask, ids_keep, _ = uniform_mask(
+            x.size(0), h, w, self.mask_ratio, self.kept_mask_ratio, min_mask_size=self.min_mask_size, device=x.device
+        )
+
+        if return_moe_training_output is True:
+            latent = self.encoder.masked_encoding_omission(
+                x, ids_keep, return_all_features=True, return_moe_training_output=True
+            )
+        else:
+            latent = self.encoder.masked_encoding_omission(x, ids_keep, return_all_features=True)
+
+        pred = self.forward_decoder(latent["tokens"], mask)
+        loss = self.forward_loss(x, pred, mask)
+
+        result = {"loss": loss, "pred": pred, "mask": mask}
+        if "moe_training_output" in latent:
+            result["moe_training_output"] = latent["moe_training_output"]
+
+        return result
+
+
+registry.register_model_config("crossmae", CrossMAE, config={"decoder_depth": 8, "decoder_embed_dim": 512})
+registry.register_model_config("crossmae_dec512d12", CrossMAE, config={"decoder_depth": 12, "decoder_embed_dim": 512})

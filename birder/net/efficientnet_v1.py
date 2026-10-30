@@ -1,0 +1,435 @@
+"""
+EfficientNet v1, adapted from
+https://github.com/pytorch/vision/blob/main/torchvision/models/efficientnet.py
+
+Paper "EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks",
+https://arxiv.org/abs/1905.11946
+"""
+
+# Reference license: BSD 3-Clause
+
+import logging
+import math
+from collections import OrderedDict
+from functools import partial
+from typing import Any
+from typing import Literal
+from typing import Optional
+
+import torch
+from torch import nn
+from torch.utils.checkpoint import checkpoint_sequential
+from torchvision.ops import Conv2dNormActivation
+from torchvision.ops import SqueezeExcitation
+from torchvision.ops import StochasticDepth
+
+from birder.common.masking import mask_tensor
+from birder.model_registry import registry
+from birder.net.base import DetectorBackbone
+from birder.net.base import MaskedTokenRetentionMixin
+from birder.net.base import PreTrainEncoder
+from birder.net.base import TokenRetentionResultType
+from birder.net.base import make_divisible
+from birder.net.base import stochastic_depth_rates
+
+logger = logging.getLogger(__name__)
+
+
+def adjust_channels(channels: int, width: float, min_value: Optional[int] = None) -> int:
+    return make_divisible(channels * width, 8, min_value)
+
+
+def adjust_depth(num_layers: int, depth: float) -> int:
+    return int(math.ceil(num_layers * depth))
+
+
+class MBConv(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: tuple[int, int],
+        stride: tuple[int, int],
+        expand_ratio: float,
+        stochastic_depth_prob: float,
+    ) -> None:
+        super().__init__()
+
+        if stride == (1, 1) and in_channels == out_channels:
+            self.use_res_connect = True
+        else:
+            self.use_res_connect = False
+
+        layers = []
+        activation_layer = nn.SiLU
+
+        # Expand
+        expanded_channels = adjust_channels(in_channels, expand_ratio)
+        if expanded_channels != in_channels:
+            layers.append(
+                Conv2dNormActivation(
+                    in_channels,
+                    expanded_channels,
+                    kernel_size=(1, 1),
+                    stride=(1, 1),
+                    padding=(0, 0),
+                    bias=False,
+                    activation_layer=activation_layer,
+                )
+            )
+
+        # Depthwise
+        padding = ((kernel_size[0] - 1) // 2, (kernel_size[1] - 1) // 2)
+        layers.append(
+            Conv2dNormActivation(
+                expanded_channels,
+                expanded_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                groups=expanded_channels,
+                bias=False,
+                activation_layer=activation_layer,
+            )
+        )
+
+        # Squeeze and excitation
+        squeeze_channels = max(1, in_channels // 4)
+        layers.append(SqueezeExcitation(expanded_channels, squeeze_channels, activation=partial(nn.SiLU, inplace=True)))
+
+        # Project
+        layers.append(
+            Conv2dNormActivation(
+                expanded_channels,
+                out_channels,
+                kernel_size=(1, 1),
+                stride=(1, 1),
+                padding=(0, 0),
+                bias=False,
+                activation_layer=None,
+            )
+        )
+
+        self.block = nn.Sequential(*layers)
+        self.stochastic_depth = StochasticDepth(stochastic_depth_prob, mode="row")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        branch = self.block(x)
+        if self.use_res_connect is True:
+            return x + self.stochastic_depth(branch)
+
+        return branch
+
+
+class EfficientNet_v1(DetectorBackbone, PreTrainEncoder, MaskedTokenRetentionMixin):
+    block_group_regex = r"body\.stage(\d+)\.(\d+)"
+
+    def __init__(
+        self,
+        input_channels: int,
+        num_classes: int,
+        *,
+        config: Optional[dict[str, Any]] = None,
+        size: Optional[tuple[int, int]] = None,
+    ) -> None:
+        super().__init__(input_channels, num_classes, config=config, size=size)
+        assert self.config is not None, "must set config"
+
+        repeats = [1, 2, 2, 3, 3, 4, 1]
+        in_channels = [32, 16, 24, 40, 80, 112, 192]
+        out_channels = [16, 24, 40, 80, 112, 192, 320]
+        kernel_size = [(3, 3), (3, 3), (5, 5), (3, 3), (5, 5), (5, 5), (3, 3)]
+        expand_ratio = [1, 6, 6, 6, 6, 6, 6]
+        strides = [(1, 1), (2, 2), (2, 2), (2, 2), (1, 1), (2, 2), (1, 1)]
+        width_coefficient: float = self.config["width_coefficient"]
+        depth_coefficient: float = self.config["depth_coefficient"]
+        dropout_rate: float = self.config["dropout_rate"]
+        drop_path_rate: float = self.config.get("drop_path_rate", 0.2)
+
+        self.grad_checkpointing = False
+        self.grad_checkpointing_segments: Optional[int] = None
+        self.grad_checkpointing_preserve_rng_state = True
+        self.grad_checkpointing_use_reentrant = False
+        self._grad_checkpointing_blocks = ()
+
+        in_channels = [adjust_channels(ch, width_coefficient) for ch in in_channels]
+        out_channels = [adjust_channels(ch, width_coefficient) for ch in out_channels]
+        repeats = [adjust_depth(re, depth_coefficient) for re in repeats]
+
+        self.stem = Conv2dNormActivation(
+            self.input_channels,
+            in_channels[0],
+            kernel_size=(3, 3),
+            stride=(2, 2),
+            padding=(1, 1),
+            bias=False,
+            activation_layer=nn.SiLU,
+        )
+
+        layers: list[nn.Module] = []
+        stages: OrderedDict[str, nn.Module] = OrderedDict()
+        return_channels: list[int] = []
+        stage_id = 0
+        total_stage_blocks = sum(repeats)
+        dpr = stochastic_depth_rates(drop_path_rate, total_stage_blocks, endpoint=False)
+        stage_block_id = 0
+        for i, repeat in enumerate(repeats):
+            for r in range(repeat):
+                sd_prob = dpr[stage_block_id]
+
+                if r > 0:
+                    in_ch = out_channels[i]
+                    stride = (1, 1)
+
+                else:
+                    in_ch = in_channels[i]
+                    stride = strides[i]
+
+                if stride[0] > 1 or stride[1] > 1:
+                    stages[f"stage{stage_id}"] = nn.Sequential(*layers)
+                    return_channels.append(in_ch)
+                    layers = []
+                    stage_id += 1
+
+                layers.append(
+                    MBConv(
+                        in_ch,
+                        out_channels[i],
+                        kernel_size=kernel_size[i],
+                        stride=stride,
+                        expand_ratio=expand_ratio[i],
+                        stochastic_depth_prob=sd_prob,
+                    )
+                )
+
+                stage_block_id += 1
+
+        stages[f"stage{stage_id}"] = nn.Sequential(*layers)
+        return_channels.append(out_channels[-1])
+
+        self.body = nn.Sequential(stages)
+        self.features = nn.Sequential(
+            Conv2dNormActivation(
+                out_channels[-1],
+                out_channels[-1] * 4,
+                kernel_size=(1, 1),
+                stride=(1, 1),
+                padding=(0, 0),
+                bias=False,
+                activation_layer=nn.SiLU,
+            ),
+            nn.AdaptiveAvgPool2d(output_size=(1, 1)),
+            nn.Flatten(1),
+            nn.Dropout(p=dropout_rate, inplace=True),
+        )
+        self.return_channels = return_channels[1:5]
+        self.embedding_size = out_channels[-1] * 4
+        self.classifier = self.create_classifier()
+
+        self.max_stride = 32
+        self.stem_stride = 2
+        self.stem_width = in_channels[0]
+        self.feature_dim = out_channels[-1]
+
+        # Weights initialization
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+            elif isinstance(m, nn.Linear):
+                init_range = 1.0 / math.sqrt(m.out_features)
+                nn.init.uniform_(m.weight, -init_range, init_range)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def set_grad_checkpointing(
+        self,
+        enable: bool = True,
+        *,
+        segments: Optional[int] = None,
+        preserve_rng_state: bool = True,
+        use_reentrant: bool = False,
+    ) -> None:
+        if enable is True:
+            logger.debug(
+                f"Enabling gradient checkpointing: segments={segments}, "
+                f"preserve_rng_state={preserve_rng_state}, use_reentrant={use_reentrant}"
+            )
+        else:
+            logger.debug("Disabling gradient checkpointing")
+
+        self.grad_checkpointing = enable
+        self.grad_checkpointing_segments = segments
+        self.grad_checkpointing_preserve_rng_state = preserve_rng_state
+        self.grad_checkpointing_use_reentrant = use_reentrant
+        if enable is True:
+            self._grad_checkpointing_blocks = tuple(block for stage in self.body for block in stage)
+        else:
+            self._grad_checkpointing_blocks = ()
+
+    def detection_features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        x = self.stem(x)
+
+        out = {}
+        for name, module in self.body.named_children():
+            x = module(x)
+            if name in self.return_stages:
+                out[name] = x
+
+        return out
+
+    def freeze_stages(self, up_to_stage: int) -> None:
+        for param in self.stem.parameters():
+            param.requires_grad_(False)
+
+        for idx, module in enumerate(self.body.children()):
+            if idx >= up_to_stage:
+                break
+
+            for param in module.parameters():
+                param.requires_grad_(False)
+
+    def masked_encoding_retention(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        mask_token: Optional[torch.Tensor] = None,
+        return_keys: Literal["all", "features", "embedding"] = "features",
+    ) -> TokenRetentionResultType:
+        x = self.stem(x)
+        x = mask_tensor(x, mask, patch_factor=self.max_stride // self.stem_stride, mask_token=mask_token)
+        if self.grad_checkpointing is True and torch.is_grad_enabled() is True and not torch.jit.is_scripting():
+            if self.grad_checkpointing_segments is None:
+                segments = len(self._grad_checkpointing_blocks)
+            else:
+                segments = min(self.grad_checkpointing_segments, len(self._grad_checkpointing_blocks))
+
+            x = checkpoint_sequential(
+                self._grad_checkpointing_blocks,
+                segments,
+                x,
+                use_reentrant=self.grad_checkpointing_use_reentrant,
+                preserve_rng_state=self.grad_checkpointing_preserve_rng_state,
+            )
+        else:
+            x = self.body(x)
+
+        result: TokenRetentionResultType = {}
+        if return_keys in ("all", "features"):
+            result["features"] = x
+        if return_keys in ("all", "embedding"):
+            result["embedding"] = self.features(x)
+
+        return result
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        if self.grad_checkpointing is True and torch.is_grad_enabled() is True and not torch.jit.is_scripting():
+            if self.grad_checkpointing_segments is None:
+                segments = len(self._grad_checkpointing_blocks)
+            else:
+                segments = min(self.grad_checkpointing_segments, len(self._grad_checkpointing_blocks))
+
+            return checkpoint_sequential(
+                self._grad_checkpointing_blocks,
+                segments,
+                x,
+                use_reentrant=self.grad_checkpointing_use_reentrant,
+                preserve_rng_state=self.grad_checkpointing_preserve_rng_state,
+            )
+
+        return self.body(x)
+
+    def embedding_from_features(self, features: torch.Tensor) -> torch.Tensor:
+        return self.features(features)
+
+
+registry.register_model_config(
+    "efficientnet_v1_b0",
+    EfficientNet_v1,  # input_resolution = 224
+    config={"width_coefficient": 1.0, "depth_coefficient": 1.0, "dropout_rate": 0.2},
+)
+registry.register_model_config(
+    "efficientnet_v1_b1",
+    EfficientNet_v1,  # input_resolution = 240
+    config={"width_coefficient": 1.0, "depth_coefficient": 1.1, "dropout_rate": 0.2},
+)
+registry.register_model_config(
+    "efficientnet_v1_b2",
+    EfficientNet_v1,  # input_resolution = 260
+    config={"width_coefficient": 1.1, "depth_coefficient": 1.2, "dropout_rate": 0.3},
+)
+registry.register_model_config(
+    "efficientnet_v1_b3",
+    EfficientNet_v1,  # input_resolution = 300
+    config={"width_coefficient": 1.2, "depth_coefficient": 1.4, "dropout_rate": 0.3},
+)
+registry.register_model_config(
+    "efficientnet_v1_b4",
+    EfficientNet_v1,  # input_resolution = 380
+    config={"width_coefficient": 1.4, "depth_coefficient": 1.8, "dropout_rate": 0.4},
+)
+registry.register_model_config(
+    "efficientnet_v1_b5",
+    EfficientNet_v1,  # input_resolution = 456
+    config={"width_coefficient": 1.6, "depth_coefficient": 2.2, "dropout_rate": 0.4},
+)
+registry.register_model_config(
+    "efficientnet_v1_b6",
+    EfficientNet_v1,  # input_resolution = 528
+    config={"width_coefficient": 1.8, "depth_coefficient": 2.6, "dropout_rate": 0.5},
+)
+registry.register_model_config(
+    "efficientnet_v1_b7",
+    EfficientNet_v1,  # input_resolution = 600
+    config={"width_coefficient": 2.0, "depth_coefficient": 3.1, "dropout_rate": 0.5},
+)
+
+registry.register_weights(
+    "efficientnet_v1_b0_il-common",
+    {
+        "description": "EfficientNet v1 B0 model trained on the il-common dataset",
+        "resolution": (256, 256),
+        "formats": {
+            "pt": {
+                "file_size": 17.4,
+                "sha256": "0fa929ac2c996cfbb5e4975414df747cbabbe2e26b186c746c67a2a972395676",
+            }
+        },
+        "net": {"network": "efficientnet_v1_b0", "tag": "il-common"},
+    },
+)
+registry.register_weights(
+    "efficientnet_v1_b1_il-common",
+    {
+        "description": "EfficientNet v1 B1 model trained on the il-common dataset",
+        "resolution": (256, 256),
+        "formats": {
+            "pt": {
+                "file_size": 27.1,
+                "sha256": "c2b7e5809de4b549d5eb9270ecc6f79d3258dd772f9adc5eae6a601acf51dfb7",
+            }
+        },
+        "net": {"network": "efficientnet_v1_b1", "tag": "il-common"},
+    },
+)
+registry.register_weights(
+    "efficientnet_v1_b2_il-common",
+    {
+        "description": "EfficientNet v1 B2 model trained on the il-common dataset",
+        "resolution": (256, 256),
+        "formats": {
+            "pt": {
+                "file_size": 31.8,
+                "sha256": "b17b8f4c2c233e2f3f801da25d23dedd02d6ad31599b824862e6dd9c3e869498",
+            }
+        },
+        "net": {"network": "efficientnet_v1_b2", "tag": "il-common"},
+    },
+)

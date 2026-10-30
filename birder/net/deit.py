@@ -1,0 +1,348 @@
+"""
+DeiT, adapted from
+https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/deit.py
+
+Paper "Training data-efficient image transformers & distillation through attention",
+https://arxiv.org/abs/2012.12877
+"""
+
+# Reference license: Apache-2.0
+
+from typing import Any
+from typing import Optional
+
+import torch
+from torch import nn
+
+from birder.model_registry import registry
+from birder.net._vit_configs import BASE
+from birder.net._vit_configs import SMALL
+from birder.net._vit_configs import TINY
+from birder.net.base import DetectorBackbone
+from birder.net.base import normalize_out_indices
+from birder.net.base import stochastic_depth_rates
+from birder.net.vit import Encoder
+from birder.net.vit import PatchEmbed
+from birder.net.vit import adjust_position_embedding
+
+
+class DeiT(DetectorBackbone):
+    block_group_regex = r"encoder\.block\.(\d+)"
+
+    def __init__(
+        self,
+        input_channels: int,
+        num_classes: int,
+        *,
+        config: Optional[dict[str, Any]] = None,
+        size: Optional[tuple[int, int]] = None,
+    ) -> None:
+        super().__init__(input_channels, num_classes, config=config, size=size)
+        assert self.config is not None, "must set config"
+
+        image_size = self.size
+        pos_embed_antialias: bool = self.config.get("pos_embed_antialias", False)  # Controls forward pass only
+        patch_size: int = self.config["patch_size"]
+        num_layers: int = self.config["num_layers"]
+        num_heads: int = self.config["num_heads"]
+        hidden_dim: int = self.config["hidden_dim"]
+        mlp_dim: int = self.config["mlp_dim"]
+        out_indices: Optional[list[int]] = self.config.get("out_indices", None)
+        dropout: float = self.config.get("dropout", 0.0)
+        attention_dropout: float = self.config.get("attention_dropout", 0.0)
+        projection_dropout: float = self.config.get("projection_dropout", 0.0)
+        drop_path_rate: float = self.config["drop_path_rate"]
+        drop_path_uniform: bool = self.config.get("drop_path_uniform", False)
+
+        torch._assert(image_size[0] % patch_size == 0, "Input shape indivisible by patch size!")
+        torch._assert(image_size[1] % patch_size == 0, "Input shape indivisible by patch size!")
+        torch._assert(hidden_dim % num_heads == 0, "Hidden dim indivisible by num heads!")
+        self.pos_embed_antialias = pos_embed_antialias
+        self.patch_size = patch_size
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self.num_special_tokens = 2
+        self.out_indices = normalize_out_indices(out_indices, num_layers)
+        dpr = stochastic_depth_rates(drop_path_rate, num_layers, constant=drop_path_uniform)
+
+        self.conv_proj = nn.Conv2d(
+            self.input_channels,
+            hidden_dim,
+            kernel_size=(patch_size, patch_size),
+            stride=(patch_size, patch_size),
+            padding=(0, 0),
+        )
+        self.patch_embed = PatchEmbed()
+
+        seq_length = (image_size[0] // patch_size) * (image_size[1] // patch_size)
+
+        # Add a class token
+        self.class_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        seq_length += 1
+
+        # Add distillation token
+        self.dist_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        seq_length += 1
+
+        # Add positional embedding
+        self.pos_embedding = nn.Parameter(torch.empty(1, seq_length, hidden_dim).normal_(std=0.02))  # from BERT
+
+        self.encoder = Encoder(
+            num_layers,
+            num_heads,
+            hidden_dim,
+            mlp_dim,
+            dropout,
+            attention_dropout,
+            projection_dropout,
+            dpr,
+        )
+        self.norm = nn.LayerNorm(hidden_dim, eps=1e-6)
+
+        num_return_stages = len(self.out_indices) if self.out_indices is not None else 1
+        self.return_stages = [f"stage{stage_idx + 1}" for stage_idx in range(num_return_stages)]
+        self.return_channels = [hidden_dim] * num_return_stages
+        self.embedding_size = hidden_dim
+        self.dist_classifier = self.create_classifier()
+        self.classifier = self.create_classifier()
+        self.distillation_output = False
+
+        self.max_stride = patch_size
+        self.stem_stride = patch_size
+        self.stem_width = hidden_dim
+        self.feature_dim = hidden_dim
+
+        # Weight initialization
+        nn.init.trunc_normal_(self.class_token, std=0.02)
+        nn.init.trunc_normal_(self.dist_token, std=0.02)
+        nn.init.trunc_normal_(self.pos_embedding, std=0.02)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def _get_pos_embed(self, H: int, W: int) -> torch.Tensor:
+        if self.dynamic_size is False:
+            return self.pos_embedding
+
+        if H == self.size[0] and W == self.size[1]:
+            return self.pos_embedding
+
+        return adjust_position_embedding(
+            self.pos_embedding,
+            (self.size[0] // self.patch_size, self.size[1] // self.patch_size),
+            (H // self.patch_size, W // self.patch_size),
+            self.num_special_tokens,
+            antialias=self.pos_embed_antialias,
+        )
+
+    def reset_classifier(self, num_classes: int) -> None:
+        self.num_classes = num_classes
+        self.dist_classifier = self.create_classifier()
+        self.classifier = self.create_classifier()
+
+    def freeze(self, freeze_classifier: bool = True, unfreeze_features: bool = False) -> None:
+        for param in self.parameters():
+            param.requires_grad_(False)
+
+        if freeze_classifier is False:
+            for param in self.classifier.parameters():
+                param.requires_grad_(True)
+
+            for param in self.dist_classifier.parameters():
+                param.requires_grad_(True)
+
+        if unfreeze_features is True:
+            for param in self.norm.parameters():
+                param.requires_grad_(True)
+
+    def set_causal_attention(self, is_causal: bool = True) -> None:
+        self.encoder.set_causal_attention(is_causal)
+
+    def strip_for_forward_features(self) -> None:
+        super().strip_for_forward_features()
+        self.dist_classifier = nn.Identity()
+
+    def strip_for_detection_features(self) -> None:
+        super().strip_for_detection_features()
+        self.norm = nn.Identity()
+        self.dist_classifier = nn.Identity()
+
+    def detection_features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        H, W = x.shape[-2:]
+
+        # Reshape and permute the input tensor
+        x = self.conv_proj(x)
+        x = self.patch_embed(x)
+
+        # Expand the class token to the full batch
+        batch_class_token = self.class_token.expand(x.shape[0], -1, -1)
+        batch_dist_token = self.dist_token.expand(x.shape[0], -1, -1)
+
+        x = torch.concat([batch_class_token, batch_dist_token, x], dim=1)
+        x = x + self._get_pos_embed(H, W)
+
+        if self.out_indices is None:
+            xs = [self.encoder(x)]
+        else:
+            xs = self.encoder.forward_features(x, out_indices=self.out_indices)
+
+        out: dict[str, torch.Tensor] = {}
+        for stage_name, stage_x in zip(self.return_stages, xs, strict=True):
+            stage_x = stage_x[:, self.num_special_tokens :]
+            stage_x = stage_x.permute(0, 2, 1)
+            B, C, _ = stage_x.size()
+            stage_x = stage_x.reshape(B, C, H // self.patch_size, W // self.patch_size)
+            out[stage_name] = stage_x
+
+        return out
+
+    def freeze_stages(self, up_to_stage: int) -> None:
+        for param in self.conv_proj.parameters():
+            param.requires_grad_(False)
+
+        self.pos_embedding.requires_grad_(False)
+
+        if up_to_stage <= 0:
+            return
+
+        if self.out_indices is None:
+            stage_boundaries = [self.num_layers - 1]
+        else:
+            stage_boundaries = sorted(set(self.out_indices))
+
+        last_block = stage_boundaries[min(up_to_stage, len(stage_boundaries)) - 1]
+        for block in self.encoder.block[: last_block + 1]:
+            for param in block.parameters():
+                param.requires_grad_(False)
+
+    def forward_features(
+        self, x: torch.Tensor, return_input_embedding: bool = False, attn_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        H, W = x.shape[-2:]
+
+        # Reshape and permute the input tensor
+        x = self.conv_proj(x)
+        x = self.patch_embed(x)
+
+        # Expand the class token to the full batch
+        batch_class_token = self.class_token.expand(x.shape[0], -1, -1)
+        batch_dist_token = self.dist_token.expand(x.shape[0], -1, -1)
+
+        x = torch.concat([batch_class_token, batch_dist_token, x], dim=1)
+        if return_input_embedding is True:
+            input_embedding = x
+        else:
+            input_embedding = None  # For TorchScript compatibility
+
+        x = x + self._get_pos_embed(H, W)
+
+        x = self.encoder(x, attn_mask=attn_mask)
+        x = self.norm(x)
+
+        if return_input_embedding is True and input_embedding is not None:
+            return torch.stack([input_embedding, x], dim=-1)
+
+        return x
+
+    def flatten_features(self, features: torch.Tensor, include_special_tokens: bool = True) -> torch.Tensor:
+        if include_special_tokens is False:
+            return features[:, self.num_special_tokens :]
+
+        return features
+
+    def embedding_from_features(self, features: torch.Tensor) -> torch.Tensor:
+        return features[:, 0:2]
+
+    def set_distillation_output(self, enable: bool = True) -> None:
+        self.distillation_output = enable
+
+    def classify(self, x: torch.Tensor) -> torch.Tensor:
+        x_cls = x[:, 0]
+        x_dist = x[:, 1]
+
+        x_cls = self.classifier(x_cls)
+        x_dist = self.dist_classifier(x_dist)
+
+        if self.training is True and self.distillation_output is True:
+            x = torch.stack([x_cls, x_dist], dim=1)
+        else:
+            # Classifier "token" as an average of both tokens (during regular training or inference)
+            x = (x_cls + x_dist) / 2
+
+        return x
+
+    def adjust_size(self, new_size: tuple[int, int]) -> None:
+        if new_size == self.size:
+            return
+
+        assert new_size[0] % self.patch_size == 0, "Input shape indivisible by patch size!"
+        assert new_size[1] % self.patch_size == 0, "Input shape indivisible by patch size!"
+
+        old_size = self.size
+        super().adjust_size(new_size)
+
+        # Sort out sizes
+        num_prefix_tokens = 2
+
+        # Add back class tokens
+        with torch.no_grad():
+            pos_embedding = adjust_position_embedding(
+                self.pos_embedding,
+                (old_size[0] // self.patch_size, old_size[1] // self.patch_size),
+                (new_size[0] // self.patch_size, new_size[1] // self.patch_size),
+                num_prefix_tokens,
+            )
+        self.pos_embedding = nn.Parameter(pos_embedding, requires_grad=self.pos_embedding.requires_grad)
+
+
+registry.register_model_config(
+    "deit_t16",
+    DeiT,
+    config={"patch_size": 16, **TINY},
+)
+registry.register_model_config(
+    "deit_s16",
+    DeiT,
+    config={"patch_size": 16, **SMALL, "drop_path_rate": 0.1},  # Override the SMALL definition
+)
+registry.register_model_config(
+    "deit_b16",
+    DeiT,
+    config={"patch_size": 16, **BASE},
+)
+
+registry.register_weights(
+    "deit_t16_il-common",
+    {
+        "description": "DeiT T/16 model trained on the il-common dataset",
+        "resolution": (256, 256),
+        "formats": {
+            "pt": {
+                "file_size": 21.7,
+                "sha256": "68b33aba0c1be5e78d4a33e74a7c1ea72b6abb232d59f0048ff9b8342e43246e",
+            }
+        },
+        "net": {"network": "deit_t16", "tag": "il-common"},
+    },
+)
+registry.register_weights(
+    "deit_t16_dist-il-common",
+    {
+        "description": (
+            "DeiT T/16 model trained using distillation from a ConvNeXt v2 Tiny teacher on the il-common dataset"
+        ),
+        "resolution": (256, 256),
+        "formats": {
+            "pt": {
+                "file_size": 21.7,
+                "sha256": "f693e89fc350341141c55152bec9f499df63738e8423071f3b8e71801c3e5415",
+            }
+        },
+        "net": {"network": "deit_t16", "tag": "dist-il-common"},
+    },
+)

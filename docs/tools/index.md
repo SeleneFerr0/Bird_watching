@@ -1,0 +1,47 @@
+# Birder Tools
+
+Birder provides a comprehensive suite of tools to assist with various aspects of model development, evaluation, analysis and productization. These tools are designed to streamline your workflow and enhance your ability to work with bird classification models.
+
+## Usage
+
+To use any of the Birder tools, use the following command structure:
+
+```sh
+python -m birder.tools [TOOL_NAME] [OPTIONS]
+```
+
+For a list of tools, use:
+
+```sh
+python -m birder.tools --help
+```
+
+For help on a specific tool, use:
+
+```sh
+python -m birder.tools [TOOL_NAME] --help
+```
+
+### Available Tools
+
+- [adversarial](adversarial.md)
+- avg-model
+- [convert-model](convert-model.md)
+- download-model
+- [ensemble-model](ensemble-model.md)
+- feature-matching
+- [introspection](introspection.md)
+- labelme-to-coco
+- list-models
+- model-info
+- [pack](pack.md)
+- [pack-detection](pack-detection.md)
+- quantize-model
+- [results](results.md)
+- show-det-iterator
+- show-iterator
+- similarity
+- stats
+- verify-directory
+
+Each tool is documented in detail on its respective page. Click on a tool name to view its full documentation.

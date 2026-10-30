@@ -1,0 +1,1626 @@
+"""
+ViT, adapted from
+https://github.com/pytorch/vision/blob/main/torchvision/models/vision_transformer.py
+and
+https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py
+
+Paper "An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale",
+https://arxiv.org/abs/2010.11929
+and
+Paper "Vision Transformers Need Registers", https://arxiv.org/abs/2309.16588
+and
+Paper "DeiT III: Revenge of the ViT", https://arxiv.org/abs/2204.07118
+and
+Paper "Getting ViT in Shape: Scaling Laws for Compute-Optimal Model Design", https://arxiv.org/abs/2305.13035
+and
+Paper "From Sparse to Soft Mixtures of Experts", https://arxiv.org/abs/2308.00951
+and
+Paper "Three things everyone should know about Vision Transformers", https://arxiv.org/abs/2203.09795
+"""
+
+# Reference license: BSD 3-Clause and Apache-2.0
+
+import logging
+import math
+from collections.abc import Callable
+from functools import partial
+from typing import Any
+from typing import Literal
+from typing import Optional
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.utils.checkpoint import checkpoint_sequential
+from torchvision.ops import StochasticDepth
+
+from birder.common.masking import mask_tensor
+from birder.layers import FFN
+from birder.layers import EfficientProbing
+from birder.layers import LayerNorm2d
+from birder.layers import LayerScale
+from birder.layers import MultiHeadAttentionPool
+from birder.layers import SoftMoE_FFN
+from birder.layers import SwiGLU_FFN
+from birder.layers.activations import get_activation_module
+from birder.model_registry import registry
+from birder.net._vit_configs import register_vit_configs
+from birder.net.base import DetectorBackbone
+from birder.net.base import MaskedTokenOmissionMixin
+from birder.net.base import MaskedTokenRetentionMixin
+from birder.net.base import PreTrainEncoder
+from birder.net.base import TokenOmissionResultType
+from birder.net.base import TokenRetentionResultType
+from birder.net.base import normalize_out_indices
+from birder.net.base import stochastic_depth_rates
+
+logger = logging.getLogger(__name__)
+
+
+def adjust_position_embedding(
+    pos_embedding: torch.Tensor,
+    old_base_size: tuple[int, int],
+    new_base_size: tuple[int, int],
+    num_prefix_tokens: int,
+    interpolation_mode: str = "bicubic",
+    antialias: bool = True,
+) -> torch.Tensor:
+    """
+    Adapted from
+    https://github.com/huggingface/pytorch-image-models/blob/main/timm/layers/pos_embed.py
+    """
+
+    pos_embedding_prefix = pos_embedding[:, :num_prefix_tokens]
+    pos_embedding = pos_embedding[:, num_prefix_tokens:]
+
+    # Interpolation
+    embed_dim = pos_embedding.shape[-1]
+    orig_dtype = pos_embedding.dtype
+    pos_embedding = pos_embedding.float()  # Interpolate needs float32
+    pos_embedding = pos_embedding.reshape(1, old_base_size[0], old_base_size[1], -1).permute(0, 3, 1, 2)
+    pos_embedding = F.interpolate(pos_embedding, size=new_base_size, mode=interpolation_mode, antialias=antialias)
+    pos_embedding = pos_embedding.permute(0, 2, 3, 1).reshape(1, -1, embed_dim)
+    pos_embedding = pos_embedding.to(orig_dtype)
+
+    # Add back special tokens
+    return torch.concat([pos_embedding_prefix, pos_embedding], dim=1)
+
+
+def apply_attention_mask(attn: torch.Tensor, attn_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    if attn_mask is None:
+        return attn
+
+    if attn_mask.dtype == torch.bool:
+        return attn.masked_fill(~attn_mask, float("-inf"))
+
+    return attn + attn_mask
+
+
+class PatchEmbed(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        This is equivalent (in output) to: x.flatten(2).transpose(1, 2)
+        """
+
+        n, hidden_dim, h, w = x.size()
+        x = x.reshape(n, hidden_dim, h * w)
+
+        # (n, hidden_dim, (h * w)) -> (n, (h * w), hidden_dim)
+        # The self attention layer expects inputs in the format (N, S, E)
+        # where S is the source sequence length, N is the batch size, E is the
+        # embedding dimension
+        x = x.permute(0, 2, 1)
+
+        return x
+
+
+class hMLPStem(nn.Sequential):
+    """
+    Hierarchical MLP image-to-patch stem for 16x16 patches
+    """
+
+    def __init__(
+        self,
+        input_channels: int,
+        hidden_dim: int,
+        norm_layer: Callable[..., nn.Module] = LayerNorm2d,
+    ) -> None:
+        stem_dim = hidden_dim // 4
+        super().__init__(
+            nn.Conv2d(input_channels, stem_dim, kernel_size=(4, 4), stride=(4, 4), padding=(0, 0)),
+            norm_layer(stem_dim),
+            nn.GELU(),
+            nn.Conv2d(stem_dim, stem_dim, kernel_size=(2, 2), stride=(2, 2), padding=(0, 0)),
+            norm_layer(stem_dim),
+            nn.GELU(),
+            nn.Conv2d(stem_dim, hidden_dim, kernel_size=(2, 2), stride=(2, 2), padding=(0, 0)),
+            norm_layer(hidden_dim),
+        )
+
+
+class Attention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        attn_drop: float,
+        proj_drop: float,
+        qkv_bias: bool = True,
+        qk_norm: bool = False,
+        attn_norm: bool = False,
+        norm_layer: Callable[..., nn.Module] = nn.LayerNorm,
+        norm_layer_eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        assert dim % num_heads == 0, "dim should be divisible by num_heads"
+
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim**-0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        if qk_norm is True:
+            self.q_norm = norm_layer(self.head_dim, eps=norm_layer_eps)
+            self.k_norm = norm_layer(self.head_dim, eps=norm_layer_eps)
+        else:
+            self.q_norm = nn.Identity()
+            self.k_norm = nn.Identity()
+
+        self.attn_drop = nn.Dropout(attn_drop)
+        if attn_norm is True:
+            self.norm = norm_layer(dim, eps=norm_layer_eps)
+        else:
+            self.norm = nn.Identity()
+
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        # Weight initialization
+        for m in (self.qkv, self.proj):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        need_weights: bool = False,
+        average_attn_weights: bool = False,
+        is_causal: bool = False,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Apply multi-head self-attention to the input sequence
+
+        This module implements scaled dot-product attention over x and returns the
+        projected output.
+
+        Parameters
+        ----------
+        x
+            Input tensor of shape (B, N, C) where B is batch size, N is sequence length,
+            and C is embedding dimension.
+        need_weights
+            If True, also return attention weights computed explicitly. If False, uses
+            torch.nn.functional.scaled_dot_product_attention and returns None for attention weights.
+        average_attn_weights
+            If True and need_weights is True, average attention weights across heads
+            to shape (B, N, N). If False, return per-head weights of shape (B, num_heads, N, N).
+        is_causal
+            If True, apply a causal (upper-triangular) mask so positions cannot attend to future tokens.
+        attn_mask
+            Optional attention mask broadcastable to (B, num_heads, N, N). Boolean masks use True for allowed
+            positions. Floating masks are additive.
+
+        Returns
+        -------
+        A tuple containing two elements:
+            - output: Tensor of shape (B, N, C)
+            - attn_weights: If need_weights is True attention weights, otherwise, None.
+        """
+
+        B, N, C = x.size()
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        attn_weights: Optional[torch.Tensor] = None
+        if need_weights is True:
+            # Compute attention manually to get weights
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            if is_causal is True:
+                causal_bias = torch.full((N, N), float("-inf"), dtype=attn.dtype, device=attn.device).triu_(diagonal=1)
+                attn = attn + causal_bias
+
+            attn = apply_attention_mask(attn, attn_mask)
+            attn = attn.softmax(dim=-1)
+            attn_weights = attn
+            attn = self.attn_drop(attn)
+            x = attn @ v
+
+            if average_attn_weights is True:
+                # Average across heads: (B, num_heads, N, N) -> (B, N, N)
+                attn_weights = attn_weights.mean(dim=1)
+        else:
+            x = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+                is_causal=is_causal,
+                scale=self.scale,
+            )
+
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self.norm(x)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return (x, attn_weights)
+
+
+class EncoderBlock(nn.Module):
+    def __init__(
+        self,
+        num_heads: int,
+        hidden_dim: int,
+        mlp_dim: Optional[int],
+        dropout: float,
+        attention_dropout: float,
+        projection_dropout: float,
+        drop_path: float,
+        activation_layer: Callable[..., nn.Module],
+        layer_scale_init_value: Optional[float] = None,
+        norm_layer: Callable[..., nn.Module] = nn.LayerNorm,
+        norm_layer_eps: float = 1e-6,
+        mlp_layer: Callable[..., nn.Module] = FFN,
+        qkv_bias: bool = True,
+        qk_norm: bool = False,
+        attn_norm: bool = False,
+    ) -> None:
+        super().__init__()
+        self.need_attn = False
+
+        if mlp_dim is None:
+            mlp_dim = hidden_dim * 4
+
+        # Attention block
+        self.norm1 = norm_layer(hidden_dim, eps=norm_layer_eps)
+        self.attn = Attention(
+            hidden_dim,
+            num_heads=num_heads,
+            attn_drop=attention_dropout,
+            proj_drop=projection_dropout,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            attn_norm=attn_norm,
+            norm_layer=norm_layer,
+            norm_layer_eps=norm_layer_eps,
+        )
+
+        self.drop_path = StochasticDepth(drop_path, mode="row")
+        if layer_scale_init_value is not None:
+            self.layer_scale_1 = LayerScale(hidden_dim, layer_scale_init_value)
+        else:
+            self.layer_scale_1 = nn.Identity()
+
+        # MLP block
+        self.norm2 = norm_layer(hidden_dim, eps=norm_layer_eps)
+        self.mlp = mlp_layer(hidden_dim, mlp_dim, act_layer=activation_layer, dropout=dropout)
+        if layer_scale_init_value is not None:
+            self.layer_scale_2 = LayerScale(hidden_dim, layer_scale_init_value)
+        else:
+            self.layer_scale_2 = nn.Identity()
+
+    def forward(
+        self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None, is_causal: bool = False
+    ) -> torch.Tensor:
+        # torch._assert(x.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {x.size()}")
+        attn_out, _ = self.attn(
+            self.norm1(x),
+            need_weights=self.need_attn,
+            average_attn_weights=False,
+            is_causal=is_causal,
+            attn_mask=attn_mask,
+        )
+        x = x + self.drop_path(self.layer_scale_1(attn_out))
+        x = x + self.drop_path(self.layer_scale_2(self.mlp(self.norm2(x))))
+
+        return x
+
+    def set_need_attn(self, need_attn: bool = True) -> None:
+        self.need_attn = need_attn
+
+
+class Encoder(nn.Module):
+    def __init__(
+        self,
+        num_layers: int,
+        num_heads: int,
+        hidden_dim: int,
+        mlp_dim: int,
+        dropout: float,
+        attention_dropout: float,
+        projection_dropout: float,
+        dpr: list[float],
+        pre_norm: bool = False,
+        qkv_bias: bool = True,
+        qk_norm: bool = False,
+        attn_norm: bool = False,
+        activation_layer: Callable[..., nn.Module] = nn.GELU,
+        layer_scale_init_value: Optional[float] = None,
+        norm_layer: Callable[..., nn.Module] = nn.LayerNorm,
+        norm_layer_eps: float = 1e-6,
+        mlp_layer: Callable[..., nn.Module] = FFN,
+        soft_moe_num_experts: Optional[int] = None,
+        soft_moe_num_slots: int = 1,
+    ) -> None:
+        super().__init__()
+        self.need_attn = False
+        self.is_causal = False
+        self.has_soft_moe = soft_moe_num_experts is not None
+        self.grad_checkpointing = False
+        self.grad_checkpointing_segments: Optional[int] = None
+        self.grad_checkpointing_preserve_rng_state = True
+        self.grad_checkpointing_use_reentrant = False
+
+        pre_layers = []
+        if dropout > 0.0:
+            pre_layers.append(nn.Dropout(dropout))
+        if pre_norm is True:
+            pre_layers.append(norm_layer(hidden_dim, eps=norm_layer_eps))
+
+        self.pre_block = nn.Sequential(*pre_layers)
+
+        layers = []
+        for i in range(num_layers):
+            block_mlp_layer = mlp_layer
+            if soft_moe_num_experts is not None:
+                if i < num_layers // 2:
+                    block_mlp_layer = FFN
+                else:
+                    block_mlp_layer = partial(
+                        mlp_layer,
+                        num_experts=soft_moe_num_experts,
+                        num_slots=soft_moe_num_slots,
+                        norm_eps=norm_layer_eps,
+                    )
+
+            layers.append(
+                EncoderBlock(
+                    num_heads,
+                    hidden_dim,
+                    mlp_dim,
+                    dropout,
+                    attention_dropout,
+                    projection_dropout,
+                    dpr[i],
+                    activation_layer=activation_layer,
+                    layer_scale_init_value=layer_scale_init_value,
+                    norm_layer=norm_layer,
+                    norm_layer_eps=norm_layer_eps,
+                    mlp_layer=block_mlp_layer,
+                    qkv_bias=qkv_bias,
+                    qk_norm=qk_norm,
+                    attn_norm=attn_norm,
+                )
+            )
+
+        self.block = nn.Sequential(*layers)
+
+    def _prepare_attention_mask(
+        self, x: torch.Tensor, attn_mask: Optional[torch.Tensor]
+    ) -> tuple[Optional[torch.Tensor], bool]:
+        if attn_mask is None:
+            return (None, self.is_causal)
+
+        if attn_mask.dtype == torch.bool:
+            if self.need_attn is True:
+                if self.is_causal is True:
+                    seq_len = x.size(1)
+                    causal_mask = torch.ones((seq_len, seq_len), dtype=torch.bool, device=attn_mask.device).tril_()
+                    attn_mask = attn_mask & causal_mask
+
+                return (attn_mask, False)
+
+            if self.is_causal is True:
+                seq_len = x.size(1)
+                causal_mask = torch.ones((seq_len, seq_len), dtype=torch.bool, device=attn_mask.device).triu_(
+                    diagonal=1
+                )
+                mask_shape = torch.broadcast_shapes(attn_mask.shape, causal_mask.shape)
+                additive_mask = torch.zeros(mask_shape, dtype=x.dtype, device=attn_mask.device)
+                additive_mask.masked_fill_(causal_mask, float("-inf"))
+                additive_mask.masked_fill_(~attn_mask, float("-inf"))
+            else:
+                additive_mask = torch.full_like(attn_mask, float("-inf"), dtype=x.dtype)
+                additive_mask.masked_fill_(attn_mask, 0.0)
+
+            attn_mask = additive_mask
+        elif self.is_causal is True:
+            seq_len = x.size(1)
+            causal_bias = torch.full(
+                (seq_len, seq_len), float("-inf"), dtype=attn_mask.dtype, device=attn_mask.device
+            ).triu_(diagonal=1)
+            attn_mask = attn_mask + causal_bias
+
+        return (attn_mask, False)
+
+    def _checkpoint_blocks(
+        self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None, is_causal: bool = False
+    ) -> torch.Tensor:
+        if self.grad_checkpointing_segments is None:
+            segments = len(self.block)
+        else:
+            segments = min(self.grad_checkpointing_segments, len(self.block))
+
+        if attn_mask is not None or is_causal is True:
+            blocks = tuple(partial(block, attn_mask=attn_mask, is_causal=is_causal) for block in self.block)
+        else:
+            blocks = self.block
+
+        return checkpoint_sequential(
+            blocks,
+            segments,
+            x,
+            use_reentrant=self.grad_checkpointing_use_reentrant,
+            preserve_rng_state=self.grad_checkpointing_preserve_rng_state,
+        )
+
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = self.pre_block(x)
+        attn_mask, is_causal = self._prepare_attention_mask(x, attn_mask)
+        if self.grad_checkpointing is True and torch.is_grad_enabled() is True and not torch.jit.is_scripting():
+            return self._checkpoint_blocks(x, attn_mask=attn_mask, is_causal=is_causal)
+
+        if attn_mask is None and is_causal is False:
+            return self.block(x)
+
+        for blk in self.block:
+            x = blk(x, attn_mask=attn_mask, is_causal=is_causal)
+
+        return x
+
+    def forward_features(
+        self, x: torch.Tensor, out_indices: Optional[list[int]] = None, attn_mask: Optional[torch.Tensor] = None
+    ) -> list[torch.Tensor]:
+        x = self.pre_block(x)
+        attn_mask, is_causal = self._prepare_attention_mask(x, attn_mask)
+
+        out_indices_set = set(out_indices) if out_indices is not None else None
+        xs = []
+        for idx, blk in enumerate(self.block):
+            x = blk(x, attn_mask=attn_mask, is_causal=is_causal)
+            if out_indices_set is None or idx in out_indices_set:
+                xs.append(x)
+
+        return xs
+
+    def set_need_attn(self, need_attn: bool = True) -> None:
+        if need_attn is True and self.grad_checkpointing is True:
+            raise ValueError("Attention weights cannot be returned when gradient checkpointing is enabled")
+
+        self.need_attn = need_attn
+        for b in self.block:
+            b.set_need_attn(need_attn)
+
+    def set_grad_checkpointing(
+        self,
+        enable: bool = True,
+        *,
+        segments: Optional[int] = None,
+        preserve_rng_state: bool = True,
+        use_reentrant: bool = False,
+    ) -> None:
+        if enable is True and self.need_attn is True:
+            raise ValueError("Gradient checkpointing cannot be enabled when attention weights are returned")
+
+        if enable is True:
+            logger.debug(
+                f"Enabling gradient checkpointing: segments={segments}, "
+                f"preserve_rng_state={preserve_rng_state}, use_reentrant={use_reentrant}"
+            )
+        else:
+            logger.debug("Disabling gradient checkpointing")
+
+        self.grad_checkpointing = enable
+        self.grad_checkpointing_segments = segments
+        self.grad_checkpointing_preserve_rng_state = preserve_rng_state
+        self.grad_checkpointing_use_reentrant = use_reentrant
+
+    def set_causal_attention(self, is_causal: bool = True) -> None:
+        if is_causal is True and self.has_soft_moe is True:
+            raise ValueError("SoftMoE_FFN does not support causal attention")
+
+        self.is_causal = is_causal
+
+
+class ViT(DetectorBackbone, PreTrainEncoder, MaskedTokenOmissionMixin, MaskedTokenRetentionMixin):
+    block_group_regex = r"encoder\.block\.(\d+)"
+
+    def __init__(
+        self,
+        input_channels: int,
+        num_classes: int,
+        *,
+        config: Optional[dict[str, Any]] = None,
+        size: Optional[tuple[int, int]] = None,
+    ) -> None:
+        super().__init__(input_channels, num_classes, config=config, size=size)
+        assert self.config is not None, "must set config"
+
+        image_size = self.size
+        abs_pos_embed: bool = self.config.get("abs_pos_embed", True)
+        pos_embed_special_tokens: bool = self.config.get("pos_embed_special_tokens", True)
+        pos_embed_interpolation_mode: Literal["bilinear", "bicubic"] = self.config.get(
+            "pos_embed_interpolation_mode", "bicubic"
+        )
+        pos_embed_antialias: bool = self.config.get("pos_embed_antialias", False)  # Controls forward pass only
+        patch_size: int = self.config["patch_size"]
+        stem_type: Literal["patchify", "hmlp"] = self.config.get("stem_type", "patchify")
+        stem_norm_layer_type: Optional[Literal["BatchNorm2d", "LayerNorm2d"]] = self.config.get(
+            "stem_norm_layer_type", None
+        )
+        num_layers: int = self.config["num_layers"]
+        num_heads: int = self.config["num_heads"]
+        hidden_dim: int = self.config["hidden_dim"]
+        mlp_dim: int = self.config["mlp_dim"]
+        layer_scale_init_value: Optional[float] = self.config.get("layer_scale_init_value", None)
+        pre_norm: bool = self.config.get("pre_norm", False)
+        post_norm: bool = self.config.get("post_norm", True)
+        norm_after_pool: bool = self.config.get("norm_after_pool", False)
+        qkv_bias: bool = self.config.get("qkv_bias", True)
+        qk_norm: bool = self.config.get("qk_norm", False)
+        attn_norm: bool = self.config.get("attn_norm", False)
+        num_reg_tokens: int = self.config.get("num_reg_tokens", 0)
+        class_token: bool = self.config.get("class_token", True)
+        attn_pool_head: bool = self.config.get("attn_pool_head", False)
+        attn_pool_type: str = self.config.get("attn_pool_type", "MultiHeadAttentionPool")
+        attn_pool_num_heads: Optional[int] = self.config.get("attn_pool_num_heads", None)
+        attn_pool_special_tokens: bool = self.config.get("attn_pool_special_tokens", False)
+        attn_pool_norm_eps: float = self.config.get("attn_pool_norm_eps", 1e-5)
+        attn_pool_act_layer_type: str = self.config.get("attn_pool_act_layer_type", "gelu")
+        norm_layer_type: str = self.config.get("norm_layer_type", "LayerNorm")
+        norm_layer_eps: float = self.config.get("norm_layer_eps", 1e-6)
+        mlp_layer_type: str = self.config.get("mlp_layer_type", "FFN")
+        soft_moe_num_experts: Optional[int] = self.config.get("soft_moe_num_experts", None)
+        soft_moe_num_slots: int = self.config.get("soft_moe_num_slots", 1)
+        act_layer_type: Optional[str] = self.config.get("act_layer_type", None)  # Default according to mlp type
+        out_indices: Optional[list[int]] = self.config.get("out_indices", None)
+        dropout: float = self.config.get("dropout", 0.0)
+        attention_dropout: float = self.config.get("attention_dropout", 0.0)
+        projection_dropout: float = self.config.get("projection_dropout", 0.0)
+        drop_path_rate: float = self.config["drop_path_rate"]
+        drop_path_uniform: bool = self.config.get("drop_path_uniform", False)
+
+        if pos_embed_interpolation_mode not in ("bilinear", "bicubic"):
+            raise ValueError(f"Unknown pos_embed_interpolation_mode '{pos_embed_interpolation_mode}'")
+
+        if stem_type == "patchify":
+            if stem_norm_layer_type is not None:
+                raise ValueError("stem_norm_layer_type is only supported with stem_type='hmlp'")
+
+            self.conv_proj = nn.Conv2d(
+                self.input_channels,
+                hidden_dim,
+                kernel_size=(patch_size, patch_size),
+                stride=(patch_size, patch_size),
+                padding=(0, 0),
+                bias=not pre_norm,
+            )
+        elif stem_type == "hmlp":
+            assert patch_size == 16, "The hMLP stem requires patch_size=16"
+
+            if stem_norm_layer_type is None:
+                self.conv_proj = hMLPStem(self.input_channels, hidden_dim)
+            else:
+                if stem_norm_layer_type == "BatchNorm2d":
+                    stem_norm_layer = nn.BatchNorm2d
+                elif stem_norm_layer_type == "LayerNorm2d":
+                    stem_norm_layer = LayerNorm2d
+                else:
+                    raise ValueError(f"Unknown stem_norm_layer_type '{stem_norm_layer_type}'")
+
+                self.conv_proj = hMLPStem(self.input_channels, hidden_dim, norm_layer=stem_norm_layer)
+        else:
+            raise ValueError(f"Unknown stem_type '{stem_type}'")
+
+        if norm_layer_type == "LayerNorm":
+            norm_layer = nn.LayerNorm
+        elif norm_layer_type == "RMSNorm":
+            norm_layer = nn.RMSNorm
+        else:
+            raise ValueError(f"Unknown norm_layer_type '{norm_layer_type}'")
+
+        if mlp_layer_type == "FFN":
+            mlp_layer = FFN
+            act_layer = nn.GELU
+        elif mlp_layer_type == "SwiGLU_FFN":
+            mlp_layer = SwiGLU_FFN
+            act_layer = nn.SiLU
+        elif mlp_layer_type == "Norm_SwiGLU_FFN":
+            mlp_layer = partial(SwiGLU_FFN, norm_layer=norm_layer, norm_eps=norm_layer_eps)  # type: ignore[assignment]
+            act_layer = nn.SiLU
+        elif mlp_layer_type == "SoftMoE_FFN":
+            if soft_moe_num_experts is None:
+                raise ValueError("soft_moe_num_experts must be set when mlp_layer_type is 'SoftMoE_FFN'")
+
+            mlp_layer = SoftMoE_FFN
+            act_layer = nn.GELU
+        else:
+            raise ValueError(f"Unknown mlp_layer_type '{mlp_layer_type}'")
+
+        if act_layer_type is not None:
+            act_layer = get_activation_module(act_layer_type)
+
+        torch._assert(image_size[0] % patch_size == 0, "Input shape indivisible by patch size!")
+        torch._assert(image_size[1] % patch_size == 0, "Input shape indivisible by patch size!")
+        torch._assert(hidden_dim % num_heads == 0, "Hidden dim indivisible by num heads!")
+        self.abs_pos_embed = abs_pos_embed
+        self.pos_embed_special_tokens = pos_embed_special_tokens
+        self.pos_embed_interpolation_mode = pos_embed_interpolation_mode
+        self.pos_embed_antialias = pos_embed_antialias
+        self.patch_size = patch_size
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self.num_reg_tokens = num_reg_tokens
+        self.attn_pool_special_tokens = attn_pool_special_tokens
+        self.out_indices = normalize_out_indices(out_indices, num_layers)
+        dpr = stochastic_depth_rates(drop_path_rate, num_layers, constant=drop_path_uniform)
+
+        self.patch_embed = PatchEmbed()
+
+        seq_length = (image_size[0] // patch_size) * (image_size[1] // patch_size)
+        self.num_special_tokens = 0
+
+        # Add a class token
+        if class_token is True:
+            self.class_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+            self.num_special_tokens += 1
+            if pos_embed_special_tokens is True:
+                seq_length += 1
+        else:
+            self.class_token = None
+
+        # Add optional register tokens
+        if self.num_reg_tokens > 0:
+            self.reg_tokens = nn.Parameter(torch.zeros(1, self.num_reg_tokens, hidden_dim))
+            self.num_special_tokens += self.num_reg_tokens
+            if pos_embed_special_tokens is True:
+                seq_length += self.num_reg_tokens
+        else:
+            self.reg_tokens = None
+
+        # Add positional embedding
+        if self.abs_pos_embed is True:
+            self.pos_embedding = nn.Parameter(torch.empty(1, seq_length, hidden_dim).normal_(std=0.02))  # from BERT
+        else:
+            self.pos_embedding = None
+
+        self.encoder = Encoder(
+            num_layers,
+            num_heads,
+            hidden_dim,
+            mlp_dim,
+            dropout,
+            attention_dropout,
+            projection_dropout,
+            dpr,
+            pre_norm=pre_norm,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            attn_norm=attn_norm,
+            activation_layer=act_layer,
+            layer_scale_init_value=layer_scale_init_value,
+            norm_layer=norm_layer,
+            norm_layer_eps=norm_layer_eps,
+            mlp_layer=mlp_layer,
+            soft_moe_num_experts=soft_moe_num_experts,
+            soft_moe_num_slots=soft_moe_num_slots,
+        )
+
+        if post_norm is True and norm_after_pool is False:
+            self.norm = norm_layer(hidden_dim, eps=norm_layer_eps)
+        else:
+            self.norm = nn.Identity()
+
+        if post_norm is True and norm_after_pool is True:
+            self.embedding_norm = norm_layer(hidden_dim, eps=norm_layer_eps)
+        else:
+            self.embedding_norm = nn.Identity()
+
+        if attn_pool_head is False:
+            self.attn_pool = None
+        else:
+            if attn_pool_type == "MultiHeadAttentionPool":
+                attn_pool = MultiHeadAttentionPool
+                if attn_pool_num_heads is None:
+                    attn_pool_num_heads = num_heads
+            elif attn_pool_type == "EfficientProbing":
+                attn_pool = EfficientProbing
+                if attn_pool_num_heads is None:
+                    attn_pool_num_heads = 1
+            else:
+                raise ValueError(f"Unknown attn_pool_type '{attn_pool_type}'")
+
+            self.attn_pool = attn_pool(
+                hidden_dim,
+                attn_pool_num_heads,
+                mlp_dim,
+                qkv_bias=True,
+                norm_eps=attn_pool_norm_eps,
+                activation_layer=get_activation_module(attn_pool_act_layer_type),
+            )
+
+        num_return_stages = len(self.out_indices) if self.out_indices is not None else 1
+        self.return_stages = [f"stage{stage_idx + 1}" for stage_idx in range(num_return_stages)]
+        self.return_channels = [hidden_dim] * num_return_stages
+        self.embedding_size = hidden_dim
+        self.classifier = self.create_classifier()
+
+        self.max_stride = patch_size
+        self.stem_stride = patch_size
+        self.stem_width = hidden_dim
+        self.feature_dim = hidden_dim
+        decoder_mlp_layer = FFN if mlp_layer_type == "SoftMoE_FFN" else mlp_layer
+        self.decoder_block = partial(
+            EncoderBlock,
+            16,
+            mlp_dim=None,
+            dropout=0.0,
+            attention_dropout=0.0,
+            projection_dropout=0.0,
+            drop_path=0.0,
+            activation_layer=act_layer,
+            norm_layer=norm_layer,
+            norm_layer_eps=norm_layer_eps,
+            mlp_layer=decoder_mlp_layer,
+        )
+
+        # Weight initialization
+        if isinstance(self.conv_proj, nn.Conv2d):
+            # Init the patchify stem
+            fan_in = self.conv_proj.in_channels * self.conv_proj.kernel_size[0] * self.conv_proj.kernel_size[1]
+            nn.init.trunc_normal_(self.conv_proj.weight, std=math.sqrt(1 / fan_in))
+            if self.conv_proj.bias is not None:
+                nn.init.zeros_(self.conv_proj.bias)
+
+        if isinstance(self.classifier, nn.Linear):
+            nn.init.zeros_(self.classifier.weight)
+            if self.classifier.bias is not None:
+                nn.init.zeros_(self.classifier.bias)
+
+    def _get_input_conv(self) -> nn.Conv2d:
+        if isinstance(self.conv_proj, nn.Conv2d):
+            return self.conv_proj
+
+        conv = self.conv_proj[0]
+        return conv
+
+    def _get_pos_embed(self, H: int, W: int) -> Optional[torch.Tensor]:
+        if self.pos_embedding is None:
+            return None
+
+        if self.dynamic_size is False:
+            return self.pos_embedding
+
+        if H == self.size[0] and W == self.size[1]:
+            return self.pos_embedding
+
+        return adjust_position_embedding(
+            self.pos_embedding,
+            (self.size[0] // self.patch_size, self.size[1] // self.patch_size),
+            (H // self.patch_size, W // self.patch_size),
+            self.num_special_tokens if self.pos_embed_special_tokens is True else 0,
+            interpolation_mode=self.pos_embed_interpolation_mode,
+            antialias=self.pos_embed_antialias,
+        )
+
+    def freeze(self, freeze_classifier: bool = True, unfreeze_features: bool = False) -> None:
+        for param in self.parameters():
+            param.requires_grad_(False)
+
+        if freeze_classifier is False:
+            for param in self.classifier.parameters():
+                param.requires_grad_(True)
+
+        if unfreeze_features is True:
+            for param in self.norm.parameters():
+                param.requires_grad_(True)
+            for param in self.embedding_norm.parameters():
+                param.requires_grad_(True)
+            if self.attn_pool is not None:
+                for param in self.attn_pool.parameters():
+                    param.requires_grad_(True)
+
+    def set_grad_checkpointing(
+        self,
+        enable: bool = True,
+        *,
+        segments: Optional[int] = None,
+        preserve_rng_state: bool = True,
+        use_reentrant: bool = False,
+    ) -> None:
+        self.encoder.set_grad_checkpointing(
+            enable=enable,
+            segments=segments,
+            preserve_rng_state=preserve_rng_state,
+            use_reentrant=use_reentrant,
+        )
+
+    def set_causal_attention(self, is_causal: bool = True) -> None:
+        self.encoder.set_causal_attention(is_causal)
+
+    def strip_for_forward_features(self) -> None:
+        super().strip_for_forward_features()
+        self.embedding_norm = nn.Identity()
+        self.attn_pool = None
+
+    def strip_for_detection_features(self) -> None:
+        super().strip_for_detection_features()
+        self.norm = nn.Identity()
+        self.embedding_norm = nn.Identity()
+        self.attn_pool = None
+
+    def _pool(self, x: torch.Tensor) -> torch.Tensor:
+        if self.attn_pool is not None:
+            if self.attn_pool_special_tokens is False:
+                x = x[:, self.num_special_tokens :]
+
+            x = self.attn_pool(x)
+            return x[:, 0]
+
+        if self.class_token is None:
+            x = x[:, self.num_special_tokens :]
+            return x.mean(dim=1)
+
+        # Classifier "token" as used by standard language architectures
+        return x[:, self.num_reg_tokens]
+
+    def detection_features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        H, W = x.shape[-2:]
+        x = self.conv_proj(x)
+        x = self.patch_embed(x)
+        pos_embedding = self._get_pos_embed(H, W)
+
+        if pos_embedding is not None and self.pos_embed_special_tokens is False:
+            x = x + pos_embedding
+
+        # Expand special tokens to batch size and prepend in order [REG..., CLS, PATCH...]
+        special_tokens: list[torch.Tensor] = []
+        if self.reg_tokens is not None:
+            special_tokens.append(self.reg_tokens.expand(x.size(0), -1, -1))
+        if self.class_token is not None:
+            special_tokens.append(self.class_token.expand(x.size(0), -1, -1))
+        if len(special_tokens) > 0:
+            x = torch.concat(special_tokens + [x], dim=1)
+
+        if pos_embedding is not None and self.pos_embed_special_tokens is True:
+            x = x + pos_embedding
+
+        if self.out_indices is None:
+            xs = [self.encoder(x)]
+        else:
+            xs = self.encoder.forward_features(x, out_indices=self.out_indices)
+
+        out: dict[str, torch.Tensor] = {}
+        for stage_name, stage_x in zip(self.return_stages, xs, strict=True):
+            stage_x = stage_x[:, self.num_special_tokens :]
+            stage_x = stage_x.permute(0, 2, 1)
+            B, C, _ = stage_x.size()
+            stage_x = stage_x.reshape(B, C, H // self.patch_size, W // self.patch_size)
+            out[stage_name] = stage_x
+
+        return out
+
+    def freeze_stages(self, up_to_stage: int) -> None:
+        for param in self.conv_proj.parameters():
+            param.requires_grad_(False)
+
+        if self.pos_embedding is not None:
+            self.pos_embedding.requires_grad_(False)
+
+        if up_to_stage <= 0:
+            return
+
+        for param in self.encoder.pre_block.parameters():
+            param.requires_grad_(False)
+
+        if self.out_indices is None:
+            stage_boundaries = [self.num_layers - 1]
+        else:
+            stage_boundaries = sorted(set(self.out_indices))
+
+        last_block = stage_boundaries[min(up_to_stage, len(stage_boundaries)) - 1]
+        for block in self.encoder.block[: last_block + 1]:
+            for param in block.parameters():
+                param.requires_grad_(False)
+
+    def masked_encoding_omission(
+        self,
+        x: torch.Tensor,
+        ids_keep: Optional[torch.Tensor] = None,
+        return_all_features: bool = False,
+        return_keys: Literal["all", "tokens", "embedding"] = "tokens",
+    ) -> TokenOmissionResultType:
+        H, W = x.shape[-2:]
+
+        # Reshape and permute the input tensor
+        x = self.conv_proj(x)
+        x = self.patch_embed(x)
+
+        # Add pos embedding without special tokens
+        pos_embedding = self._get_pos_embed(H, W)
+        if pos_embedding is not None:
+            if self.pos_embed_special_tokens is True:
+                x = x + pos_embedding[:, self.num_special_tokens :, :]
+            else:
+                x = x + pos_embedding
+
+        # Mask tokens
+        if ids_keep is not None:
+            x = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, x.size(2)))
+
+        # Expand special tokens to batch size and prepend in order [REG..., CLS, PATCH...]
+        special_tokens: list[torch.Tensor] = []
+        if self.reg_tokens is not None:
+            if pos_embedding is not None and self.pos_embed_special_tokens is True:
+                reg_tokens = self.reg_tokens + pos_embedding[:, 0 : self.num_reg_tokens, :]
+            else:
+                reg_tokens = self.reg_tokens
+
+            special_tokens.append(reg_tokens.expand(x.size(0), -1, -1))
+
+        if self.class_token is not None:
+            if pos_embedding is not None and self.pos_embed_special_tokens is True:
+                cls_token = self.class_token + pos_embedding[:, self.num_reg_tokens : self.num_reg_tokens + 1, :]
+            else:
+                cls_token = self.class_token
+
+            special_tokens.append(cls_token.expand(x.size(0), -1, -1))
+
+        if len(special_tokens) > 0:
+            x = torch.concat(special_tokens + [x], dim=1)
+
+        # Apply transformer
+        if return_all_features is True:
+            xs = self.encoder.forward_features(x)
+            xs[-1] = self.norm(xs[-1])
+            x = torch.stack(xs, dim=-1)
+        else:
+            x = self.encoder(x)
+            x = self.norm(x)
+
+        result: TokenOmissionResultType = {}
+        if return_keys in ("all", "tokens"):
+            result["tokens"] = x
+
+        if return_keys in ("all", "embedding"):
+            if return_all_features is True:
+                x = x[..., -1]
+
+            result["embedding"] = self.embedding_from_features(x)
+
+        return result
+
+    def masked_encoding_retention(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        mask_token: Optional[torch.Tensor] = None,
+        return_keys: Literal["all", "features", "embedding"] = "features",
+    ) -> TokenRetentionResultType:
+        H, W = x.shape[-2:]
+
+        x = self.conv_proj(x)
+        x = mask_tensor(x, mask, mask_token=mask_token, patch_factor=self.max_stride // self.stem_stride)
+
+        # Reshape and permute the input tensor
+        x = self.patch_embed(x)
+        pos_embedding = self._get_pos_embed(H, W)
+
+        if pos_embedding is not None and self.pos_embed_special_tokens is False:
+            x = x + pos_embedding
+
+        # Expand special tokens to batch size and prepend in order [REG..., CLS, PATCH...]
+        special_tokens: list[torch.Tensor] = []
+        if self.reg_tokens is not None:
+            special_tokens.append(self.reg_tokens.expand(x.size(0), -1, -1))
+        if self.class_token is not None:
+            special_tokens.append(self.class_token.expand(x.size(0), -1, -1))
+        if len(special_tokens) > 0:
+            x = torch.concat(special_tokens + [x], dim=1)
+
+        if pos_embedding is not None and self.pos_embed_special_tokens is True:
+            x = x + pos_embedding
+
+        x = self.encoder(x)
+        x = self.norm(x)
+
+        result: TokenRetentionResultType = {}
+        if return_keys in ("all", "features"):
+            features = x[:, self.num_special_tokens :]
+            features = features.permute(0, 2, 1)
+            B, C, _ = features.size()
+            features = features.reshape(B, C, H // self.patch_size, W // self.patch_size)
+            result["features"] = features
+
+        if return_keys in ("all", "embedding"):
+            result["embedding"] = self.embedding_from_features(x)
+
+        return result
+
+    def forward_features(
+        self, x: torch.Tensor, return_input_embedding: bool = False, attn_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        H, W = x.shape[-2:]
+
+        # Reshape and permute the input tensor
+        x = self.conv_proj(x)
+        x = self.patch_embed(x)
+        patch_embedding = x
+        pos_embedding = self._get_pos_embed(H, W)
+
+        if pos_embedding is not None and self.pos_embed_special_tokens is False:
+            x = x + pos_embedding
+
+        # Expand special tokens to batch size and prepend in order [REG..., CLS, PATCH...]
+        special_tokens: list[torch.Tensor] = []
+        if self.reg_tokens is not None:
+            special_tokens.append(self.reg_tokens.expand(x.size(0), -1, -1))
+        if self.class_token is not None:
+            special_tokens.append(self.class_token.expand(x.size(0), -1, -1))
+        if len(special_tokens) > 0:
+            x = torch.concat(special_tokens + [x], dim=1)
+
+        if return_input_embedding is True:
+            if len(special_tokens) > 0:
+                input_embedding = torch.concat(special_tokens + [patch_embedding], dim=1)
+            else:
+                input_embedding = patch_embedding
+        else:
+            input_embedding = None  # For TorchScript compatibility
+
+        if pos_embedding is not None and self.pos_embed_special_tokens is True:
+            x = x + pos_embedding
+
+        x = self.encoder(x, attn_mask=attn_mask)
+        x = self.norm(x)
+
+        if return_input_embedding is True and input_embedding is not None:
+            return torch.stack([input_embedding, x], dim=-1)
+
+        return x
+
+    def flatten_features(self, features: torch.Tensor, include_special_tokens: bool = True) -> torch.Tensor:
+        if include_special_tokens is False:
+            return features[:, self.num_special_tokens :]
+
+        return features
+
+    def embedding_from_features(self, features: torch.Tensor) -> torch.Tensor:
+        return self.embedding_norm(self._pool(features))
+
+    def adjust_size(self, new_size: tuple[int, int]) -> None:
+        if new_size == self.size:
+            return
+
+        assert new_size[0] % self.patch_size == 0, "Input shape indivisible by patch size!"
+        assert new_size[1] % self.patch_size == 0, "Input shape indivisible by patch size!"
+
+        old_size = self.size
+        super().adjust_size(new_size)
+        if self.pos_embedding is None:
+            return
+
+        if self.pos_embed_special_tokens is True:
+            num_prefix_tokens = self.num_special_tokens
+        else:
+            num_prefix_tokens = 0
+
+        # Add back class tokens
+        with torch.no_grad():
+            pos_embedding = adjust_position_embedding(
+                # On rounding error see: https://github.com/facebookresearch/dino/issues/8
+                self.pos_embedding,
+                (old_size[0] // self.patch_size, old_size[1] // self.patch_size),
+                (new_size[0] // self.patch_size, new_size[1] // self.patch_size),
+                num_prefix_tokens,
+                interpolation_mode=self.pos_embed_interpolation_mode,
+            )
+
+        self.pos_embedding = nn.Parameter(pos_embedding, requires_grad=self.pos_embedding.requires_grad)
+
+
+# Register model configs (side effects)
+register_vit_configs(ViT)
+
+registry.register_weights(
+    "vit_b16_ls_franca-bioscan5m",
+    {
+        "url": "https://huggingface.co/birder-project/vit_b16_ls_franca-bioscan5m/resolve/main",
+        "description": (
+            "ViT B/16 image encoder pretrained using Franca on the BIOSCAN-5M dataset. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 327.4,
+                "sha256": "2124b590b20fb769e693b1ff31a9f5e77cb449924a3b27fc5a74013af5b2990c",
+            },
+        },
+        "net": {"network": "vit_b16_ls", "tag": "franca-bioscan5m"},
+    },
+)
+registry.register_weights(  # BioCLIP v1: https://arxiv.org/abs/2311.18803
+    "vit_b16_pn_bioclip-v1",
+    {
+        "url": "https://huggingface.co/birder-project/vit_b16_pn_bioclip-v1/resolve/main",
+        "description": (
+            "ViT B/16 image encoder pretrained by Imageomics using CLIP on the TreeOfLife-10M dataset. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 328.9,
+                "sha256": "9b2e5598f233657932eeb77e027cd4c4d683bf75515768fe6971cab6ec10bf15",
+            },
+        },
+        "net": {"network": "vit_b16_pn", "tag": "bioclip-v1"},
+    },
+)
+registry.register_weights(  # BioTrove: https://arxiv.org/abs/2406.17720
+    "vit_b16_pn_biotrove-clip-o",
+    {
+        "url": "https://huggingface.co/birder-project/vit_b16_pn_biotrove-clip-o/resolve/main",
+        "description": (
+            "ViT B/16 image encoder pretrained by Baskar group using CLIP on the BioTrove dataset. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 328.9,
+                "sha256": "5477a42494efa4122bb8e903ebe7e3fc6278df39074c7d2828063b97652f8bb6",
+            },
+        },
+        "net": {"network": "vit_b16_pn", "tag": "biotrove-clip-o"},
+    },
+)
+registry.register_weights(
+    "vit_l16_mim_200",
+    {
+        "url": "https://huggingface.co/birder-project/vit_l16_mim/resolve/main",
+        "description": (
+            "ViT L/16 image encoder pretrained using Masked Image Modeling (MIM) for 200 epochs. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 1157.1,
+                "sha256": "7fc5b342347d8349aaf5f069a47efd441b646f8542821ed2e30b47a7da72917a",
+            },
+        },
+        "net": {"network": "vit_l16", "tag": "mim", "epoch": 200},
+    },
+)
+registry.register_weights(
+    "vit_l16_mim_400",
+    {
+        "url": "https://huggingface.co/birder-project/vit_l16_mim/resolve/main",
+        "description": (
+            "ViT L/16 image encoder pretrained using Masked Image Modeling (MIM) for 400 epochs. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 1157.1,
+                "sha256": "9b5c4e2538ea40edd60d8831d3807b543290dc2db44d537e60e44a341b47e54e",
+            },
+        },
+        "net": {"network": "vit_l16", "tag": "mim", "epoch": 400},
+    },
+)
+registry.register_weights(  # BioCLIP v2: https://arxiv.org/abs/2505.23883
+    "vit_l14_pn_bioclip-v2",
+    {
+        "url": "https://huggingface.co/birder-project/vit_l14_pn_bioclip-v2/resolve/main",
+        "description": (
+            "ViT L/14 image encoder pretrained by Imageomics using CLIP on the TreeOfLife-200M dataset. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 1159.7,
+                "sha256": "301a325579dafdfa2ea13b0cbaf8129211ecd1429c29afa20d1c2eaaa91d8b0d",
+            },
+        },
+        "net": {"network": "vit_l14_pn", "tag": "bioclip-v2"},
+    },
+)
+registry.register_weights(  # OpenAI CLIP: https://arxiv.org/abs/2103.00020
+    "vit_l14_pn_quick_gelu_openai-clip",
+    {
+        "url": "https://huggingface.co/birder-project/vit_l14_pn_quick_gelu_openai-clip/resolve/main",
+        "description": (
+            "ViT L/14 image encoder pretrained by OpenAI using CLIP. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 1159.7,
+                "sha256": "2c7462390956d8942de0df21d9d1a43cf53fdbe3a3570a1add64d859313a0bee",
+            },
+        },
+        "net": {"network": "vit_l14_pn_quick_gelu", "tag": "openai-clip"},
+    },
+)
+registry.register_weights(  # SigLIP 2: https://arxiv.org/abs/2502.14786
+    "vit_so400m_p14_ap_c1_siglip-v2-webli",
+    {
+        "url": "https://huggingface.co/birder-project/vit_so400m_p14_ap_c1_siglip-v2-webli/resolve/main",
+        "description": (
+            "SoViT 400M/14 image encoder with attention pooling, pretrained by Google using SigLIP v2. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 1631.6,
+                "sha256": "f8ac3bdf028d17a2ee2673f58b51cffa5c696edef44c92092299d970607c7be6",
+            },
+        },
+        "net": {"network": "vit_so400m_p14_ap_c1", "tag": "siglip-v2-webli"},
+    },
+)
+registry.register_weights(  # BioCLIP v2.5: https://arxiv.org/abs/2505.23883
+    "vit_h14_pn_bioclip-v25",
+    {
+        "url": "https://huggingface.co/birder-project/vit_h14_pn_bioclip-v25/resolve/main",
+        "description": (
+            "ViT H/14 image encoder pretrained by Imageomics using CLIP on the TreeOfLife-200M dataset. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 2411.4,
+                "sha256": "f0b6b49e06078100395945a866ee4bd2cb38011a263d6a2b8d27bc1be2d0502f",
+            },
+        },
+        "net": {"network": "vit_h14_pn", "tag": "bioclip-v25"},
+    },
+)
+
+# With registers
+registry.register_weights(  # DINO v2: https://arxiv.org/abs/2304.07193
+    "vit_reg4_s14_nps_ls_dino-v2-lvd142m",
+    {
+        "url": "https://huggingface.co/birder-project/vit_reg4_s14_nps_ls_dino-v2-lvd142m/resolve/main",
+        "description": (
+            "ViT Reg4 S/14 image encoder pretrained by Facebook AI using DINO v2. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (518, 518),
+        "formats": {
+            "pt": {
+                "file_size": 84.2,
+                "sha256": "c08263b219669d3933ee83f6b3be16ddecde046472b7869862312c6bdf89190f",
+            },
+        },
+        "net": {"network": "vit_reg4_s14_nps_ls", "tag": "dino-v2-lvd142m"},
+    },
+)
+registry.register_weights(
+    "vit_reg4_m16_rms_avg_i-jepa",
+    {
+        "url": "https://huggingface.co/birder-project/vit_reg4_m16_rms_avg_i-jepa/resolve/main",
+        "description": (
+            "ViT Reg4 M/16 image encoder with average pooling, pretrained using I-JEPA. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 146.2,
+                "sha256": "0f5cd4e0acb44d1e429bbed342c60bf22087ecd1d7112363c3ceb909dcd9d547",
+            },
+        },
+        "net": {"network": "vit_reg4_m16_rms_avg", "tag": "i-jepa"},
+    },
+)
+registry.register_weights(
+    "vit_reg4_m16_rms_avg_i-jepa-inat21-256px",
+    {
+        "url": "https://huggingface.co/birder-project/vit_reg4_m16_rms_avg_i-jepa-inat21/resolve/main",
+        "description": (
+            "ViT Reg4 M/16 model with average pooling and I-JEPA pretraining, then fine-tuned on the "
+            "iNaturalist 2021 dataset"
+        ),
+        "resolution": (256, 256),
+        "formats": {
+            "pt": {
+                "file_size": 166.8,
+                "sha256": "e9b83e90c284877c859e92a05a35ff25884a06d3fd006d90ee576d58f71d3251",
+            },
+        },
+        "net": {"network": "vit_reg4_m16_rms_avg", "tag": "i-jepa-inat21-256px"},
+    },
+)
+registry.register_weights(
+    "vit_reg4_m16_rms_avg_i-jepa-inat21",
+    {
+        "url": "https://huggingface.co/birder-project/vit_reg4_m16_rms_avg_i-jepa-inat21/resolve/main",
+        "description": (
+            "ViT Reg4 M/16 model with average pooling and I-JEPA pretraining, then fine-tuned on the "
+            "iNaturalist 2021 dataset"
+        ),
+        "resolution": (384, 384),
+        "formats": {
+            "pt": {
+                "file_size": 167.4,
+                "sha256": "7fde7375f5f9165114561f6288cdf086ba8b6635251304de08bd01883bb7a2da",
+            },
+        },
+        "net": {"network": "vit_reg4_m16_rms_avg", "tag": "i-jepa-inat21"},
+    },
+)
+registry.register_weights(
+    "vit_reg4_m16_rms_avg_i-jepa-imagenet21k",
+    {
+        "url": "https://huggingface.co/birder-project/vit_reg4_m16_rms_avg_i-jepa-imagenet21k/resolve/main",
+        "description": (
+            "ViT Reg4 M/16 model with average pooling and I-JEPA pretraining, then fine-tuned on the "
+            "ImageNet 21K dataset"
+        ),
+        "resolution": (256, 256),
+        "formats": {
+            "pt": {
+                "file_size": 184.2,
+                "sha256": "da47dc6bd4f41c347235beba92657b66148180141d0bd629169e84449b629fbb",
+            },
+        },
+        "net": {"network": "vit_reg4_m16_rms_avg", "tag": "i-jepa-imagenet21k"},
+    },
+)
+registry.register_weights(
+    "vit_reg4_b16_mim_200",
+    {
+        "url": "https://huggingface.co/birder-project/vit_reg4_b16_mim/resolve/main",
+        "description": (
+            "ViT Reg4 B/16 image encoder pretrained using Masked Image Modeling (MIM) for 200 epochs. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 327.4,
+                "sha256": "c7ec433c01e1dc0d6100cafc29fa88155a0d65f4b42afa9cc252b77485a566a7",
+            },
+        },
+        "net": {"network": "vit_reg4_b16", "tag": "mim", "epoch": 200},
+    },
+)
+registry.register_weights(
+    "vit_reg4_b16_mim_300",
+    {
+        "url": "https://huggingface.co/birder-project/vit_reg4_b16_mim/resolve/main",
+        "description": (
+            "ViT Reg4 B/16 image encoder pretrained using Masked Image Modeling (MIM) for 300 epochs. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 327.4,
+                "sha256": "b0e5e2b24ea7a8d2be246df43c9d8092354f6ee81e88c6cdd7c52d8e38ed44a4",
+            },
+        },
+        "net": {"network": "vit_reg4_b16", "tag": "mim", "epoch": 300},
+    },
+)
+registry.register_weights(
+    "vit_reg4_b16_mim-intermediate-il-common",
+    {
+        "url": "https://huggingface.co/birder-project/vit_reg4_b16_mim-intermediate-il-common/resolve/main",
+        "description": (
+            "ViT Reg4 B/16 model with MIM pretraining and intermediate training, then fine-tuned on the il-common "
+            "dataset"
+        ),
+        "resolution": (256, 256),
+        "formats": {
+            "pt": {
+                "file_size": 328.7,
+                "sha256": "3a15b95285cd4435b601ef058839f422cdce8f68cca50de9353e1ac2bcb65f9a",
+            },
+        },
+        "net": {"network": "vit_reg4_b16", "tag": "mim-intermediate-il-common"},
+    },
+)
+registry.register_weights(
+    "vit_reg4_b16_mim-intermediate-arabian-peninsula",
+    {
+        "url": "https://huggingface.co/birder-project/vit_reg4_b16_mim-intermediate-arabian-peninsula/resolve/main",
+        "description": (
+            "ViT Reg4 B/16 model with MIM pretraining and intermediate training, then fine-tuned on the "
+            "arabian-peninsula dataset"
+        ),
+        "resolution": (384, 384),
+        "formats": {
+            "pt": {
+                "file_size": 330.7,
+                "sha256": "78dbf578ebe7d5761705231e16fef280b14905a94f18879167c96df3e59d13a5",
+            },
+        },
+        "net": {"network": "vit_reg4_b16", "tag": "mim-intermediate-arabian-peninsula"},
+    },
+)
+registry.register_weights(
+    "vit_reg4_so150m_p14_avg_mim-bio",
+    {
+        "url": "https://huggingface.co/birder-project/vit_reg4_so150m_p14_avg_mim-bio/resolve/main",
+        "description": (
+            "SoViT Reg4 150M/14 image encoder with average pooling, pretrained using MIM on natural biological "
+            "images. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 509.7,
+                "sha256": "397979a026a120a035b20f863f10de409b9fca12a244a6ea9ba745c7ca48420d",
+            },
+        },
+        "net": {"network": "vit_reg4_so150m_p14_avg", "tag": "mim-bio"},
+    },
+)
+
+# DINO v2 by Meta AI
+registry.register_weights(  # DINO v2: https://arxiv.org/abs/2304.07193
+    "vit_reg4_b14_nps_ls_dino-v2-lvd142m",
+    {
+        "url": "https://huggingface.co/birder-project/vit_reg4_b14_nps_ls_dino-v2-lvd142m/resolve/main",
+        "description": (
+            "ViT Reg4 B/14 image encoder pretrained by Facebook AI using DINO v2. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (518, 518),
+        "formats": {
+            "pt": {
+                "file_size": 330.4,
+                "sha256": "c091d95be4c0ab6102ed7d4a183b3ab8728e2fb73969c5811381046d34b53944",
+            },
+        },
+        "net": {"network": "vit_reg4_b14_nps_ls", "tag": "dino-v2-lvd142m"},
+    },
+)
+registry.register_weights(  # DINO v2: https://arxiv.org/abs/2304.07193
+    "vit_reg4_l14_nps_ls_dino-v2-lvd142m",
+    {
+        "url": "https://huggingface.co/birder-project/vit_reg4_l14_nps_ls_dino-v2-lvd142m/resolve/main",
+        "description": (
+            "ViT Reg4 L/14 image encoder pretrained by Facebook AI using DINO v2. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (518, 518),
+        "formats": {
+            "pt": {
+                "file_size": 1161.2,
+                "sha256": "441721029ca0ef85582bc8822ec91d780ee442eb3d06b04fb5e4662c9317b52d",
+            },
+        },
+        "net": {"network": "vit_reg4_l14_nps_ls", "tag": "dino-v2-lvd142m"},
+    },
+)
+
+# BIO-DINO
+registry.register_weights(
+    "vit_reg1_s14_ls_dino-v2-dist-bio",
+    {
+        "url": "https://huggingface.co/birder-project/vit_reg1_s14_ls_dino-v2-dist-bio/resolve/main",
+        "description": (
+            "ViT Reg1 S/14 image encoder pretrained using DINO v2 distillation on natural biological images. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (252, 252),
+        "formats": {
+            "pt": {
+                "file_size": 82.7,
+                "sha256": "f50046e70639e190d0adeef422bbdc66097641f4993a4ce1b15f66c7ede93cb7",
+            },
+        },
+        "net": {"network": "vit_reg1_s14_ls", "tag": "dino-v2-dist-bio"},
+    },
+)
+registry.register_weights(
+    "vit_reg4_so150m_p14_ls_dino-v2-bio-224px",
+    {
+        "url": "https://huggingface.co/birder-project/vit_reg4_so150m_p14_ls_dino-v2-bio/resolve/main",
+        "description": (
+            "SoViT Reg4 150M/14 image encoder pretrained using DINO v2 on natural biological images. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 509.8,
+                "sha256": "cabfd49ca3d934a8a7df006060988aff138d079d9952a2af441b3eba7c662c90",
+            },
+        },
+        "net": {"network": "vit_reg4_so150m_p14_ls", "tag": "dino-v2-bio-224px"},
+    },
+)
+registry.register_weights(
+    "vit_reg4_so150m_p14_ls_dino-v2-bio-252px",
+    {
+        "url": "https://huggingface.co/birder-project/vit_reg4_so150m_p14_ls_dino-v2-bio/resolve/main",
+        "description": (
+            "SoViT Reg4 150M/14 image encoder pretrained using DINO v2 on natural biological images. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (252, 252),
+        "formats": {
+            "pt": {
+                "file_size": 510.1,
+                "sha256": "a47cb23593eb9f750ecdd51bbaf29c8bc23923980bf624024db8b8a5ab4be145",
+            },
+        },
+        "net": {"network": "vit_reg4_so150m_p14_ls", "tag": "dino-v2-bio-252px"},
+    },
+)
+registry.register_weights(
+    "vit_reg4_so150m_p14_ls_dino-v2-bio-336px",
+    {
+        "url": "https://huggingface.co/birder-project/vit_reg4_so150m_p14_ls_dino-v2-bio/resolve/main",
+        "description": (
+            "SoViT Reg4 150M/14 image encoder pretrained using DINO v2 on natural biological images. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (336, 336),
+        "formats": {
+            "pt": {
+                "file_size": 510.9,
+                "sha256": "f7873db83482a4afd7c0863cc499cdb14a4cd4190e4c104a2aafb40df87df3fc",
+            },
+        },
+        "net": {"network": "vit_reg4_so150m_p14_ls", "tag": "dino-v2-bio-336px"},
+    },
+)
+
+# DeiT III
+registry.register_weights(
+    "deit3_t16_il-common",
+    {
+        "description": "DeiT3 T/16 model trained on the il-common dataset",
+        "resolution": (256, 256),
+        "formats": {
+            "pt": {
+                "file_size": 21.5,
+                "sha256": "a04141c7f6c459ae075a48ccdee5b82d191bbaa82337673140c06ef82f0a8dc5",
+            }
+        },
+        "net": {"network": "deit3_t16", "tag": "il-common"},
+    },
+)
+registry.register_weights(
+    "deit3_reg4_t16_il-common",
+    {
+        "description": "DeiT3 Reg4 T/16 model trained on the il-common dataset",
+        "resolution": (256, 256),
+        "formats": {
+            "pt": {
+                "file_size": 21.5,
+                "sha256": "d26320462da64df6d62b307f7fb35d09c86a5f073002dfb24a51f014074e65c3",
+            }
+        },
+        "net": {"network": "deit3_reg4_t16", "tag": "il-common"},
+    },
+)

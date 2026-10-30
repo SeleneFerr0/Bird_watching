@@ -1,0 +1,6 @@
+include CHANGELOG.md CITATION.cff bumpver.toml mkdocs.yml
+include *.py *.ini .flake8 .pylintrc .bandit .gitlab-ci.yml train_distributed_template.sh
+recursive-include requirements *.txt
+recursive-include docs *.md *.txt *.png *.jpeg *.ico *.j2
+recursive-include tests *.py
+recursive-include tests_flow *.py

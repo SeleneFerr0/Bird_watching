@@ -1,0 +1,85 @@
+[project]
+name = "birder"
+authors = [{ name = "Ofer Hasson" }]
+description = "An open-source computer vision framework for wildlife image analysis, featuring state-of-the-art models for species classification and detection."
+readme = "README.md"
+requires-python = ">=3.11"
+keywords = [
+    "computer-vision",
+    "image-classification",
+    "object-detection",
+    "self-supervised learning",
+    "masked image modeling",
+    "pytorch",
+    "deep-learning",
+    "artificial intelligence",
+]
+license = "Apache-2.0"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Topic :: Software Development",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dynamic = ["dependencies", "optional-dependencies", "version"]
+
+[project.urls]
+Homepage = "https://gitlab.com/birder/birder"
+Documentation = "https://birder.gitlab.io/birder/"
+Issues = "https://gitlab.com/birder/birder/-/issues"
+Changelog = "https://gitlab.com/birder/birder/-/blob/main/CHANGELOG.md"
+
+[project.scripts]
+birder-predict = "birder.scripts.predict:main"
+birder-predict_detection = "birder.scripts.predict_detection:main"
+birder-predict-wildlife = "birder.scripts.predict_wildlife:main"
+
+# [project.optional-dependencies]
+# hf = ["huggingface_hub", "transformers"]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["birder*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+birder = ["**/*.cpp", "**/*.h", "**/*.hpp", "**/*.cu", "**/*.cuh"]
+
+[tool.setuptools.dynamic]
+version = { attr = "birder.version.__version__" }
+dependencies = { file = ["requirements/requirements.txt"] }
+optional-dependencies.dev = { file = ["requirements/_requirements-dev.txt"] }
+optional-dependencies.hf = { file = ["requirements/requirements-hf.txt"] }
+optional-dependencies.yolo = { file = ["requirements/requirements-yolo.txt"] }
+
+[tool.black]
+line-length = 120
+target-version = ["py311"]
+exclude = '/(\.git|\.mypy_cache|\.venv|node_modules)/'
+extend-exclude = '^/data/'
+
+[tool.isort]
+line_length = 120
+force_single_line = true
+skip = ["data/", ".venv/"]
+
+[tool.coverage.run]
+omit = [
+    # Omit command line scripts and tools
+    "birder/scripts/*",
+    "birder/tools/*",
+    "birder/eval/benchmarks/*",
+]

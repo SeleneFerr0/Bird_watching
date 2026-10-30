@@ -1,0 +1,411 @@
+"""
+FishNet benchmark using MLP probe for multi-label trait prediction
+
+Paper "FishNet: A Large-scale Dataset and Benchmark for Fish Recognition, Detection, and Functional Trait Prediction"
+https://fishnet-2023.github.io/
+"""
+
+import argparse
+import logging
+import time
+from pathlib import Path
+from typing import Any
+from typing import Optional
+
+import numpy as np
+import numpy.typing as npt
+import polars as pl
+import torch
+from rich.console import Console
+from rich.table import Table
+from sklearn.metrics import f1_score
+
+from birder.common import cli
+from birder.common import lib
+from birder.conf import settings
+from birder.datahub.evaluation import FishNet
+from birder.eval._embeddings import load_embeddings
+from birder.eval.methods.mlp import evaluate_mlp
+from birder.eval.methods.mlp import train_mlp
+
+logger = logging.getLogger(__name__)
+
+
+def _format_float_for_filename(value: float) -> str:
+    return f"{value:g}".replace(".", "p")
+
+
+def _results_filename(args: argparse.Namespace) -> str:
+    return (
+        f"fishnet_mlp_runs{args.runs}"
+        f"_e{args.epochs}"
+        f"_bs{args.batch_size}"
+        f"_lr{_format_float_for_filename(args.lr)}"
+        f"_hd{args.hidden_dim}"
+        f"_do{_format_float_for_filename(args.dropout)}"
+        ".csv"
+    )
+
+
+def _print_summary_table(results: list[dict[str, Any]]) -> None:
+    console = Console()
+
+    table = Table(show_header=True, header_style="bold dark_magenta")
+    table.add_column("FishNet (MLP)", style="dim")
+    table.add_column("Macro F1", justify="right")
+    table.add_column("Std", justify="right")
+    table.add_column("Exact Match", justify="right")
+    table.add_column("Std", justify="right")
+    table.add_column("Runs", justify="right")
+    for result in sorted(results, key=lambda result: Path(result["embeddings_file"]).name):
+        row = [
+            Path(result["embeddings_file"]).name,
+            f"{result['macro_f1']:.4f}",
+            f"{result['macro_f1_std']:.4f}",
+            f"{result['exact_match_acc']:.4f}",
+            f"{result['exact_match_acc_std']:.4f}",
+            f"{result['num_runs']}",
+        ]
+
+        table.add_row(*row)
+
+    console.print(table)
+
+
+def _result_to_row(result: dict[str, Any], trait_names: list[str]) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "embeddings_file": result["embeddings_file"],
+        "method": result["method"],
+        "macro_f1": result["macro_f1"],
+        "macro_f1_std": result["macro_f1_std"],
+        "exact_match_acc": result["exact_match_acc"],
+        "exact_match_acc_std": result["exact_match_acc_std"],
+        "num_runs": result["num_runs"],
+    }
+    for trait in trait_names:
+        row[f"f1_{trait}"] = result["per_trait_f1"].get(trait)
+
+    return row
+
+
+def _append_result_csv(result: dict[str, Any], trait_names: list[str], output_path: Path) -> None:
+    row_df = pl.DataFrame([_result_to_row(result, trait_names)])
+    file_exists = output_path.exists()
+    mode = "a" if file_exists is True else "w"
+    with open(output_path, mode, encoding="utf-8") as handle:
+        row_df.write_csv(handle, include_header=file_exists is False)
+
+    logger.info(f"Results updated at {output_path}")
+
+
+def _row_to_result(row: dict[str, Any], trait_names: list[str]) -> dict[str, Any]:
+    per_trait_f1 = {trait: float(value) for trait in trait_names if (value := row.get(f"f1_{trait}")) is not None}
+
+    return {
+        "embeddings_file": str(row["embeddings_file"]),
+        "method": str(row["method"]),
+        "macro_f1": float(row["macro_f1"]),
+        "macro_f1_std": float(row["macro_f1_std"]),
+        "exact_match_acc": float(row["exact_match_acc"]),
+        "exact_match_acc_std": float(row["exact_match_acc_std"]),
+        "num_runs": int(row["num_runs"]),
+        "per_trait_f1": per_trait_f1,
+    }
+
+
+def _load_cached_result(
+    existing_df: Optional[pl.DataFrame], embeddings_path: str, trait_names: list[str]
+) -> Optional[dict[str, Any]]:
+    if existing_df is None or existing_df.is_empty() is True:
+        return None
+
+    match_df = existing_df.filter(pl.col("embeddings_file") == embeddings_path)
+    if match_df.is_empty() is True:
+        return None
+
+    return _row_to_result(match_df.row(0, named=True), trait_names)
+
+
+def _summary_results(
+    existing_df: Optional[pl.DataFrame], current_results: list[dict[str, Any]], trait_names: list[str]
+) -> list[dict[str, Any]]:
+    if existing_df is None or existing_df.is_empty() is True:
+        return current_results
+
+    return [_row_to_result(row, trait_names) for row in existing_df.iter_rows(named=True)]
+
+
+def _load_fishnet_data(csv_path: Path, trait_columns: list[str], split: str) -> pl.DataFrame:
+    """
+    Load FishNet CSV and prepare metadata
+
+    Returns DataFrame with columns: id, split, trait labels (0/1)
+    """
+
+    df = pl.read_csv(csv_path)
+    df = df.with_columns(
+        pl.col("image")
+        .str.extract(r"([^/]+)$")  # Get filename (last path segment)
+        .str.replace(r"\.[^.]+$", "")  # Remove extension
+        .alias("id")
+    )
+
+    # Encode FeedingPath: benthic=0, pelagic=1
+    df = df.with_columns(
+        pl.when(pl.col("FeedingPath") == "pelagic")
+        .then(pl.lit(1))
+        .when(pl.col("FeedingPath") == "benthic")
+        .then(pl.lit(0))
+        .otherwise(pl.lit(None))
+        .alias("FeedingPath_encoded")
+    )
+
+    # Select relevant columns
+    other_traits = [t for t in trait_columns if t != "FeedingPath"]
+    select_cols = ["id", "FeedingPath_encoded"] + other_traits
+    df = df.select(select_cols)
+
+    # Rename FeedingPath_encoded back to FeedingPath
+    df = df.rename({"FeedingPath_encoded": "FeedingPath"})
+    df = df.with_columns(pl.lit(split).alias("split"))
+
+    # Filter rows with any null trait values
+    for trait in trait_columns:
+        df = df.filter(pl.col(trait).is_not_null())
+
+    return df
+
+
+def _load_embeddings_with_labels(
+    embeddings_path: str, metadata_df: pl.DataFrame, trait_columns: list[str]
+) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.float32], npt.NDArray[np.float32], npt.NDArray[np.float32]]:
+    logger.info(f"Loading embeddings from {embeddings_path}")
+    emb_df = load_embeddings(embeddings_path)
+
+    train_meta = metadata_df.filter(pl.col("split") == "train")
+    test_meta = metadata_df.filter(pl.col("split") == "test")
+
+    train_join = train_meta.join(emb_df, on="id", how="inner")
+    test_join = test_meta.join(emb_df, on="id", how="inner")
+
+    expected_train = train_meta.height
+    expected_test = test_meta.height
+    found_train = train_join.height
+    found_test = test_join.height
+
+    if found_train < expected_train:
+        logger.warning(f"Train: dropped {expected_train - found_train} samples (missing embeddings)")
+    if found_test < expected_test:
+        logger.warning(f"Test: dropped {expected_test - found_test} samples (missing embeddings)")
+
+    # Extract features and labels
+    x_train = train_join.get_column("embedding").to_numpy().astype(np.float32, copy=False)
+    y_train = train_join.select(trait_columns).to_numpy().astype(np.float32)
+    x_test = test_join.get_column("embedding").to_numpy().astype(np.float32, copy=False)
+    y_test = test_join.select(trait_columns).to_numpy().astype(np.float32)
+
+    logger.info(f"Train: {x_train.shape[0]} samples, Test: {x_test.shape[0]} samples")
+    logger.info(f"Features: {x_train.shape[1]} dims, Traits: {len(trait_columns)}")
+
+    return (x_train, y_train, x_test, y_test)
+
+
+def evaluate_fishnet_single(
+    x_train: npt.NDArray[np.float32],
+    y_train: npt.NDArray[np.float32],
+    x_test: npt.NDArray[np.float32],
+    y_test: npt.NDArray[np.float32],
+    trait_columns: list[str],
+    args: argparse.Namespace,
+    embeddings_path: str,
+    device: torch.device,
+) -> dict[str, Any]:
+    num_classes = len(trait_columns)
+
+    scores: list[float] = []
+    exact_match_scores: list[float] = []
+    per_trait_f1_runs: list[dict[str, float]] = []
+
+    for run in range(args.runs):
+        run_seed = args.seed + run
+        logger.info(f"Run {run + 1}/{args.runs} (seed={run_seed})")
+
+        # Train MLP
+        model = train_mlp(
+            x_train,
+            y_train,
+            num_classes=num_classes,
+            device=device,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            hidden_dim=args.hidden_dim,
+            dropout=args.dropout,
+            seed=run_seed,
+        )
+
+        # Evaluate
+        y_pred, y_true, macro_f1 = evaluate_mlp(model, x_test, y_test, batch_size=args.batch_size, device=device)
+        scores.append(macro_f1)
+        exact_match_acc = float(np.mean(np.all(y_pred == y_true, axis=1)))
+        exact_match_scores.append(exact_match_acc)
+
+        # Per-trait F1
+        per_trait_f1: dict[str, float] = {}
+        for i, trait in enumerate(trait_columns):
+            trait_f1 = f1_score(y_true[:, i], y_pred[:, i], average="binary", zero_division=0.0)
+            per_trait_f1[trait] = float(trait_f1)
+
+        per_trait_f1_runs.append(per_trait_f1)
+        logger.info(f"Run {run + 1}/{args.runs} - Macro F1: {macro_f1:.4f}, Exact Match: {exact_match_acc:.4f}")
+
+    # Average results
+    scores_arr = np.array(scores)
+    mean_f1 = float(scores_arr.mean())
+    std_f1 = float(scores_arr.std(ddof=1)) if len(scores) > 1 else 0.0
+    exact_scores_arr = np.array(exact_match_scores)
+    mean_exact = float(exact_scores_arr.mean())
+    std_exact = float(exact_scores_arr.std(ddof=1)) if len(exact_match_scores) > 1 else 0.0
+
+    # Average per-trait F1 across runs
+    avg_per_trait_f1: dict[str, float] = {}
+    for trait in trait_columns:
+        trait_scores = [run_f1[trait] for run_f1 in per_trait_f1_runs]
+        avg_per_trait_f1[trait] = float(np.mean(trait_scores))
+
+    logger.info(f"Mean Macro F1 over {args.runs} runs: {mean_f1:.4f} +/- {std_f1:.4f} (std)")
+    logger.info(f"Mean Exact Match over {args.runs} runs: {mean_exact:.4f} +/- {std_exact:.4f} (std)")
+    for trait, f1 in avg_per_trait_f1.items():
+        logger.info(f"  {trait}: {f1:.4f}")
+
+    return {
+        "method": "mlp",
+        "macro_f1": mean_f1,
+        "macro_f1_std": std_f1,
+        "exact_match_acc": mean_exact,
+        "exact_match_acc_std": std_exact,
+        "num_runs": args.runs,
+        "per_trait_f1": avg_per_trait_f1,
+        "embeddings_file": str(embeddings_path),
+    }
+
+
+def evaluate_fishnet(args: argparse.Namespace) -> None:
+    tic = time.time()
+
+    if args.gpu is True:
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+
+    if args.gpu_id is not None:
+        torch.cuda.set_device(args.gpu_id)
+
+    logger.info(f"Using device {device}")
+    logger.info(f"Loading FishNet dataset from {args.dataset_path}")
+    dataset = FishNet(args.dataset_path)
+    trait_columns = dataset.trait_columns
+    existing_df: Optional[pl.DataFrame] = None
+    output_path: Optional[Path] = None
+
+    if args.dry_run is False:
+        output_dir = settings.RESULTS_DIR.joinpath(args.dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir.joinpath(_results_filename(args))
+        if output_path.exists() is True:
+            logger.info(f"Loading existing results from {output_path}")
+            existing_df = pl.read_csv(output_path)
+
+    if args.embeddings is None:
+        summary_results = _summary_results(existing_df, [], trait_columns)
+        if len(summary_results) == 0:
+            raise cli.ValidationError("--embeddings is required when no cached results are available")
+
+        logger.info("No embeddings provided, showing cached results")
+        _print_summary_table(summary_results)
+        toc = time.time()
+        logger.info(f"FishNet benchmark completed in {lib.format_duration(toc - tic)}")
+        return
+
+    train_df = _load_fishnet_data(dataset.train_csv, trait_columns, split="train")
+    test_df = _load_fishnet_data(dataset.test_csv, trait_columns, split="test")
+    metadata_df = pl.concat([train_df, test_df])
+    logger.info(f"Train samples: {train_df.height}, Test samples: {test_df.height}")
+
+    results: list[dict[str, Any]] = []
+    total = len(args.embeddings)
+    for idx, embeddings_path in enumerate(args.embeddings, start=1):
+        logger.info(f"Processing embeddings {idx}/{total}: {embeddings_path}")
+
+        cached_result = _load_cached_result(existing_df, embeddings_path, trait_columns)
+        if cached_result is not None:
+            logger.info(f"Using cached result for {embeddings_path}")
+            results.append(cached_result)
+            continue
+
+        if Path(embeddings_path).exists() is False:
+            logger.warning(f"Embeddings file not found, skipping: {embeddings_path}")
+            continue
+
+        x_train, y_train, x_test, y_test = _load_embeddings_with_labels(embeddings_path, metadata_df, trait_columns)
+
+        result = evaluate_fishnet_single(x_train, y_train, x_test, y_test, trait_columns, args, embeddings_path, device)
+        results.append(result)
+        if output_path is not None:
+            _append_result_csv(result, trait_columns, output_path)
+            row_df = pl.DataFrame([_result_to_row(result, trait_columns)])
+            if existing_df is None:
+                existing_df = row_df
+            else:
+                existing_df = pl.concat([existing_df, row_df], how="diagonal_relaxed")
+
+    _print_summary_table(_summary_results(existing_df, results, trait_columns))
+
+    toc = time.time()
+    logger.info(f"FishNet benchmark completed in {lib.format_duration(toc - tic)}")
+
+
+def set_parser(subparsers: Any) -> None:
+    subparser = subparsers.add_parser(
+        "fishnet",
+        allow_abbrev=False,
+        help="run FishNet benchmark - 9 trait multi-label classification using MLP probe",
+        description="run FishNet benchmark - 9 trait multi-label classification using MLP probe",
+        epilog=(
+            "Usage examples:\n"
+            "python -m birder.eval fishnet --embeddings "
+            "results/vit_b16_224px_embeddings.parquet "
+            "--dataset-path ~/Datasets/fishnet --dry-run\n"
+            "python -m birder.eval fishnet --embeddings results/fishnet/*.parquet "
+            "--dataset-path ~/Datasets/fishnet --gpu --gpu-id 1\n"
+        ),
+        formatter_class=cli.ArgumentHelpFormatter,
+    )
+    subparser.add_argument(
+        "--embeddings", type=str, nargs="+", metavar="FILE", help="paths to embeddings parquet files"
+    )
+    subparser.add_argument("--dataset-path", type=str, metavar="PATH", help="path to FishNet dataset root")
+    subparser.add_argument("--runs", type=int, default=3, help="number of evaluation runs")
+    subparser.add_argument("--epochs", type=int, default=100, help="training epochs per run")
+    subparser.add_argument("--batch-size", type=int, default=128, help="batch size for training and inference")
+    subparser.add_argument("--lr", type=float, default=1e-4, help="learning rate")
+    subparser.add_argument("--hidden-dim", type=int, default=512, help="MLP hidden layer dimension")
+    subparser.add_argument("--dropout", type=float, default=0.5, help="dropout probability")
+    subparser.add_argument("--seed", type=int, default=0, help="base random seed")
+    subparser.add_argument("--gpu", default=False, action="store_true", help="use gpu")
+    subparser.add_argument("--gpu-id", type=int, metavar="ID", help="gpu id to use")
+    subparser.add_argument(
+        "--dir", type=str, default="fishnet", help="place all outputs in a sub-directory (relative to results)"
+    )
+    subparser.add_argument("--dry-run", default=False, action="store_true", help="skip saving results to file")
+    subparser.set_defaults(func=main)
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.dataset_path is None:
+        raise cli.ValidationError("--dataset-path is required")
+
+
+def main(args: argparse.Namespace) -> None:
+    validate_args(args)
+    evaluate_fishnet(args)

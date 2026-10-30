@@ -1,0 +1,220 @@
+"""
+MAE ViT, adapted from
+https://github.com/lucidrains/vit-pytorch/blob/main/vit_pytorch/mae.py
+and
+https://github.com/huggingface/transformers/blob/main/src/transformers/models/vit_mae/modeling_vit_mae.py
+
+Paper "Masked Autoencoders Are Scalable Vision Learners", https://arxiv.org/abs/2111.06377
+"""
+
+# Reference license: MIT and Apache-2.0
+
+from typing import Any
+from typing import Optional
+
+import torch
+from torch import nn
+
+from birder.common.masking import uniform_mask
+from birder.model_registry import registry
+from birder.net.base import MaskedTokenOmissionMixin
+from birder.net.base import PreTrainEncoder
+from birder.net.base import pos_embedding_sin_cos_2d
+from birder.net.mim.base import MIMBaseNet
+
+
+class MAE_ViT(MIMBaseNet):
+    default_size = (224, 224)
+    default_mask_ratio = 0.75
+    auto_register = False
+
+    def __init__(
+        self,
+        encoder: PreTrainEncoder,
+        *,
+        config: Optional[dict[str, Any]] = None,
+        size: Optional[tuple[int, int]] = None,
+        mask_ratio: Optional[float] = None,
+        min_mask_size: int = 1,
+    ) -> None:
+        super().__init__(encoder, config=config, size=size, mask_ratio=mask_ratio, min_mask_size=min_mask_size)
+        assert self.config is not None, "must set config"
+        assert isinstance(self.encoder, MaskedTokenOmissionMixin)
+        assert hasattr(self.encoder, "decoder_block")
+
+        self.patch_size = self.encoder.stem_stride
+        encoder_dim = self.encoder.feature_dim
+        decoder_embed_dim: int = self.config["decoder_embed_dim"]
+        decoder_depth: int = self.config["decoder_depth"]
+        norm_pix_loss: bool = self.config.get("norm_pix_loss", False)
+        learnable_pos_embed: bool = self.config.get("learnable_pos_embed", False)
+
+        self.norm_pix_loss = norm_pix_loss
+
+        self.decoder_embed = nn.Linear(encoder_dim, decoder_embed_dim)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
+
+        if learnable_pos_embed is True:
+            seq_len = (self.size[0] // self.patch_size) * (self.size[1] // self.patch_size)
+            seq_len += self.encoder.num_special_tokens
+            self.decoder_pos_embed = nn.Parameter(torch.empty(1, seq_len, decoder_embed_dim))
+        else:
+            # Fixed sin-cos embeddings
+            pos_embedding = pos_embedding_sin_cos_2d(
+                h=self.size[0] // self.patch_size,
+                w=self.size[1] // self.patch_size,
+                dim=decoder_embed_dim,
+                num_special_tokens=self.encoder.num_special_tokens,
+                include_frequency_endpoint=False,
+            )
+            self.decoder_pos_embed = nn.Buffer(pos_embedding)
+
+        layers = []
+        for _ in range(decoder_depth):
+            layers.append(self.encoder.decoder_block(decoder_embed_dim))
+
+        layers.append(nn.LayerNorm(decoder_embed_dim, eps=1e-6))
+        layers.append(nn.Linear(decoder_embed_dim, self.patch_size**2 * self.input_channels))  # Decoder to patch
+        self.decoder = nn.Sequential(*layers)
+
+        # Weight initialization
+        nn.init.normal_(self.mask_token, std=0.02)
+        if learnable_pos_embed is True:
+            nn.init.trunc_normal_(self.decoder_pos_embed, std=0.02)
+
+        for m in (self.decoder_embed, *self.decoder.modules()):
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def patchify(self, imgs: torch.Tensor) -> torch.Tensor:
+        """
+        imgs: (N, C, H, W)
+        x: (N, L, patch_size**2 * C)
+        """
+
+        p = self.patch_size
+        c = self.input_channels
+        assert imgs.shape[2] % p == 0 and imgs.shape[3] % p == 0
+
+        h = imgs.shape[2] // p
+        w = imgs.shape[3] // p
+        x = imgs.reshape(shape=(imgs.shape[0], c, h, p, w, p))
+        x = torch.einsum("nchpwq->nhwpqc", x)
+        x = x.reshape(shape=(imgs.shape[0], h * w, p**2 * c))
+
+        return x
+
+    def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (N, L, patch_size**2 * C)
+        imgs: (N, C, H, W)
+        """
+
+        p = self.patch_size
+        c = self.input_channels
+        h = self.size[0] // p
+        w = self.size[1] // p
+        assert h * w == x.shape[1]
+
+        x = x.reshape(shape=(x.size(0), h, w, p, p, c))
+        x = torch.einsum("nhwpqc->nchpwq", x)
+        imgs = x.reshape(shape=(x.size(0), c, h * p, w * p))
+
+        return imgs
+
+    def forward_decoder(self, x: torch.Tensor, ids_restore: torch.Tensor) -> torch.Tensor:
+        x = self.decoder_embed(x)
+
+        # Append mask tokens to sequence
+        special_token_len = self.encoder.num_special_tokens
+        mask_tokens = self.mask_token.repeat(x.size(0), ids_restore.size(1) + special_token_len - x.size(1), 1)
+        x_ = torch.concat([x[:, special_token_len:, :], mask_tokens], dim=1)  # No special tokens
+        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.size(2)))  # Un-shuffle
+        x = torch.concat([x[:, :special_token_len, :], x_], dim=1)  # Re-append special tokens
+
+        # Add positional embeddings
+        x = x + self.decoder_pos_embed
+
+        # Apply decoder transformer
+        x = self.decoder(x)
+
+        # Remove special tokens
+        x = x[:, special_token_len:, :]
+
+        return x
+
+    def forward_loss(self, x: torch.Tensor, pred: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        target = self.patchify(x)
+
+        if self.norm_pix_loss is True:
+            mean = target.mean(dim=-1, keepdim=True)
+            var = target.var(dim=-1, keepdim=True)
+            target = (target - mean) / (var + 1.0e-6) ** 0.5
+
+        loss = (pred - target) ** 2
+        loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
+        loss = (loss * mask).sum() / mask.sum()  # Mean loss on removed patches
+
+        return loss
+
+    def forward(self, x: torch.Tensor, *, return_moe_training_output: bool = False) -> dict[str, Any]:
+        h = self.size[0] // self.encoder.max_stride
+        w = self.size[1] // self.encoder.max_stride
+        mask, ids_keep, ids_restore = uniform_mask(
+            x.size(0), h, w, self.mask_ratio, min_mask_size=self.min_mask_size, device=x.device
+        )
+
+        if return_moe_training_output is True:
+            latent = self.encoder.masked_encoding_omission(x, ids_keep, return_moe_training_output=True)
+        else:
+            latent = self.encoder.masked_encoding_omission(x, ids_keep)
+
+        pred = self.forward_decoder(latent["tokens"], ids_restore)
+        loss = self.forward_loss(x, pred, mask)
+
+        result = {"loss": loss, "pred": pred, "mask": mask}
+        if "moe_training_output" in latent:
+            result["moe_training_output"] = latent["moe_training_output"]
+
+        return result
+
+
+# Base models
+registry.register_model_config("mae_vit", MAE_ViT, config={"decoder_depth": 8, "decoder_embed_dim": 512})
+registry.register_model_config("mae_vit_dec512d12", MAE_ViT, config={"decoder_depth": 12, "decoder_embed_dim": 512})
+registry.register_model_config("mae_vit_dec512d24", MAE_ViT, config={"decoder_depth": 24, "decoder_embed_dim": 512})
+registry.register_model_config("mae_vit_dec512d32", MAE_ViT, config={"decoder_depth": 32, "decoder_embed_dim": 512})
+
+# With norm pix loss
+registry.register_model_config(
+    "mae_vit_dec512d12_npl", MAE_ViT, config={"decoder_depth": 12, "decoder_embed_dim": 512, "norm_pix_loss": True}
+)
+registry.register_model_config(
+    "mae_vit_dec512d24_npl", MAE_ViT, config={"decoder_depth": 24, "decoder_embed_dim": 512, "norm_pix_loss": True}
+)
+registry.register_model_config(
+    "mae_vit_dec512d32_npl", MAE_ViT, config={"decoder_depth": 32, "decoder_embed_dim": 512, "norm_pix_loss": True}
+)
+
+# With norm pix loss and learnable positional embedding
+registry.register_model_config(
+    "mae_vit_dec512d12_npl_lpe",
+    MAE_ViT,
+    config={"decoder_depth": 12, "decoder_embed_dim": 512, "norm_pix_loss": True, "learnable_pos_embed": True},
+)
+registry.register_model_config(
+    "mae_vit_dec512d24_npl_lpe",
+    MAE_ViT,
+    config={"decoder_depth": 24, "decoder_embed_dim": 512, "norm_pix_loss": True, "learnable_pos_embed": True},
+)
+registry.register_model_config(  # From "In Pursuit of Pixel Supervision for Visual Pretraining"
+    "mae_vit_dec512d32_npl_lpe",
+    MAE_ViT,
+    config={"decoder_depth": 32, "decoder_embed_dim": 512, "norm_pix_loss": True, "learnable_pos_embed": True},
+)

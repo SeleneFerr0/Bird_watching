@@ -1,0 +1,333 @@
+"""
+ResNeXt, adapted from
+https://github.com/pytorch/vision/blob/main/torchvision/models/resnet.py
+
+Paper "Aggregated Residual Transformations for Deep Neural Networks", https://arxiv.org/abs/1611.05431
+and
+Paper "Squeeze-and-Excitation Networks", https://arxiv.org/abs/1709.01507
+and
+Paper "Bag of Tricks for Image Classification with Convolutional Neural Networks",
+https://arxiv.org/abs/1812.01187
+"""
+
+# Reference license: BSD 3-Clause
+
+from collections import OrderedDict
+from typing import Any
+from typing import Literal
+from typing import Optional
+
+import torch
+from torch import nn
+from torchvision.ops import Conv2dNormActivation
+from torchvision.ops import SqueezeExcitation
+
+from birder.common.masking import mask_tensor
+from birder.model_registry import registry
+from birder.net.base import DetectorBackbone
+from birder.net.base import MaskedTokenRetentionMixin
+from birder.net.base import PreTrainEncoder
+from birder.net.base import TokenRetentionResultType
+
+
+class ResidualBlock(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: tuple[int, int],
+        groups: int,
+        base_width: int,
+        expansion: int,
+        squeeze_excitation: bool,
+        avg_down: bool,
+    ) -> None:
+        super().__init__()
+        width = int(out_channels * (base_width / 64.0)) * groups
+        self.block1 = nn.Sequential(
+            Conv2dNormActivation(
+                in_channels,
+                width,
+                kernel_size=(1, 1),
+                stride=(1, 1),
+                padding=(0, 0),
+                bias=False,
+            ),
+            Conv2dNormActivation(
+                width,
+                width,
+                kernel_size=(3, 3),
+                stride=stride,
+                padding=(1, 1),
+                groups=groups,
+                bias=False,
+            ),
+            nn.Conv2d(
+                width,
+                out_channels * expansion,
+                kernel_size=(1, 1),
+                stride=(1, 1),
+                padding=(0, 0),
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels * expansion),
+        )
+
+        if in_channels == out_channels * expansion and stride == (1, 1):
+            self.block2 = nn.Identity()
+        else:
+            if avg_down is True and stride != (1, 1):
+                self.block2 = nn.Sequential(
+                    nn.AvgPool2d(kernel_size=2, stride=stride, ceil_mode=True, count_include_pad=False),
+                    nn.Conv2d(
+                        in_channels,
+                        out_channels * expansion,
+                        kernel_size=(1, 1),
+                        stride=(1, 1),
+                        padding=(0, 0),
+                        bias=False,
+                    ),
+                    nn.BatchNorm2d(out_channels * expansion),
+                )
+            else:
+                self.block2 = nn.Sequential(
+                    nn.Conv2d(
+                        in_channels,
+                        out_channels * expansion,
+                        kernel_size=(1, 1),
+                        stride=stride,
+                        padding=(0, 0),
+                        bias=False,
+                    ),
+                    nn.BatchNorm2d(out_channels * expansion),
+                )
+
+        self.relu = nn.ReLU(inplace=True)
+        if squeeze_excitation is True:
+            self.se = SqueezeExcitation(out_channels * expansion, out_channels * expansion // 16)
+        else:
+            self.se = nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        x = self.block1(x)
+        x = self.se(x)
+        identity = self.block2(identity)
+        x += identity
+        x = self.relu(x)
+
+        return x
+
+
+class ResNeXt(DetectorBackbone, PreTrainEncoder, MaskedTokenRetentionMixin):
+    block_group_regex = r"body\.stage(\d+)\.(\d+)"
+
+    def __init__(
+        self,
+        input_channels: int,
+        num_classes: int,
+        *,
+        config: Optional[dict[str, Any]] = None,
+        size: Optional[tuple[int, int]] = None,
+    ) -> None:
+        super().__init__(input_channels, num_classes, config=config, size=size)
+        assert self.config is not None, "must set config"
+
+        expansion = 4
+        groups: int = self.config.get("groups", 32)
+        base_width: int = self.config.get("base_width", 4)
+        filter_list = [64, 128, 256, 512]
+        units: list[int] = self.config["units"]
+        squeeze_excitation: bool = self.config.get("squeeze_excitation", False)
+        deep_stem: bool = self.config.get("deep_stem", False)
+        avg_down: bool = self.config.get("avg_down", False)
+
+        if deep_stem is True:
+            self.stem = nn.Sequential(
+                Conv2dNormActivation(
+                    self.input_channels, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False
+                ),
+                Conv2dNormActivation(32, 32, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False),
+                Conv2dNormActivation(32, filter_list[0], kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False),
+                nn.MaxPool2d(kernel_size=(3, 3), stride=(2, 2), padding=(1, 1)),
+            )
+        else:
+            self.stem = nn.Sequential(
+                Conv2dNormActivation(
+                    self.input_channels,
+                    filter_list[0],
+                    kernel_size=(7, 7),
+                    stride=(2, 2),
+                    padding=(3, 3),
+                    bias=False,
+                ),
+                nn.MaxPool2d(kernel_size=(3, 3), stride=(2, 2), padding=(1, 1)),
+            )
+
+        # Generate body layers
+        in_channels = filter_list[0]
+
+        stages: OrderedDict[str, nn.Module] = OrderedDict()
+        return_channels: list[int] = []
+        for i, (channels, num_blocks) in enumerate(zip(filter_list, units)):
+            layers = []
+            if i == 0:
+                stride = (1, 1)
+            else:
+                stride = (2, 2)
+
+            for block_idx in range(num_blocks):
+                if block_idx != 0:
+                    stride = (1, 1)
+
+                layers.append(
+                    ResidualBlock(
+                        in_channels,
+                        channels,
+                        stride=stride,
+                        groups=groups,
+                        base_width=base_width,
+                        expansion=expansion,
+                        squeeze_excitation=squeeze_excitation,
+                        avg_down=avg_down,
+                    )
+                )
+                in_channels = channels * expansion
+
+            stages[f"stage{i+1}"] = nn.Sequential(*layers)
+            return_channels.append(channels * expansion)
+
+        self.body = nn.Sequential(stages)
+        self.features = nn.Sequential(
+            nn.AdaptiveAvgPool2d(output_size=(1, 1)),
+            nn.Flatten(1),
+        )
+        self.return_channels = return_channels
+        self.embedding_size = filter_list[-1] * expansion
+        self.classifier = self.create_classifier()
+
+        self.max_stride = 32
+        self.stem_stride = 4
+        self.stem_width = filter_list[0]
+        self.feature_dim = filter_list[-1] * expansion
+
+        # Weight initialization
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def detection_features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        x = self.stem(x)
+
+        out = {}
+        for name, module in self.body.named_children():
+            x = module(x)
+            if name in self.return_stages:
+                out[name] = x
+
+        return out
+
+    def freeze_stages(self, up_to_stage: int) -> None:
+        for param in self.stem.parameters():
+            param.requires_grad_(False)
+
+        for idx, module in enumerate(self.body.children()):
+            if idx >= up_to_stage:
+                break
+
+            for param in module.parameters():
+                param.requires_grad_(False)
+
+    def masked_encoding_retention(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        mask_token: Optional[torch.Tensor] = None,
+        return_keys: Literal["all", "features", "embedding"] = "features",
+    ) -> TokenRetentionResultType:
+        x = self.stem(x)
+        x = mask_tensor(x, mask, patch_factor=self.max_stride // self.stem_stride, mask_token=mask_token)
+        x = self.body(x)
+
+        result: TokenRetentionResultType = {}
+        if return_keys in ("all", "features"):
+            result["features"] = x
+        if return_keys in ("all", "embedding"):
+            result["embedding"] = self.features(x)
+
+        return result
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        return self.body(x)
+
+    def embedding_from_features(self, features: torch.Tensor) -> torch.Tensor:
+        return self.features(features)
+
+
+registry.register_model_config("resnext_50", ResNeXt, config={"units": [3, 4, 6, 3]})
+registry.register_model_config("resnext_101", ResNeXt, config={"units": [3, 4, 23, 3]})
+registry.register_model_config("resnext_152", ResNeXt, config={"units": [3, 8, 36, 3]})
+
+registry.register_model_config("resnext_101_32x8", ResNeXt, config={"units": [3, 4, 23, 3], "base_width": 8})
+registry.register_model_config("resnext_101_64x4", ResNeXt, config={"units": [3, 4, 23, 3], "groups": 64})
+
+# ResNeXt-D variants (From: Bag of Tricks for Image Classification with Convolutional Neural Networks)
+registry.register_model_config(
+    "resnext_d_50", ResNeXt, config={"units": [3, 4, 6, 3], "deep_stem": True, "avg_down": True}
+)
+registry.register_model_config(
+    "resnext_d_101", ResNeXt, config={"units": [3, 4, 23, 3], "deep_stem": True, "avg_down": True}
+)
+registry.register_model_config(
+    "resnext_d_152", ResNeXt, config={"units": [3, 8, 36, 3], "deep_stem": True, "avg_down": True}
+)
+
+# Squeeze-and-Excitation Networks
+registry.register_model_config("se_resnext_50", ResNeXt, config={"units": [3, 4, 6, 3], "squeeze_excitation": True})
+registry.register_model_config("se_resnext_101", ResNeXt, config={"units": [3, 4, 23, 3], "squeeze_excitation": True})
+registry.register_model_config("se_resnext_152", ResNeXt, config={"units": [3, 8, 36, 3], "squeeze_excitation": True})
+
+registry.register_model_config(
+    "se_resnext_101_32x8", ResNeXt, config={"units": [3, 4, 23, 3], "base_width": 8, "squeeze_excitation": True}
+)
+registry.register_model_config(
+    "se_resnext_101_64x4", ResNeXt, config={"units": [3, 4, 23, 3], "groups": 64, "squeeze_excitation": True}
+)
+
+# SE-ResNeXt-D variants with SE
+registry.register_model_config(
+    "se_resnext_d_50",
+    ResNeXt,
+    config={"units": [3, 4, 6, 3], "squeeze_excitation": True, "deep_stem": True, "avg_down": True},
+)
+registry.register_model_config(
+    "se_resnext_d_101",
+    ResNeXt,
+    config={"units": [3, 4, 23, 3], "squeeze_excitation": True, "deep_stem": True, "avg_down": True},
+)
+registry.register_model_config(
+    "se_resnext_d_152",
+    ResNeXt,
+    config={"units": [3, 8, 36, 3], "squeeze_excitation": True, "deep_stem": True, "avg_down": True},
+)
+
+registry.register_weights(
+    "se_resnext_50_arabian-peninsula",
+    {
+        "url": "https://huggingface.co/birder-project/se_resnext_50_arabian-peninsula/resolve/main",
+        "description": "SE ResNeXt 50 model trained on the arabian-peninsula dataset",
+        "resolution": (256, 256),
+        "formats": {
+            "pt": {
+                "file_size": 103.5,
+                "sha256": "825c790628c800312f8669243a307cd79b396b0adcd0e506cc912be2fc5017cf",
+            }
+        },
+        "net": {"network": "se_resnext_50", "tag": "arabian-peninsula"},
+    },
+)

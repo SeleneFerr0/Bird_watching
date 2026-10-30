@@ -1,0 +1,313 @@
+import fnmatch
+import warnings
+from enum import StrEnum
+from typing import TYPE_CHECKING
+from typing import Any
+from typing import Literal
+from typing import Optional
+from typing import TypeAlias
+
+from birder.conf.settings import DEFAULT_NUM_CHANNELS
+from birder.model_registry import manifest
+
+if TYPE_CHECKING is True:
+    from birder.net.base import BaseNet  # pylint: disable=cyclic-import
+    from birder.net.base import DetectorBackbone  # pylint: disable=cyclic-import
+    from birder.net.base import PreTrainEncoder  # pylint: disable=cyclic-import
+    from birder.net.detection.base import DetectionBaseNet  # pylint: disable=cyclic-import
+    from birder.net.mim.base import MIMBaseNet  # pylint: disable=cyclic-import
+    from birder.net.ssl.base import SSLBaseNet  # pylint: disable=cyclic-import
+
+    BaseNetObjType: TypeAlias = BaseNet | DetectionBaseNet | MIMBaseNet | SSLBaseNet
+    BaseNetType: TypeAlias = type[BaseNet] | type[DetectionBaseNet] | type[MIMBaseNet] | type[SSLBaseNet]
+
+
+def group_sort(model_list: list[str]) -> list[str]:
+    # Sort by model group for visibility
+    index_map = {item: index for index, item in enumerate(model_list)}
+    model_list = sorted(model_list, key=lambda x: (x.split("_")[0], index_map[x]))
+    return model_list
+
+
+class Task(StrEnum):
+    IMAGE_CLASSIFICATION = "image_classification"
+    OBJECT_DETECTION = "object_detection"
+    MASKED_IMAGE_MODELING = "masked_image_modeling"
+    SELF_SUPERVISED_LEARNING = "self_supervised_learning"
+
+
+class ModelRegistry:
+    def __init__(self) -> None:
+        self.registered_configs: dict[str, "BaseNetType"] = {}
+        self.name_aliases: dict[str, str] = {}
+        self._nets: dict[str, type["BaseNet"]] = {}
+        self._detection_nets: dict[str, type["DetectionBaseNet"]] = {}
+        self._mim_nets: dict[str, type["MIMBaseNet"]] = {}
+        self._ssl_nets: dict[str, type["SSLBaseNet"]] = {}
+        self._pretrained_nets = manifest.REGISTRY_MANIFEST
+
+    @property
+    def all_nets(self) -> dict[str, "BaseNetType"]:
+        return {**self._nets, **self._detection_nets, **self._mim_nets, **self._ssl_nets}
+
+    def _assert_name_not_alias(self, name: str) -> None:
+        if name in self.name_aliases:
+            raise ValueError(f"Registered model name '{name}' is reserved by a name alias")
+
+    def register_model(self, name: str, net_type: "BaseNetType") -> None:
+        self._assert_name_not_alias(name)
+
+        if net_type.task == Task.IMAGE_CLASSIFICATION:
+            if name in self._nets:
+                warnings.warn(f"Network '{name}' is already registered and will be overwritten", UserWarning)
+
+            self._nets[name] = net_type
+
+        elif net_type.task == Task.OBJECT_DETECTION:
+            if name in self._detection_nets:
+                warnings.warn(f"Detection network '{name}' is already registered and will be overwritten", UserWarning)
+
+            self._detection_nets[name] = net_type
+
+        elif net_type.task == Task.MASKED_IMAGE_MODELING:
+            if name in self._mim_nets:
+                warnings.warn(f"MIM network '{name}' is already registered and will be overwritten", UserWarning)
+
+            self._mim_nets[name] = net_type
+
+        elif net_type.task == Task.SELF_SUPERVISED_LEARNING:
+            if name in self._ssl_nets:
+                warnings.warn(f"SSL network '{name}' is already registered and will be overwritten", UserWarning)
+
+            self._ssl_nets[name] = net_type
+
+        else:
+            raise ValueError(f"Unsupported model task: {net_type.task}")
+
+    def register_model_config(
+        self, name: str, net_type: "BaseNetType", *, config: Optional[dict[str, Any]] = None
+    ) -> None:
+        """
+        Register a model configuration
+
+        When auto_register is active, just by defining the type(name, (net_type,), ...) the network is registered,
+        no further registration is needed.
+        """
+
+        name_key = name.lower()
+        self._assert_name_not_alias(name_key)
+        registered_net_type = type(name, (net_type,), {"config": config})
+        if net_type.auto_register is False:
+            # Register the model manually, as the base class doesn't take care of that for us
+            self.register_model(name_key, registered_net_type)
+
+        if name_key in self.registered_configs:
+            warnings.warn(f"Registered config '{name}' is already registered and will be overwritten", UserWarning)
+
+        self.registered_configs[name_key] = registered_net_type
+
+    def register_name_alias(self, alias_name: str, registered_name: str) -> None:
+        alias_key = alias_name.lower()
+        registered_name_key = registered_name.lower()
+
+        if alias_key in self.all_nets:
+            raise ValueError(f"Alias '{alias_name}' collides with an existing registered model name")
+
+        if alias_key in self.name_aliases:
+            raise ValueError(f"Alias '{alias_name}' is already registered")
+
+        if registered_name_key in self.name_aliases:
+            raise ValueError(f"Alias names must target a canonical registered name, got alias '{registered_name}'")
+
+        if registered_name_key not in self.all_nets:
+            raise ValueError(f"Registered name '{registered_name}' not found")
+
+        self.name_aliases[alias_key] = registered_name_key
+
+    def register_weights(self, name: str, weights_info: manifest.ModelMetadataType) -> None:
+        if name in self._pretrained_nets:
+            warnings.warn(f"Weights '{name}' are already registered and will be overwritten", UserWarning)
+
+        if "task" not in weights_info:
+            weights_info["task"] = self.all_nets[weights_info["net"]["network"]].task
+
+        manifest.REGISTRY_MANIFEST[name] = weights_info
+        self._pretrained_nets[name] = weights_info
+
+    def _resolve_name(self, name: str) -> str:
+        name_key = name.lower()
+        if name_key in self.name_aliases:
+            return self.name_aliases[name_key]
+
+        return name_key
+
+    def _get_model_by_name(self, name: str) -> "BaseNetType":
+        resolved_name = self._resolve_name(name)
+        if resolved_name in self._nets:
+            net = self._nets[resolved_name]
+        elif resolved_name in self._detection_nets:
+            net = self._detection_nets[resolved_name]
+        elif resolved_name in self._mim_nets:
+            net = self._mim_nets[resolved_name]
+        elif resolved_name in self._ssl_nets:
+            net = self._ssl_nets[resolved_name]
+        else:
+            raise ValueError(f"Network with name: {name} not found")
+
+        return net
+
+    def _get_models_for_task(self, task: Task) -> dict[str, "BaseNetType"]:
+        if task == Task.IMAGE_CLASSIFICATION:
+            nets = self._nets
+        elif task == Task.OBJECT_DETECTION:
+            nets = self._detection_nets
+        elif task == Task.MASKED_IMAGE_MODELING:
+            nets = self._mim_nets
+        elif task == Task.SELF_SUPERVISED_LEARNING:
+            nets = self._ssl_nets
+        else:
+            raise ValueError(f"Unsupported model task: {task}")
+
+        return nets
+
+    def list_models(
+        self,
+        *,
+        include_filter: Optional[str] = None,
+        task: Optional[Task] = None,
+        net_type: Optional[type | tuple[type, ...]] = None,
+        net_type_op: Literal["AND", "OR"] = "AND",
+    ) -> list[str]:
+        nets = self.all_nets
+        if task is not None:
+            nets = self._get_models_for_task(task)
+
+        if net_type is not None:
+            if not isinstance(net_type, tuple):
+                net_type = (net_type,)
+
+            if net_type_op == "OR":
+                nets = {name: t for name, t in nets.items() if issubclass(t, net_type) is True}
+            elif net_type_op == "AND":
+                nets = {name: t for name, t in nets.items() if all(issubclass(t, nt) for nt in net_type)}
+            else:
+                raise ValueError(f"Unknown op {net_type_op}")
+
+        model_list = list(nets.keys())
+        if include_filter is not None:
+            model_list = fnmatch.filter(model_list, include_filter)
+
+        return model_list
+
+    def exists(self, name: str, task: Optional[Task] = None, net_type: Optional[type] = None) -> bool:
+        nets = self.all_nets
+        if task is not None:
+            nets = self._get_models_for_task(task)
+
+        if net_type is not None:
+            nets = {name: t for name, t in nets.items() if issubclass(t, net_type) is True}
+
+        return self._resolve_name(name) in nets
+
+    def _metadata_type_name(self, model: "BaseNetObjType") -> str:
+        cls = model.__class__
+        bases = cls.__bases__
+        if len(bases) > 1 and bases[0].__name__ == "FSDPModule":
+            return bases[1].__name__.lower()
+
+        return cls.__name__.lower()
+
+    def get_model_base_name(self, model: "BaseNetObjType") -> str:
+        type_name = self._metadata_type_name(model)
+        if type_name in self.registered_configs:
+            type_name = self.registered_configs[type_name].__bases__[0].__name__.lower()
+
+        return type_name
+
+    def get_registered_name(self, model: "BaseNetObjType") -> Optional[str]:
+        type_name = self._metadata_type_name(model)
+        if type_name in self.registered_configs:
+            return type_name
+
+        return None
+
+    def list_pretrained_models(self, include_filter: Optional[str] = None, task: Optional[Task] = None) -> list[str]:
+        """
+        Parameters
+        ----------
+        include_filter
+            Filter string that goes into fnmatch
+        task
+            Filter by network task
+
+        Returns
+        -------
+        Sorted models list (by model group) of pretrained networks.
+        """
+
+        model_list = list(self._pretrained_nets.keys())
+
+        if include_filter is not None:
+            model_list = fnmatch.filter(model_list, include_filter)
+
+        if task is not None:
+            model_list = [model_name for model_name in model_list if self._pretrained_nets[model_name]["task"] == task]
+
+        return group_sort(model_list)
+
+    def pretrained_exists(self, model_name: str) -> bool:
+        return model_name in self._pretrained_nets
+
+    def get_default_size(self, model_name: str) -> tuple[int, int]:
+        net = self._get_model_by_name(model_name)
+        return net.default_size
+
+    def get_pretrained_metadata(self, model_name: str) -> manifest.ModelMetadataType:
+        metadata = self._pretrained_nets[model_name]
+        if "task" not in metadata:
+            metadata["task"] = self.all_nets[metadata["net"]["network"]].task
+
+        return metadata
+
+    def net_factory(
+        self,
+        name: str,
+        num_classes: int,
+        input_channels: int = DEFAULT_NUM_CHANNELS,
+        *,
+        config: Optional[dict[str, Any]] = None,
+        size: Optional[tuple[int, int]] = None,
+    ) -> "BaseNet":
+        return self._nets[self._resolve_name(name)](input_channels, num_classes, config=config, size=size)
+
+    def detection_net_factory(
+        self,
+        name: str,
+        num_classes: int,
+        backbone: "DetectorBackbone",
+        *,
+        config: Optional[dict[str, Any]] = None,
+        size: Optional[tuple[int, int]] = None,
+        export_mode: bool = False,
+    ) -> "DetectionBaseNet":
+        return self._detection_nets[self._resolve_name(name)](
+            num_classes, backbone, config=config, size=size, export_mode=export_mode
+        )
+
+    def mim_net_factory(
+        self,
+        name: str,
+        encoder: "PreTrainEncoder",
+        *,
+        config: Optional[dict[str, Any]] = None,
+        size: Optional[tuple[int, int]] = None,
+        mask_ratio: Optional[float] = None,
+        min_mask_size: int = 1,
+    ) -> "MIMBaseNet":
+        return self._mim_nets[self._resolve_name(name)](
+            encoder, config=config, size=size, mask_ratio=mask_ratio, min_mask_size=min_mask_size
+        )
+
+
+registry = ModelRegistry()
+list_pretrained_models = registry.list_pretrained_models

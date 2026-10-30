@@ -1,0 +1,337 @@
+"""
+ConvNeXt v1, adapted from
+https://github.com/pytorch/vision/blob/main/torchvision/models/convnext.py
+
+Paper "A ConvNet for the 2020s", https://arxiv.org/abs/2201.03545
+"""
+
+# Reference license: BSD 3-Clause
+
+import logging
+from collections import OrderedDict
+from functools import partial
+from typing import Any
+from typing import Literal
+from typing import Optional
+
+import torch
+from torch import nn
+from torch.utils.checkpoint import checkpoint_sequential
+from torchvision.ops import Conv2dNormActivation
+from torchvision.ops import Permute
+from torchvision.ops import StochasticDepth
+
+from birder.common.masking import mask_tensor
+from birder.layers import LayerNorm2d
+from birder.model_registry import registry
+from birder.net.base import DetectorBackbone
+from birder.net.base import MaskedTokenRetentionMixin
+from birder.net.base import PreTrainEncoder
+from birder.net.base import TokenRetentionResultType
+from birder.net.base import stochastic_depth_rates
+
+logger = logging.getLogger(__name__)
+
+
+class ConvNeXtBlock(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        layer_scale: float,
+        stochastic_depth_prob: float,
+    ) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=(7, 7), stride=(1, 1), padding=(3, 3), groups=channels),
+            Permute([0, 2, 3, 1]),
+            nn.LayerNorm(channels, eps=1e-6),
+            nn.Linear(channels, 4 * channels),  # Same as 1x1 conv
+            nn.GELU(),
+            nn.Linear(4 * channels, channels),  # Same as 1x1 conv
+            Permute([0, 3, 1, 2]),
+        )
+        self.layer_scale = nn.Parameter(torch.ones(channels, 1, 1) * layer_scale)
+        self.stochastic_depth = StochasticDepth(stochastic_depth_prob, mode="row")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        x = self.layer_scale * self.block(x)
+        x = self.stochastic_depth(x)
+        x += identity
+
+        return x
+
+
+class ConvNeXt_v1(DetectorBackbone, PreTrainEncoder, MaskedTokenRetentionMixin):
+    block_group_regex = r"body\.stage(\d+)\.(\d+)"
+
+    def __init__(
+        self,
+        input_channels: int,
+        num_classes: int,
+        *,
+        config: Optional[dict[str, Any]] = None,
+        size: Optional[tuple[int, int]] = None,
+    ) -> None:
+        super().__init__(input_channels, num_classes, config=config, size=size)
+        assert self.config is not None, "must set config"
+
+        layer_scale = 1e-6
+        in_channels: list[int] = self.config["in_channels"]
+        num_layers: list[int] = self.config["num_layers"]
+        drop_path_rate: float = self.config["drop_path_rate"]
+        drop_path_uniform: bool = self.config.get("drop_path_uniform", False)
+        out_channels = in_channels[1:] + [-1]
+
+        self.grad_checkpointing = False
+        self.grad_checkpointing_segments: Optional[int] = None
+        self.grad_checkpointing_preserve_rng_state = True
+        self.grad_checkpointing_use_reentrant = False
+        self._grad_checkpointing_blocks = ()
+
+        self.stem = Conv2dNormActivation(
+            self.input_channels,
+            in_channels[0],
+            kernel_size=(4, 4),
+            stride=(4, 4),
+            padding=(0, 0),
+            bias=True,
+            norm_layer=LayerNorm2d,
+            activation_layer=None,
+        )
+
+        total_stage_blocks = sum(num_layers)
+        dpr = stochastic_depth_rates(drop_path_rate, total_stage_blocks, constant=drop_path_uniform)
+        stage_block_id = 0
+        stages: OrderedDict[str, nn.Module] = OrderedDict()
+        return_channels: list[int] = []
+        layers = []
+        for idx, (i, out, n) in enumerate(zip(in_channels, out_channels, num_layers)):
+            # Bottlenecks
+            for _ in range(n):
+                layers.append(ConvNeXtBlock(i, layer_scale, dpr[stage_block_id]))
+                stage_block_id += 1
+
+            stages[f"stage{idx+1}"] = nn.Sequential(*layers)
+            return_channels.append(i)
+            layers = []
+
+            # Down sampling
+            if out != -1:
+                layers.append(
+                    nn.Sequential(
+                        LayerNorm2d(i, eps=1e-6),
+                        nn.Conv2d(i, out, kernel_size=(2, 2), stride=(2, 2), padding=(0, 0)),
+                    )
+                )
+
+        self.body = nn.Sequential(stages)
+        self.features = nn.Sequential(
+            nn.AdaptiveAvgPool2d(output_size=(1, 1)),
+            LayerNorm2d(in_channels[-1], eps=1e-6),
+            nn.Flatten(1),
+        )
+        self.return_channels = return_channels
+        self.embedding_size = in_channels[-1]
+        self.classifier = self.create_classifier()
+
+        self.max_stride = 32
+        self.stem_stride = 4
+        self.stem_width = in_channels[0]
+        self.feature_dim = in_channels[-1]
+        self.decoder_block = partial(ConvNeXtBlock, stochastic_depth_prob=0)
+
+        # Weights initialization
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def _get_input_conv(self) -> nn.Conv2d:
+        conv = self.stem[0]
+        return conv
+
+    def set_grad_checkpointing(
+        self,
+        enable: bool = True,
+        *,
+        segments: Optional[int] = None,
+        preserve_rng_state: bool = True,
+        use_reentrant: bool = False,
+    ) -> None:
+        if enable is True:
+            logger.debug(
+                f"Enabling gradient checkpointing: segments={segments}, "
+                f"preserve_rng_state={preserve_rng_state}, use_reentrant={use_reentrant}"
+            )
+        else:
+            logger.debug("Disabling gradient checkpointing")
+
+        self.grad_checkpointing = enable
+        self.grad_checkpointing_segments = segments
+        self.grad_checkpointing_preserve_rng_state = preserve_rng_state
+        self.grad_checkpointing_use_reentrant = use_reentrant
+        if enable is True:
+            self._grad_checkpointing_blocks = tuple(block for stage in self.body for block in stage)
+        else:
+            self._grad_checkpointing_blocks = ()
+
+    def detection_features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        x = self.stem(x)
+
+        out = {}
+        for name, module in self.body.named_children():
+            x = module(x)
+            if name in self.return_stages:
+                out[name] = x
+
+        return out
+
+    def freeze_stages(self, up_to_stage: int) -> None:
+        for param in self.stem.parameters():
+            param.requires_grad_(False)
+
+        for idx, module in enumerate(self.body.children()):
+            if idx >= up_to_stage:
+                break
+
+            for param in module.parameters():
+                param.requires_grad_(False)
+
+    def masked_encoding_retention(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        mask_token: Optional[torch.Tensor] = None,
+        return_keys: Literal["all", "features", "embedding"] = "features",
+    ) -> TokenRetentionResultType:
+        x = self.stem(x)
+        x = mask_tensor(x, mask, patch_factor=self.max_stride // self.stem_stride, mask_token=mask_token)
+        if self.grad_checkpointing is True and torch.is_grad_enabled() is True and not torch.jit.is_scripting():
+            if self.grad_checkpointing_segments is None:
+                segments = len(self._grad_checkpointing_blocks)
+            else:
+                segments = min(self.grad_checkpointing_segments, len(self._grad_checkpointing_blocks))
+
+            x = checkpoint_sequential(
+                self._grad_checkpointing_blocks,
+                segments,
+                x,
+                use_reentrant=self.grad_checkpointing_use_reentrant,
+                preserve_rng_state=self.grad_checkpointing_preserve_rng_state,
+            )
+        else:
+            x = self.body(x)
+
+        result: TokenRetentionResultType = {}
+        if return_keys in ("all", "features"):
+            result["features"] = x
+        if return_keys in ("all", "embedding"):
+            result["embedding"] = self.features(x)
+
+        return result
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        if self.grad_checkpointing is True and torch.is_grad_enabled() is True and not torch.jit.is_scripting():
+            if self.grad_checkpointing_segments is None:
+                segments = len(self._grad_checkpointing_blocks)
+            else:
+                segments = min(self.grad_checkpointing_segments, len(self._grad_checkpointing_blocks))
+
+            return checkpoint_sequential(
+                self._grad_checkpointing_blocks,
+                segments,
+                x,
+                use_reentrant=self.grad_checkpointing_use_reentrant,
+                preserve_rng_state=self.grad_checkpointing_preserve_rng_state,
+            )
+
+        return self.body(x)
+
+    def embedding_from_features(self, features: torch.Tensor) -> torch.Tensor:
+        return self.features(features)
+
+
+registry.register_model_config(
+    "convnext_v1_atto",  # Not in the original v1, taken from v2
+    ConvNeXt_v1,
+    config={"in_channels": [40, 80, 160, 320], "num_layers": [2, 2, 6, 2], "drop_path_rate": 0.0},
+)
+registry.register_model_config(
+    "convnext_v1_femto",  # Not in the original v1, taken from v2
+    ConvNeXt_v1,
+    config={"in_channels": [48, 96, 192, 384], "num_layers": [2, 2, 6, 2], "drop_path_rate": 0.0},
+)
+registry.register_model_config(
+    "convnext_v1_pico",  # Not in the original v1, taken from v2
+    ConvNeXt_v1,
+    config={"in_channels": [64, 128, 256, 512], "num_layers": [2, 2, 6, 2], "drop_path_rate": 0.0},
+)
+registry.register_model_config(
+    "convnext_v1_nano",  # Not in the original v1, taken from v2
+    ConvNeXt_v1,
+    config={"in_channels": [80, 160, 320, 640], "num_layers": [2, 2, 8, 2], "drop_path_rate": 0.1},
+)
+registry.register_model_config(
+    "convnext_v1_tiny",
+    ConvNeXt_v1,
+    config={"in_channels": [96, 192, 384, 768], "num_layers": [3, 3, 9, 3], "drop_path_rate": 0.1},
+)
+registry.register_model_config(
+    "convnext_v1_small",
+    ConvNeXt_v1,
+    config={"in_channels": [96, 192, 384, 768], "num_layers": [3, 3, 27, 3], "drop_path_rate": 0.4},
+)
+registry.register_model_config(
+    "convnext_v1_base",
+    ConvNeXt_v1,
+    config={"in_channels": [128, 256, 512, 1024], "num_layers": [3, 3, 27, 3], "drop_path_rate": 0.5},
+)
+registry.register_model_config(
+    "convnext_v1_large",
+    ConvNeXt_v1,
+    config={"in_channels": [192, 384, 768, 1536], "num_layers": [3, 3, 27, 3], "drop_path_rate": 0.5},
+)
+registry.register_model_config(
+    "convnext_v1_xlarge",
+    ConvNeXt_v1,
+    config={"in_channels": [256, 512, 1024, 2048], "num_layers": [3, 3, 27, 3], "drop_path_rate": 0.5},
+)
+registry.register_model_config(
+    "convnext_v1_huge",  # Not in the original v1, taken from v2
+    ConvNeXt_v1,
+    config={"in_channels": [352, 704, 1408, 2816], "num_layers": [3, 3, 27, 3], "drop_path_rate": 0.5},
+)
+
+registry.register_weights(
+    "convnext_v1_tiny_eu-common256px",
+    {
+        "url": "https://huggingface.co/birder-project/convnext_v1_tiny_eu-common/resolve/main",
+        "description": "ConvNeXt v1 Tiny model trained on the eu-common dataset",
+        "resolution": (256, 256),
+        "formats": {
+            "pt": {
+                "file_size": 108.3,
+                "sha256": "38ef8694710eb506a062b4a11932eb7a65829a7e0ba56060a20ce057810d2ae9",
+            }
+        },
+        "net": {"network": "convnext_v1_tiny", "tag": "eu-common256px"},
+    },
+)
+registry.register_weights(
+    "convnext_v1_tiny_eu-common",
+    {
+        "url": "https://huggingface.co/birder-project/convnext_v1_tiny_eu-common/resolve/main",
+        "description": "ConvNeXt v1 Tiny model trained on the eu-common dataset",
+        "resolution": (384, 384),
+        "formats": {
+            "pt": {
+                "file_size": 108.3,
+                "sha256": "f23b018aa729e8e6620e5dd8088fbe1041b575e60ec555f4a61b5e22d004fa87",
+            }
+        },
+        "net": {"network": "convnext_v1_tiny", "tag": "eu-common"},
+    },
+)

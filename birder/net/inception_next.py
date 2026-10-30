@@ -1,0 +1,371 @@
+"""
+InceptionNeXt, adapted from
+https://github.com/sail-sg/inceptionnext/blob/main/models/inceptionnext.py
+
+Paper "InceptionNeXt: When Inception Meets ConvNeXt", https://arxiv.org/abs/2303.16900
+"""
+
+# Reference license: Apache-2.0
+
+from collections import OrderedDict
+from collections.abc import Callable
+from typing import Any
+from typing import Literal
+from typing import Optional
+
+import torch
+from torch import nn
+from torchvision.ops import Conv2dNormActivation
+from torchvision.ops import StochasticDepth
+
+from birder.common.masking import mask_tensor
+from birder.model_registry import registry
+from birder.net.base import DetectorBackbone
+from birder.net.base import MaskedTokenRetentionMixin
+from birder.net.base import PreTrainEncoder
+from birder.net.base import TokenRetentionResultType
+from birder.net.base import staged_stochastic_depth_rates
+
+
+class InceptionDWConv2d(nn.Module):
+    def __init__(self, in_channels: int, square_kernel_size: int, band_kernel_size: int, branch_ratio: float) -> None:
+        super().__init__()
+
+        branch_channels = int(in_channels * branch_ratio)
+        self.dwconv_hw = nn.Conv2d(
+            branch_channels,
+            branch_channels,
+            kernel_size=(square_kernel_size, square_kernel_size),
+            stride=(1, 1),
+            padding=square_kernel_size // 2,
+            groups=branch_channels,
+        )
+        self.dwconv_w = nn.Conv2d(
+            branch_channels,
+            branch_channels,
+            kernel_size=(1, band_kernel_size),
+            stride=(1, 1),
+            padding=(0, band_kernel_size // 2),
+            groups=branch_channels,
+        )
+        self.dwconv_h = nn.Conv2d(
+            branch_channels,
+            branch_channels,
+            kernel_size=(band_kernel_size, 1),
+            stride=(1, 1),
+            padding=(band_kernel_size // 2, 0),
+            groups=branch_channels,
+        )
+        self.split_indexes = (
+            in_channels - (3 * branch_channels),
+            branch_channels,
+            branch_channels,
+            branch_channels,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_id, x_hw, x_w, x_h = torch.split(x, self.split_indexes, dim=1)
+        x_hw = self.dwconv_hw(x_hw)
+        x_w = self.dwconv_w(x_w)
+        x_h = self.dwconv_h(x_h)
+
+        return torch.concat((x_id, x_hw, x_w, x_h), dim=1)
+
+
+class ConvMLP(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: int,
+        out_features: int,
+        act_layer: Callable[..., nn.Module] = nn.GELU,
+    ) -> None:
+        super().__init__()
+        self.fc1 = nn.Conv2d(in_features, hidden_features, kernel_size=(1, 1), stride=(1, 1), padding=(0, 0))
+        self.act = act_layer()
+        self.fc2 = nn.Conv2d(hidden_features, out_features, kernel_size=(1, 1), stride=(1, 1), padding=(0, 0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.fc2(x)
+
+        return x
+
+
+class InceptionNeXtBlock(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        mlp_ratio: float,
+        layer_scale: float,
+        band_kernel_size: int,
+        branch_ratio: float,
+        stochastic_depth_prob: float,
+    ) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            InceptionDWConv2d(
+                channels, square_kernel_size=3, band_kernel_size=band_kernel_size, branch_ratio=branch_ratio
+            ),
+            nn.BatchNorm2d(channels),
+            ConvMLP(channels, hidden_features=int(mlp_ratio * channels), out_features=channels),
+        )
+        self.layer_scale = nn.Parameter(torch.ones(channels, 1, 1) * layer_scale)
+        self.stochastic_depth = StochasticDepth(stochastic_depth_prob, mode="row")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        x = self.layer_scale * self.block(x)
+        x = self.stochastic_depth(x) + identity
+
+        return x
+
+
+class InceptionNeXtStage(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int,
+        depth: int,
+        drop_path_rates: list[float],
+        mlp_ratio: float,
+        layer_scale: float,
+        band_kernel_size: int,
+        branch_ratio: float,
+    ) -> None:
+        super().__init__()
+        if stride > 1:
+            self.downsample = nn.Sequential(
+                nn.BatchNorm2d(in_channels),
+                nn.Conv2d(
+                    in_channels, out_channels, kernel_size=(stride, stride), stride=(stride, stride), padding=(0, 0)
+                ),
+            )
+
+        else:
+            self.downsample = nn.Identity()
+
+        stage_blocks = []
+        for i in range(depth):
+            stage_blocks.append(
+                InceptionNeXtBlock(
+                    channels=out_channels,
+                    mlp_ratio=mlp_ratio,
+                    layer_scale=layer_scale,
+                    band_kernel_size=band_kernel_size,
+                    branch_ratio=branch_ratio,
+                    stochastic_depth_prob=drop_path_rates[i],
+                )
+            )
+
+        self.blocks = nn.Sequential(*stage_blocks)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.downsample(x)
+        x = self.blocks(x)
+
+        return x
+
+
+class Inception_NeXt(DetectorBackbone, PreTrainEncoder, MaskedTokenRetentionMixin):
+    block_group_regex = r"body\.stage(\d+)\.blocks\.(\d+)"
+
+    def __init__(
+        self,
+        input_channels: int,
+        num_classes: int,
+        *,
+        config: Optional[dict[str, Any]] = None,
+        size: Optional[tuple[int, int]] = None,
+    ) -> None:
+        super().__init__(input_channels, num_classes, config=config, size=size)
+        assert self.config is not None, "must set config"
+
+        layer_scale = 1e-6
+        mlp_ratios = [4, 4, 4, 3]
+        channels: list[int] = self.config["channels"]
+        num_layers: list[int] = self.config["num_layers"]
+        band_kernel_size: int = self.config["band_kernel_size"]
+        branch_ratio: float = self.config["branch_ratio"]
+        self.mlp_head = self.config.get("mlp_head", True)
+        drop_path_rate: float = self.config["drop_path_rate"]
+
+        self.stem = Conv2dNormActivation(
+            self.input_channels,
+            channels[0],
+            kernel_size=(4, 4),
+            stride=(4, 4),
+            padding=(0, 0),
+            bias=True,
+            activation_layer=None,
+        )
+
+        num_stage = len(num_layers)
+        dp_rates = staged_stochastic_depth_rates(drop_path_rate, num_layers)
+
+        stages: OrderedDict[str, nn.Module] = OrderedDict()
+        return_channels: list[int] = []
+        prev_chs = channels[0]
+        for i in range(num_stage):
+            out_chs = channels[i]
+            if i > 0:
+                stride = 2
+            else:
+                stride = 1
+
+            stages[f"stage{i+1}"] = InceptionNeXtStage(
+                prev_chs,
+                out_chs,
+                stride=stride,
+                depth=num_layers[i],
+                drop_path_rates=dp_rates[i],
+                mlp_ratio=mlp_ratios[i],
+                layer_scale=layer_scale,
+                band_kernel_size=band_kernel_size,
+                branch_ratio=branch_ratio,
+            )
+            return_channels.append(out_chs)
+            prev_chs = out_chs
+
+        self.body = nn.Sequential(stages)
+        self.features = nn.Sequential(
+            nn.AdaptiveAvgPool2d(output_size=(1, 1)),
+            nn.Flatten(1),
+        )
+        self.return_channels = return_channels
+        self.embedding_size = channels[-1]
+        self.classifier = self.create_classifier()
+
+        self.max_stride = 4 * 2 ** (num_stage - 1)
+        self.stem_stride = 4
+        self.stem_width = channels[0]
+        self.feature_dim = channels[-1]
+
+        # Weight initialization
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def detection_features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        x = self.stem(x)
+
+        out = {}
+        for name, module in self.body.named_children():
+            x = module(x)
+            if name in self.return_stages:
+                out[name] = x
+
+        return out
+
+    def freeze_stages(self, up_to_stage: int) -> None:
+        for param in self.stem.parameters():
+            param.requires_grad_(False)
+
+        for idx, module in enumerate(self.body.children()):
+            if idx >= up_to_stage:
+                break
+
+            for param in module.parameters():
+                param.requires_grad_(False)
+
+    def masked_encoding_retention(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        mask_token: Optional[torch.Tensor] = None,
+        return_keys: Literal["all", "features", "embedding"] = "features",
+    ) -> TokenRetentionResultType:
+        x = self.stem(x)
+        x = mask_tensor(x, mask, patch_factor=self.max_stride // self.stem_stride, mask_token=mask_token)
+        x = self.body(x)
+
+        result: TokenRetentionResultType = {}
+        if return_keys in ("all", "features"):
+            result["features"] = x
+        if return_keys in ("all", "embedding"):
+            result["embedding"] = self.features(x)
+
+        return result
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        return self.body(x)
+
+    def embedding_from_features(self, features: torch.Tensor) -> torch.Tensor:
+        return self.features(features)
+
+
+registry.register_model_config(
+    "inception_next_a",
+    Inception_NeXt,
+    config={
+        "channels": [40, 80, 160, 320],
+        "num_layers": [2, 2, 6, 2],
+        "band_kernel_size": 9,
+        "branch_ratio": 0.25,
+        "drop_path_rate": 0.1,
+    },
+)
+registry.register_model_config(
+    "inception_next_t",
+    Inception_NeXt,
+    config={
+        "channels": [96, 192, 384, 768],
+        "num_layers": [3, 3, 9, 3],
+        "band_kernel_size": 11,
+        "branch_ratio": 0.125,
+        "drop_path_rate": 0.1,
+    },
+)
+registry.register_model_config(
+    "inception_next_s",
+    Inception_NeXt,
+    config={
+        "channels": [96, 192, 384, 768],
+        "num_layers": [3, 3, 27, 3],
+        "band_kernel_size": 11,
+        "branch_ratio": 0.125,
+        "drop_path_rate": 0.3,
+    },
+)
+registry.register_model_config(
+    "inception_next_b",
+    Inception_NeXt,
+    config={
+        "channels": [128, 256, 512, 1024],
+        "num_layers": [3, 3, 27, 3],
+        "band_kernel_size": 11,
+        "branch_ratio": 0.125,
+        "drop_path_rate": 0.4,
+    },
+)
+registry.register_model_config(
+    "inception_next_l",
+    Inception_NeXt,
+    config={
+        "channels": [192, 384, 768, 1536],
+        "num_layers": [3, 3, 27, 3],
+        "band_kernel_size": 11,
+        "branch_ratio": 0.125,
+        "drop_path_rate": 0.5,
+    },
+)
+
+registry.register_weights(
+    "inception_next_a_il-common",
+    {
+        "description": "InceptionNeXt Atto model trained on the il-common dataset",
+        "resolution": (256, 256),
+        "formats": {
+            "pt": {
+                "file_size": 13.7,
+                "sha256": "c9e451c8dc44727acedfac400cee9d14eac5ba6b4edbfe79efcfd8802453c506",
+            }
+        },
+        "net": {"network": "inception_next_a", "tag": "il-common"},
+    },
+)

@@ -1,0 +1,70 @@
+{
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.DS_Store": true,
+    "**/.git": true,
+    "**/.mypy_cache": true,
+    "**/.pytest_cache": true,
+    ".venv/": true,
+    "data": true,
+    "logs": true,
+    "models": true,
+    "results": true,
+    "runs": true
+  },
+  "search.exclude": {
+    "**/__pycache__": true,
+    "**/.mypy_cache": true,
+    "**/.pytest_cache": true,
+    ".venv": true,
+    "data": true,
+    "logs": true,
+    "models": true,
+    "results": true,
+    "runs": true
+  },
+  "files.watcherExclude": {
+    "**/.git/**": true,
+    "**/__pycache__/**": true,
+    "**/.mypy_cache/**": true,
+    "**/.pytest_cache/**": true,
+    ".venv/**": true,
+    "data/**": true,
+    "logs/**": true,
+    "models/**": true,
+    "results/**": true,
+    "runs/**": true
+  },
+  "[json]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "[jsonc]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "[markdown]": {
+    "editor.defaultFormatter": "DavidAnson.vscode-markdownlint"
+  },
+  "markdownlint.config": {
+    "default": true,
+    "MD004": { "style": "dash" },
+    "MD007": { "indent": 4 }
+  },
+  "python.analysis.exclude": [
+    "**/node_modules",
+    "**/__pycache__",
+    "**/.*",
+    "**/.mypy_cache",
+    ".venv",
+    "data",
+    "logs",
+    "models",
+    "results",
+    "runs"
+  ],
+  "python.testing.unittestArgs": ["discover", "-s", "tests", "-v"],
+  "python.testing.pytestEnabled": false,
+  "python.testing.unittestEnabled": true,
+  "flake8.importStrategy": "fromEnvironment",
+  "pylint.importStrategy": "fromEnvironment",
+  "mypy-type-checker.importStrategy": "fromEnvironment"
+}

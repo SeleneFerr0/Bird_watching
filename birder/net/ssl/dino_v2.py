@@ -1,0 +1,694 @@
+"""
+DINO v2, adapted from
+https://github.com/facebookresearch/dinov2/tree/main/dinov2
+
+Paper "DINOv2: Learning Robust Visual Features without Supervision", https://arxiv.org/abs/2304.07193
+
+Changes from original:
+* Added optional SinkhornQueue to improve stability when using smaller batch sizes
+"""
+
+# Reference license: Apache-2.0
+
+from typing import Any
+from typing import Optional
+
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch import nn
+from torch.utils.checkpoint import checkpoint
+
+from birder.common import training_utils
+from birder.layers.moe import MoETrainingOutputType
+from birder.model_registry import registry
+from birder.net.base import MaskedTokenRetentionMixin
+from birder.net.base import PreTrainEncoder
+from birder.net.ssl.base import SSLBaseNet
+from birder.net.ssl.base import combine_moe_training_outputs
+
+
+class DINOHead(nn.Module):
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: Optional[int],
+        use_bn: bool,
+        num_layers: int,
+        hidden_dim: int,
+        bottleneck_dim: int,
+    ) -> None:
+        super().__init__()
+        if num_layers == 1:
+            self.mlp = nn.Linear(in_dim, bottleneck_dim)
+        else:
+            layers = [nn.Linear(in_dim, hidden_dim, bias=not use_bn)]
+            if use_bn is True:
+                layers.append(nn.BatchNorm1d(hidden_dim))
+
+            layers.append(nn.GELU())
+            for _ in range(num_layers - 2):
+                layers.append(nn.Linear(hidden_dim, hidden_dim, bias=not use_bn))
+                if use_bn is True:
+                    layers.append(nn.BatchNorm1d(hidden_dim))
+
+                layers.append(nn.GELU())
+
+            layers.append(nn.Linear(hidden_dim, bottleneck_dim))
+            self.mlp = nn.Sequential(*layers)
+
+        if out_dim is None:
+            # Use the normalized bottleneck directly, without prototypes (SimDINO v2)
+            self.last_layer = nn.Identity()
+        else:
+            self.last_layer = nn.utils.parametrizations.weight_norm(nn.Linear(bottleneck_dim, out_dim, bias=False))
+            self.last_layer.parametrizations.weight.original0.data.fill_(1)
+
+        # Weight initialization
+        for m in self.mlp.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        self.grad_checkpointing = False
+        self.grad_checkpointing_preserve_rng_state = True
+        self.grad_checkpointing_use_reentrant = False
+
+    def set_grad_checkpointing(
+        self, enable: bool = True, *, preserve_rng_state: bool = True, use_reentrant: bool = False
+    ) -> None:
+        self.grad_checkpointing = enable
+        self.grad_checkpointing_preserve_rng_state = preserve_rng_state
+        self.grad_checkpointing_use_reentrant = use_reentrant
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.grad_checkpointing is True and torch.is_grad_enabled() is True and not torch.jit.is_scripting():
+            x = checkpoint(
+                self.mlp,
+                x,
+                use_reentrant=self.grad_checkpointing_use_reentrant,
+                preserve_rng_state=self.grad_checkpointing_preserve_rng_state,
+            )
+        else:
+            x = self.mlp(x)
+
+        eps = 1e-6 if x.dtype == torch.float16 else 1e-12
+        x = F.normalize(x, dim=-1, p=2, eps=eps)
+        x = self.last_layer(x)
+
+        return x
+
+    def cancel_last_layer_gradients(self) -> None:
+        self.last_layer.zero_grad()
+
+
+class SinkhornQueue(nn.Module):
+    def __init__(self, queue_size: int, dim: int) -> None:
+        super().__init__()
+        self.queue_size = queue_size
+        self.active = True
+        self.queue = nn.Buffer(torch.empty(queue_size, dim))
+        self._queue_ptr = 0
+        self._queue_full = False
+
+    def get_extra_state(self) -> dict[str, int | bool]:
+        return {
+            "version": 1,
+            "queue_ptr": self._queue_ptr,
+            "queue_full": self._queue_full,
+        }
+
+    def set_extra_state(self, state: dict[str, int | bool]) -> None:
+        if state["version"] != 1:
+            raise ValueError(f"Unsupported SinkhornQueue state version: {state['version']}")
+
+        self._queue_ptr = int(state["queue_ptr"])
+        self._queue_full = bool(state["queue_full"])
+
+    def set_active(self, active: bool) -> None:
+        self.active = active
+
+    def get(self) -> Optional[torch.Tensor]:
+        if self.active is False:
+            return None
+        if self._queue_full is False:
+            return None
+
+        return self.queue
+
+    @torch.no_grad()  # type: ignore[untyped-decorator]
+    def forward(self, values: torch.Tensor) -> None:
+        if self.active is False:
+            return
+        if values.numel() == 0:
+            return
+        if values.dim() != 2:
+            raise ValueError("SinkhornQueue expects a 2D tensor")
+
+        values = values.detach()
+        if values.size(0) >= self.queue_size:
+            self.queue.copy_(values[-self.queue_size :])
+            self._queue_ptr = 0
+            self._queue_full = True
+            return
+
+        ptr = self._queue_ptr
+        end = ptr + values.size(0)
+        if end <= self.queue_size:
+            self.queue[ptr:end].copy_(values)
+        else:
+            first = self.queue_size - ptr
+            self.queue[ptr:].copy_(values[:first])
+            self.queue[: end - self.queue_size].copy_(values[first:])
+
+        self._queue_ptr = end % self.queue_size
+        self._queue_full |= end >= self.queue_size
+
+
+class SinkhornKnoppNormalization(nn.Module):
+    @torch.no_grad()  # type: ignore[untyped-decorator]
+    def forward(
+        self,
+        teacher_output: torch.Tensor,
+        queue_output: Optional[torch.Tensor],
+        teacher_temp: torch.Tensor,
+        n_iterations: int = 3,
+    ) -> torch.Tensor:
+        if queue_output is None:
+            work_output = teacher_output.to(dtype=torch.float32, copy=True)
+        else:
+            work_output = torch.concat([teacher_output, queue_output], dim=0).float()
+
+        work_output.div_(teacher_temp).exp_()
+        q = work_output.t()  # Q is K-by-B for consistency with notations from the paper
+
+        for iteration in range(n_iterations):
+            sum_of_rows = torch.sum(q, dim=1, keepdim=True)
+            if training_utils.is_dist_available_and_initialized() is True:
+                dist.all_reduce(sum_of_rows)
+
+            if queue_output is not None and iteration == n_iterations - 1:
+                # Queue rows have already contributed to the final prototype sums and can now be discarded
+                current_output = q.t()[: teacher_output.size(0)] / sum_of_rows.t()
+                current_output /= torch.sum(current_output, dim=1, keepdim=True)
+
+                return current_output
+
+            # Normalize each prototype globally
+            q /= sum_of_rows
+
+            # Normalize each sample locally
+            q /= torch.sum(q, dim=0, keepdim=True)
+
+        if queue_output is None:
+            return q.t()
+
+        # Preserve the current-batch-only return contract when no Sinkhorn iterations are requested
+        return q.t()[: teacher_output.size(0)].clone()
+
+
+class DINOLoss(nn.Module):
+    def __init__(
+        self, out_dim: int, student_temp: float, center_momentum: float, queue_size: Optional[int] = None
+    ) -> None:
+        super().__init__()
+        self.student_temp = student_temp
+        self.center_momentum = center_momentum
+        self.center = nn.Buffer(torch.zeros(1, out_dim))
+        self.sinkhorn_normalizer = SinkhornKnoppNormalization()
+        if queue_size is None:
+            self.sinkhorn_queue = None
+        else:
+            self.sinkhorn_queue = SinkhornQueue(queue_size, dim=out_dim)
+
+        self.updated = True
+        self.reduce_handle: Any = None
+        self.len_teacher_output: Optional[int] = None
+        self.async_batch_center: Optional[torch.Tensor] = None
+
+    def forward(
+        self, student_output_list: list[torch.Tensor], teacher_out_softmax_centered_list: list[torch.Tensor]
+    ) -> torch.Tensor:
+        s = torch.stack(student_output_list, 0).float()
+        t = torch.stack(teacher_out_softmax_centered_list, 0).float()
+        lsm = F.log_softmax(s / self.student_temp, dim=-1)
+        loss = -(torch.einsum("tbk,sbk->tsb", t, lsm).mean(-1).sum())
+
+        return loss
+
+    def forward_reference(
+        self, student_output_list: list[torch.Tensor], teacher_out_softmax_centered_list: list[torch.Tensor]
+    ) -> torch.Tensor:
+        total_loss = 0.0
+        for s in student_output_list:
+            lsm = F.log_softmax(s.float() / self.student_temp, dim=-1)
+            for t in teacher_out_softmax_centered_list:
+                loss = torch.sum(t.float() * lsm, dim=-1)
+                total_loss -= loss.mean()
+
+        return total_loss
+
+    def set_queue_active(self, active: bool) -> None:
+        if self.sinkhorn_queue is not None:
+            self.sinkhorn_queue.set_active(active)
+
+    @torch.no_grad()  # type: ignore[untyped-decorator]
+    def softmax_center_teacher(self, teacher_output: torch.Tensor, teacher_temp: torch.Tensor) -> torch.Tensor:
+        self.apply_center_update()
+        return F.softmax((teacher_output - self.center) / teacher_temp, dim=-1)
+
+    @torch.no_grad()  # type: ignore[untyped-decorator]
+    def sinkhorn_knopp_teacher(
+        self, teacher_output: torch.Tensor, teacher_temp: torch.Tensor, n_iterations: int = 3
+    ) -> torch.Tensor:
+        if self.sinkhorn_queue is not None:
+            queue = self.sinkhorn_queue.get()
+        else:
+            queue = None
+
+        normalized_output = self.sinkhorn_normalizer(teacher_output, queue, teacher_temp, n_iterations)
+
+        if self.sinkhorn_queue is not None:
+            self.sinkhorn_queue(teacher_output)
+
+        return normalized_output
+
+    @torch.no_grad()  # type: ignore[untyped-decorator]
+    def update_center(self, teacher_output: torch.Tensor) -> None:
+        self.reduce_center_update(teacher_output)
+
+    @torch.no_grad()  # type: ignore[untyped-decorator]
+    def reduce_center_update(self, teacher_output: torch.Tensor) -> None:
+        self.updated = False
+        self.len_teacher_output = len(teacher_output)
+        self.async_batch_center = torch.sum(teacher_output, dim=0, keepdim=True)
+        if training_utils.is_dist_available_and_initialized() is True:
+            self.reduce_handle = dist.all_reduce(self.async_batch_center, async_op=True)
+
+    @torch.no_grad()  # type: ignore[untyped-decorator]
+    def apply_center_update(self) -> None:
+        if self.updated is False:
+            world_size = training_utils.get_world_size()
+            if self.reduce_handle is not None:
+                self.reduce_handle.wait()
+
+            _t = self.async_batch_center / (self.len_teacher_output * world_size)  # type: ignore[operator]
+            self.center = self.center * self.center_momentum + _t * (1 - self.center_momentum)
+            self.updated = True
+
+
+class iBOTPatchLoss(nn.Module):
+    def __init__(
+        self, patch_out_dim: int, student_temp: float, center_momentum: float, queue_size: Optional[int] = None
+    ) -> None:
+        super().__init__()
+        self.student_temp = student_temp
+        self.center_momentum = center_momentum
+        self.center = nn.Buffer(torch.zeros(1, 1, patch_out_dim))
+        self.sinkhorn_normalizer = SinkhornKnoppNormalization()
+        if queue_size is None:
+            self.sinkhorn_queue = None
+        else:
+            self.sinkhorn_queue = SinkhornQueue(queue_size, dim=patch_out_dim)
+
+        self.updated = True
+        self.reduce_handle: Any = None
+        self.len_teacher_patch_tokens: Optional[int] = None
+        self.async_batch_center: Optional[torch.Tensor] = None
+
+    def forward(
+        self,
+        student_patch_tokens_masked: torch.Tensor,
+        teacher_patch_tokens_masked: torch.Tensor,
+        student_masks_flat: torch.Tensor,
+        masks_weight: torch.Tensor,
+        n_masked_patches: Optional[int] = None,
+    ) -> torch.Tensor:
+        t = teacher_patch_tokens_masked.float()
+        s = student_patch_tokens_masked.float()
+        loss = torch.sum(t * F.log_softmax(s / self.student_temp, dim=-1), dim=-1)
+        if n_masked_patches is not None:
+            loss = loss[:n_masked_patches]
+
+        loss = loss * masks_weight
+
+        return -loss.sum() / student_masks_flat.size(0)
+
+    def forward_no_masks(
+        self, student_patch_tokens: torch.Tensor, teacher_patch_tokens: torch.Tensor, student_masks_flat: torch.Tensor
+    ) -> torch.Tensor:
+        loss = torch.sum(
+            teacher_patch_tokens.float() * F.log_softmax(student_patch_tokens.float() / self.student_temp, dim=-1),
+            dim=-1,
+        )
+        loss = torch.sum(loss * student_masks_flat.float(), dim=-1) / student_masks_flat.sum(dim=-1).clamp(min=1.0)
+
+        return -loss.mean()
+
+    def set_queue_active(self, active: bool) -> None:
+        if self.sinkhorn_queue is not None:
+            self.sinkhorn_queue.set_active(active)
+
+    @torch.no_grad()  # type: ignore[untyped-decorator]
+    def softmax_center_teacher(self, teacher_patch_tokens: torch.Tensor, teacher_temp: torch.Tensor) -> torch.Tensor:
+        self.apply_center_update()
+        return F.softmax((teacher_patch_tokens - self.center) / teacher_temp, dim=-1)
+
+    @torch.no_grad()  # type: ignore[untyped-decorator]
+    def sinkhorn_knopp_teacher(
+        self,
+        teacher_output: torch.Tensor,
+        teacher_temp: torch.Tensor,
+        n_iterations: int = 3,
+    ) -> torch.Tensor:
+        if self.sinkhorn_queue is not None:
+            queue = self.sinkhorn_queue.get()
+        else:
+            queue = None
+
+        normalized_output = self.sinkhorn_normalizer(teacher_output, queue, teacher_temp, n_iterations)
+
+        if self.sinkhorn_queue is not None:
+            self.sinkhorn_queue(teacher_output)
+
+        return normalized_output
+
+    @torch.no_grad()  # type: ignore[untyped-decorator]
+    def update_center(self, teacher_patch_tokens: torch.Tensor) -> None:
+        self.reduce_center_update(teacher_patch_tokens)
+
+    @torch.no_grad()  # type: ignore[untyped-decorator]
+    def reduce_center_update(self, teacher_patch_tokens: torch.Tensor) -> None:
+        self.updated = False
+        self.len_teacher_patch_tokens = len(teacher_patch_tokens)
+        self.async_batch_center = torch.sum(teacher_patch_tokens.mean(1), dim=0, keepdim=True)
+        if training_utils.is_dist_available_and_initialized() is True:
+            self.reduce_handle = dist.all_reduce(self.async_batch_center, async_op=True)
+
+    @torch.no_grad()  # type: ignore[untyped-decorator]
+    def apply_center_update(self) -> None:
+        if self.updated is False:
+            world_size = training_utils.get_world_size()
+            if self.reduce_handle is not None:
+                self.reduce_handle.wait()
+
+            _t = self.async_batch_center / (self.len_teacher_patch_tokens * world_size)  # type: ignore[operator]
+            self.center = self.center * self.center_momentum + _t * (1 - self.center_momentum)
+            self.updated = True
+
+
+class KoLeoLoss(nn.Module):
+    """
+    Kozachenko-Leonenko entropic loss regularizer from:
+    Spreading vectors for similarity search - https://arxiv.org/abs/1806.03198
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pdist = nn.PairwiseDistance(2, eps=1e-8)
+
+    def pairwise_nn_inner(self, x: torch.Tensor) -> torch.Tensor:
+        # Pairwise dot products
+        dots = torch.mm(x, x.t())
+        n = x.size(0)
+        dots.view(-1)[:: (n + 1)].fill_(-1)  # Trick to fill diagonal with -1
+
+        # Max inner prod -> min distance
+        ind = torch.argmax(dots, dim=1)
+
+        return ind
+
+    def forward(self, student_output: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        with torch.amp.autocast(student_output.device.type, enabled=False):
+            student_output = F.normalize(student_output, eps=eps, p=2, dim=-1)
+            ind = self.pairwise_nn_inner(student_output)
+            distances = self.pdist(student_output, student_output[ind])  # BxD, BxD -> B
+            loss = -torch.log(distances + eps).mean()
+
+        return loss
+
+
+class DINOv2Student(SSLBaseNet):
+    default_size = (224, 224)
+
+    def __init__(
+        self,
+        backbone: PreTrainEncoder,
+        *,
+        config: Optional[dict[str, Any]] = None,
+        size: Optional[tuple[int, int]] = None,
+    ) -> None:
+        super().__init__(backbone, config=config, size=size)
+        assert self.config is not None, "must set config"
+        assert isinstance(self.backbone, MaskedTokenRetentionMixin)
+
+        dino_out_dim: Optional[int] = self.config["dino_out_dim"]
+        use_bn: bool = self.config["use_bn"]
+        num_layers: int = self.config["num_layers"]
+        hidden_dim: int = self.config["hidden_dim"]
+        head_bottleneck_dim: int = self.config["head_bottleneck_dim"]
+        ibot_separate_head: bool = self.config["ibot_separate_head"]
+        ibot_out_dim: Optional[int] = self.config.get("ibot_out_dim", dino_out_dim)
+
+        assert ibot_separate_head is True or self.backbone.feature_dim == self.backbone.embedding_size
+
+        self.dino_head = DINOHead(
+            self.backbone.embedding_size,
+            dino_out_dim,
+            use_bn=use_bn,
+            num_layers=num_layers,
+            hidden_dim=hidden_dim,
+            bottleneck_dim=head_bottleneck_dim,
+        )
+        if ibot_separate_head is False:
+            self.ibot_head = None
+        else:
+            self.ibot_head = DINOHead(
+                self.backbone.feature_dim,
+                ibot_out_dim,
+                use_bn=use_bn,
+                num_layers=num_layers,
+                hidden_dim=hidden_dim,
+                bottleneck_dim=head_bottleneck_dim,
+            )
+
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, 1, self.backbone.stem_width))
+
+    def set_grad_checkpointing(
+        self,
+        enable: bool = True,
+        *,
+        segments: Optional[int] = None,
+        preserve_rng_state: bool = True,
+        use_reentrant: bool = False,
+    ) -> None:
+        self.backbone.set_grad_checkpointing(
+            enable=enable, segments=segments, preserve_rng_state=preserve_rng_state, use_reentrant=use_reentrant
+        )
+        self.dino_head.set_grad_checkpointing(
+            enable=enable, preserve_rng_state=preserve_rng_state, use_reentrant=use_reentrant
+        )
+        if self.ibot_head is not None:
+            self.ibot_head.set_grad_checkpointing(
+                enable=enable, preserve_rng_state=preserve_rng_state, use_reentrant=use_reentrant
+            )
+
+    # pylint: disable=arguments-differ
+    def forward(  # type: ignore[override]
+        self,
+        global_crops: torch.Tensor,
+        local_crops: torch.Tensor,
+        mask: torch.Tensor,
+        upper_bound: int,
+        mask_indices_list: torch.Tensor,
+        *,
+        return_moe_training_output: bool = False,
+    ) -> dict[str, Any]:
+        n_masked_patches = mask_indices_list.size(0)
+
+        if return_moe_training_output is True:
+            global_out = self.backbone.masked_encoding_retention(
+                global_crops, mask, self.mask_token, return_keys="all", return_moe_training_output=True
+            )
+        else:
+            global_out = self.backbone.masked_encoding_retention(global_crops, mask, self.mask_token, return_keys="all")
+
+        global_features = global_out["features"]
+        global_features = global_features.flatten(2).transpose(1, 2)
+        global_embedding = global_out["embedding"]
+
+        moe_training_output: Optional[MoETrainingOutputType] = None
+        if "moe_training_output" in global_out:
+            moe_training_output = global_out["moe_training_output"]
+
+        if return_moe_training_output is True:
+            local_features, local_moe_training_output = self.backbone.forward_features(
+                local_crops, return_moe_training_output=True  # type: ignore[call-arg]
+            )
+            moe_training_output = combine_moe_training_outputs(
+                moe_training_output, local_moe_training_output, additional_loss_weight=0.1
+            )
+        else:
+            local_features = self.backbone.forward_features(local_crops)
+
+        local_embedding = self.backbone.embedding_from_features(local_features)
+
+        global_embedding_after_head = self.dino_head(global_embedding)
+        local_embedding_after_head = self.dino_head(local_embedding)
+
+        patch_dim = global_features.size(-1)
+        buffer_tensor_patch_tokens = global_features.new_zeros(upper_bound, patch_dim)
+        buffer_tensor_patch_tokens[:n_masked_patches].copy_(
+            torch.index_select(global_features.flatten(0, 1), dim=0, index=mask_indices_list)
+        )
+
+        if self.ibot_head is None:
+            global_masked_patch_tokens_after_head = self.dino_head(buffer_tensor_patch_tokens)[:n_masked_patches]
+        else:
+            global_masked_patch_tokens_after_head = self.ibot_head(buffer_tensor_patch_tokens)[:n_masked_patches]
+
+        outputs = {
+            "global_embedding": global_embedding,
+            "global_embedding_after_head": global_embedding_after_head,
+            "local_embedding_after_head": local_embedding_after_head,
+            "global_masked_patch_tokens_after_head": global_masked_patch_tokens_after_head,
+        }
+        if moe_training_output is not None:
+            outputs["moe_training_output"] = moe_training_output
+
+        return outputs
+
+
+class DINOv2Teacher(SSLBaseNet):
+    def __init__(
+        self,
+        backbone: PreTrainEncoder,
+        *,
+        config: Optional[dict[str, Any]] = None,
+        size: Optional[tuple[int, int]] = None,
+    ) -> None:
+        super().__init__(backbone, config=config, size=size)
+        assert self.config is not None, "must set config"
+        assert isinstance(self.backbone, MaskedTokenRetentionMixin)
+
+        dino_out_dim: Optional[int] = self.config["dino_out_dim"]
+        use_bn: bool = self.config["use_bn"]
+        num_layers: int = self.config["num_layers"]
+        hidden_dim: int = self.config["hidden_dim"]
+        head_bottleneck_dim: int = self.config["head_bottleneck_dim"]
+        ibot_separate_head: bool = self.config["ibot_separate_head"]
+        ibot_out_dim: Optional[int] = self.config.get("ibot_out_dim", dino_out_dim)
+
+        assert ibot_separate_head is True or self.backbone.feature_dim == self.backbone.embedding_size
+
+        self.dino_head = DINOHead(
+            self.backbone.embedding_size,
+            dino_out_dim,
+            use_bn=use_bn,
+            num_layers=num_layers,
+            hidden_dim=hidden_dim,
+            bottleneck_dim=head_bottleneck_dim,
+        )
+        if ibot_separate_head is False:
+            self.ibot_head = None
+        else:
+            self.ibot_head = DINOHead(
+                self.backbone.feature_dim,
+                ibot_out_dim,
+                use_bn=use_bn,
+                num_layers=num_layers,
+                hidden_dim=hidden_dim,
+                bottleneck_dim=head_bottleneck_dim,
+            )
+
+        # Unused, Makes for an easier EMA update
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, 1, self.backbone.stem_width))
+
+    # pylint: disable=arguments-differ
+    def forward(  # type: ignore[override]
+        self,
+        x: torch.Tensor,
+        n_crops: int,
+        upper_bound: int,
+        mask_indices_list: torch.Tensor,
+        target_feature_size: Optional[tuple[int, int]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        n_masked_patches = mask_indices_list.size(0)
+
+        seq_len = (x.size(2) // self.backbone.max_stride) * (x.size(3) // self.backbone.max_stride)
+        mask = torch.zeros([x.size(0), seq_len], device=x.device)
+
+        out = self.backbone.masked_encoding_retention(x, mask=mask, return_keys="all")
+        features = out["features"]
+        if target_feature_size is not None:
+            features = F.interpolate(features, size=target_feature_size, mode="bilinear", align_corners=False)
+
+        features = features.flatten(2).transpose(1, 2)
+        embedding = out["embedding"]
+
+        embedding = embedding.chunk(n_crops)
+        # NOTE: These are chunked and cat'd in reverse so A is matched to B in the global crops dino loss
+        embedding = torch.concat((embedding[1], embedding[0]))
+
+        patch_dim = features.size(-1)
+        n = embedding.size(0)
+
+        if self.ibot_head is None:
+            buffer_tensor = features.new_zeros(upper_bound + n, patch_dim)
+            buffer_tensor[:n].copy_(embedding)
+            torch.index_select(
+                features.flatten(0, 1),
+                dim=0,
+                index=mask_indices_list,
+                out=buffer_tensor[n : n + n_masked_patches],
+            )
+            tokens_after_head = self.dino_head(buffer_tensor)
+            embedding_after_head = tokens_after_head[:n]
+            masked_patch_tokens_after_head = tokens_after_head[n : n + n_masked_patches]
+        else:
+            buffer_teacher = features.new_zeros(upper_bound, patch_dim)
+            torch.index_select(
+                features.flatten(0, 1),
+                dim=0,
+                index=mask_indices_list,
+                out=buffer_teacher[:n_masked_patches],
+            )
+            embedding_after_head = self.dino_head(embedding)
+            masked_patch_tokens_after_head = self.ibot_head(buffer_teacher)[:n_masked_patches]
+
+        return (embedding_after_head, masked_patch_tokens_after_head)
+
+
+registry.register_weights(
+    "dino_v2_vit_reg4_so150m_p14_ls_bio-224px",
+    {
+        "url": "https://huggingface.co/birder-project/dino_v2_vit_reg4_so150m_p14_ls_bio/resolve/main",
+        "description": "DINO v2 model with a SoViT Reg4 150M/14 image encoder, trained on natural biological images",
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 1604.0,
+                "sha256": "6dd6a1c8408b423826495a92e840c49aa44f90c7dda42790645716bad1c8ea03",
+            }
+        },
+        "net": {"network": "dinov2teacher", "tag": "bio"},  # Just a placeholder
+        "encoder": {"network": "vit_reg4_so150m_p14_ls"},
+    },
+)
+registry.register_weights(
+    "dino_v2_vit_reg4_so150m_p14_ls_bio-252px",
+    {
+        "url": "https://huggingface.co/birder-project/dino_v2_vit_reg4_so150m_p14_ls_bio/resolve/main",
+        "description": "DINO v2 model with a SoViT Reg4 150M/14 image encoder, trained on natural biological images",
+        "resolution": (252, 252),
+        "formats": {
+            "pt": {
+                "file_size": 1604.5,
+                "sha256": "0ca38ef9f2296fb48b8fcaee913fff680b842d7f88d32ed8c6ff66594db5cce8",
+            }
+        },
+        "net": {"network": "dinov2teacher", "tag": "bio"},  # Just a placeholder
+        "encoder": {"network": "vit_reg4_so150m_p14_ls"},
+    },
+)

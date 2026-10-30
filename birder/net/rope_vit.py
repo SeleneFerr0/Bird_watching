@@ -1,0 +1,1510 @@
+"""
+RoPE ViT, adapted from
+https://github.com/naver-ai/rope-vit/blob/main/deit/models_v2_rope.py
+and
+https://github.com/huggingface/pytorch-image-models/blob/main/timm/layers/pos_embed_sincos.py
+
+Paper "Rotary Position Embedding for Vision Transformer", https://arxiv.org/abs/2403.13298
+"""
+
+# Reference license: Apache-2.0 (both)
+
+import logging
+import math
+from collections.abc import Callable
+from functools import partial
+from typing import Any
+from typing import Literal
+from typing import Optional
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.utils.checkpoint import checkpoint_sequential
+from torchvision.ops import StochasticDepth
+
+from birder.common.masking import mask_tensor
+from birder.layers import FFN
+from birder.layers import EfficientProbing
+from birder.layers import LayerNorm2d
+from birder.layers import LayerScale
+from birder.layers import MultiHeadAttentionPool
+from birder.layers import SoftMoE_FFN
+from birder.layers import SwiGLU_FFN
+from birder.layers.activations import get_activation_module
+from birder.layers.rope import RoPE
+from birder.layers.rope import RoPERotationType
+from birder.layers.rope import RoPEStyleType
+from birder.layers.rope import get_rope_apply_fn
+from birder.model_registry import registry
+from birder.net._rope_vit_configs import register_rope_vit_configs
+from birder.net.base import DetectorBackbone
+from birder.net.base import MaskedTokenOmissionMixin
+from birder.net.base import MaskedTokenRetentionMixin
+from birder.net.base import PreTrainEncoder
+from birder.net.base import TokenOmissionResultType
+from birder.net.base import TokenRetentionResultType
+from birder.net.base import normalize_out_indices
+from birder.net.base import stochastic_depth_rates
+from birder.net.vit import PatchEmbed
+from birder.net.vit import adjust_position_embedding
+from birder.net.vit import hMLPStem
+
+logger = logging.getLogger(__name__)
+
+
+class SequentialWithRope(nn.Sequential):
+    def forward(self, x: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:  # pylint: disable=arguments-differ
+        for module in self:
+            x = module(x, rope)
+
+        return x
+
+
+class RoPEAttention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        attn_drop: float,
+        proj_drop: float,
+        num_special_tokens: int,
+        qkv_bias: bool = True,
+        qk_norm: bool = False,
+        attn_norm: bool = False,
+        norm_layer: Callable[..., nn.Module] = nn.LayerNorm,
+        norm_layer_eps: float = 1e-6,
+        rope_rot_type: RoPERotationType = "standard",
+    ) -> None:
+        super().__init__()
+        assert dim % num_heads == 0, "dim should be divisible by num_heads"
+
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim**-0.5
+        self.num_special_tokens = num_special_tokens
+        self.apply_rot_fn = get_rope_apply_fn(rope_rot_type)
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        if qk_norm is True:
+            self.q_norm = norm_layer(self.head_dim, eps=norm_layer_eps)
+            self.k_norm = norm_layer(self.head_dim, eps=norm_layer_eps)
+        else:
+            self.q_norm = nn.Identity()
+            self.k_norm = nn.Identity()
+
+        self.attn_drop = nn.Dropout(attn_drop)
+        if attn_norm is True:
+            self.norm = norm_layer(dim, eps=norm_layer_eps)
+        else:
+            self.norm = nn.Identity()
+
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        # Weight initialization
+        for m in (self.qkv, self.proj):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(
+        self, x: torch.Tensor, rope: torch.Tensor, is_causal: bool = False, attn_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        B, N, C = x.size()
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        n = self.num_special_tokens
+        q = torch.concat([q[:, :, :n, :], self.apply_rot_fn(q[:, :, n:, :], rope)], dim=2).type_as(v)
+        k = torch.concat([k[:, :, :n, :], self.apply_rot_fn(k[:, :, n:, :], rope)], dim=2).type_as(v)
+
+        x = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+            is_causal=is_causal,
+            scale=self.scale,
+        )
+
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self.norm(x)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return x
+
+
+class EncoderBlock(nn.Module):
+    def __init__(
+        self,
+        num_heads: int,
+        hidden_dim: int,
+        mlp_dim: Optional[int],
+        num_special_tokens: int,
+        dropout: float,
+        attention_dropout: float,
+        projection_dropout: float,
+        drop_path: float,
+        activation_layer: Callable[..., nn.Module],
+        layer_scale_init_value: Optional[float] = None,
+        norm_layer: Callable[..., nn.Module] = nn.LayerNorm,
+        norm_layer_eps: float = 1e-6,
+        mlp_layer: Callable[..., nn.Module] = FFN,
+        qkv_bias: bool = True,
+        qk_norm: bool = False,
+        attn_norm: bool = False,
+        rope_rot_type: RoPERotationType = "standard",
+    ) -> None:
+        super().__init__()
+
+        if mlp_dim is None:
+            mlp_dim = hidden_dim * 4
+
+        # Attention block
+        self.norm1 = norm_layer(hidden_dim, eps=norm_layer_eps)
+        self.attn = RoPEAttention(
+            hidden_dim,
+            num_heads=num_heads,
+            attn_drop=attention_dropout,
+            proj_drop=projection_dropout,
+            num_special_tokens=num_special_tokens,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            attn_norm=attn_norm,
+            norm_layer=norm_layer,
+            norm_layer_eps=norm_layer_eps,
+            rope_rot_type=rope_rot_type,
+        )
+
+        self.drop_path = StochasticDepth(drop_path, mode="row")
+        if layer_scale_init_value is not None:
+            self.layer_scale_1 = LayerScale(hidden_dim, layer_scale_init_value)
+        else:
+            self.layer_scale_1 = nn.Identity()
+
+        # MLP block
+        self.norm2 = norm_layer(hidden_dim, eps=norm_layer_eps)
+        self.mlp = mlp_layer(hidden_dim, mlp_dim, act_layer=activation_layer, dropout=dropout)
+        if layer_scale_init_value is not None:
+            self.layer_scale_2 = LayerScale(hidden_dim, layer_scale_init_value)
+        else:
+            self.layer_scale_2 = nn.Identity()
+
+    def forward(
+        self, x: torch.Tensor, rope: torch.Tensor, attn_mask: Optional[torch.Tensor] = None, is_causal: bool = False
+    ) -> torch.Tensor:
+        x = x + self.drop_path(
+            self.layer_scale_1(self.attn(self.norm1(x), rope, is_causal=is_causal, attn_mask=attn_mask))
+        )
+        x = x + self.drop_path(self.layer_scale_2(self.mlp(self.norm2(x))))
+
+        return x
+
+
+class Encoder(nn.Module):
+    def __init__(
+        self,
+        num_layers: int,
+        num_heads: int,
+        hidden_dim: int,
+        mlp_dim: int,
+        num_special_tokens: int,
+        dropout: float,
+        attention_dropout: float,
+        projection_dropout: float,
+        dpr: list[float],
+        pre_norm: bool = False,
+        qkv_bias: bool = True,
+        qk_norm: bool = False,
+        attn_norm: bool = False,
+        activation_layer: Callable[..., nn.Module] = nn.GELU,
+        layer_scale_init_value: Optional[float] = None,
+        norm_layer: Callable[..., nn.Module] = nn.LayerNorm,
+        norm_layer_eps: float = 1e-6,
+        mlp_layer: Callable[..., nn.Module] = FFN,
+        rope_rot_type: RoPERotationType = "standard",
+        soft_moe_num_experts: Optional[int] = None,
+        soft_moe_num_slots: int = 1,
+    ) -> None:
+        super().__init__()
+        self.is_causal = False
+        self.has_soft_moe = soft_moe_num_experts is not None
+        self.grad_checkpointing = False
+        self.grad_checkpointing_segments: Optional[int] = None
+        self.grad_checkpointing_preserve_rng_state = True
+        self.grad_checkpointing_use_reentrant = False
+
+        pre_layers = []
+        if dropout > 0.0:
+            pre_layers.append(nn.Dropout(dropout))
+        if pre_norm is True:
+            pre_layers.append(norm_layer(hidden_dim, eps=norm_layer_eps))
+
+        self.pre_block = nn.Sequential(*pre_layers)
+
+        layers = []
+        for i in range(num_layers):
+            block_mlp_layer = mlp_layer
+            if soft_moe_num_experts is not None:
+                if i < num_layers // 2:
+                    block_mlp_layer = FFN
+                else:
+                    block_mlp_layer = partial(
+                        mlp_layer,
+                        num_experts=soft_moe_num_experts,
+                        num_slots=soft_moe_num_slots,
+                        norm_eps=norm_layer_eps,
+                    )
+
+            layers.append(
+                EncoderBlock(
+                    num_heads,
+                    hidden_dim,
+                    mlp_dim,
+                    num_special_tokens,
+                    dropout,
+                    attention_dropout,
+                    projection_dropout,
+                    dpr[i],
+                    activation_layer=activation_layer,
+                    layer_scale_init_value=layer_scale_init_value,
+                    norm_layer=norm_layer,
+                    norm_layer_eps=norm_layer_eps,
+                    mlp_layer=block_mlp_layer,
+                    qkv_bias=qkv_bias,
+                    qk_norm=qk_norm,
+                    attn_norm=attn_norm,
+                    rope_rot_type=rope_rot_type,
+                )
+            )
+
+        self.block = SequentialWithRope(*layers)
+
+    def _prepare_attention_mask(
+        self, x: torch.Tensor, attn_mask: Optional[torch.Tensor]
+    ) -> tuple[Optional[torch.Tensor], bool]:
+        if attn_mask is None:
+            return (None, self.is_causal)
+
+        if attn_mask.dtype == torch.bool:
+            if self.is_causal is True:
+                seq_len = x.size(1)
+                causal_mask = torch.ones((seq_len, seq_len), dtype=torch.bool, device=attn_mask.device).triu_(
+                    diagonal=1
+                )
+                mask_shape = torch.broadcast_shapes(attn_mask.shape, causal_mask.shape)
+                additive_mask = torch.zeros(mask_shape, dtype=x.dtype, device=attn_mask.device)
+                additive_mask.masked_fill_(causal_mask, float("-inf"))
+                additive_mask.masked_fill_(~attn_mask, float("-inf"))
+            else:
+                additive_mask = torch.full_like(attn_mask, float("-inf"), dtype=x.dtype)
+                additive_mask.masked_fill_(attn_mask, 0.0)
+
+            attn_mask = additive_mask
+        elif self.is_causal is True:
+            seq_len = x.size(1)
+            causal_bias = torch.full(
+                (seq_len, seq_len), float("-inf"), dtype=attn_mask.dtype, device=attn_mask.device
+            ).triu_(diagonal=1)
+            attn_mask = attn_mask + causal_bias
+
+        return (attn_mask, False)
+
+    def _checkpoint_blocks(
+        self, x: torch.Tensor, rope: torch.Tensor, attn_mask: Optional[torch.Tensor] = None, is_causal: bool = False
+    ) -> torch.Tensor:
+        if self.grad_checkpointing_segments is None:
+            segments = len(self.block)
+        else:
+            segments = min(self.grad_checkpointing_segments, len(self.block))
+
+        blocks = tuple(partial(block, rope=rope, attn_mask=attn_mask, is_causal=is_causal) for block in self.block)
+
+        return checkpoint_sequential(
+            blocks,
+            segments,
+            x,
+            use_reentrant=self.grad_checkpointing_use_reentrant,
+            preserve_rng_state=self.grad_checkpointing_preserve_rng_state,
+        )
+
+    def forward(self, x: torch.Tensor, rope: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = self.pre_block(x)
+        attn_mask, is_causal = self._prepare_attention_mask(x, attn_mask)
+        if self.grad_checkpointing is True and torch.is_grad_enabled() is True and not torch.jit.is_scripting():
+            return self._checkpoint_blocks(x, rope, attn_mask=attn_mask, is_causal=is_causal)
+
+        if attn_mask is None and is_causal is False:
+            return self.block(x, rope)
+
+        for blk in self.block:
+            x = blk(x, rope, attn_mask=attn_mask, is_causal=is_causal)
+
+        return x
+
+    def forward_features(
+        self,
+        x: torch.Tensor,
+        rope: torch.Tensor,
+        out_indices: Optional[list[int]] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> list[torch.Tensor]:
+        x = self.pre_block(x)
+        attn_mask, is_causal = self._prepare_attention_mask(x, attn_mask)
+
+        out_indices_set = set(out_indices) if out_indices is not None else None
+        xs = []
+        for idx, blk in enumerate(self.block):
+            x = blk(x, rope, attn_mask=attn_mask, is_causal=is_causal)
+            if out_indices_set is None or idx in out_indices_set:
+                xs.append(x)
+
+        return xs
+
+    def set_grad_checkpointing(
+        self,
+        enable: bool = True,
+        *,
+        segments: Optional[int] = None,
+        preserve_rng_state: bool = True,
+        use_reentrant: bool = False,
+    ) -> None:
+        if enable is True:
+            logger.debug(
+                f"Enabling gradient checkpointing: segments={segments}, "
+                f"preserve_rng_state={preserve_rng_state}, use_reentrant={use_reentrant}"
+            )
+        else:
+            logger.debug("Disabling gradient checkpointing")
+
+        self.grad_checkpointing = enable
+        self.grad_checkpointing_segments = segments
+        self.grad_checkpointing_preserve_rng_state = preserve_rng_state
+        self.grad_checkpointing_use_reentrant = use_reentrant
+
+    def set_causal_attention(self, is_causal: bool = True) -> None:
+        if is_causal is True and self.has_soft_moe is True:
+            raise ValueError("SoftMoE_FFN does not support causal attention")
+
+        self.is_causal = is_causal
+
+
+class MAEDecoderBlock(nn.Module):
+    def __init__(
+        self,
+        num_heads: int,
+        hidden_dim: int,
+        num_special_tokens: int,
+        activation_layer: Callable[..., nn.Module],
+        grid_size: tuple[int, int],
+        rope_grid_indexing: Literal["ij", "xy"],
+        rope_grid_offset: int,
+        rope_temperature: float,
+        layer_scale_init_value: Optional[float] = None,
+        norm_layer: Callable[..., nn.Module] = nn.LayerNorm,
+        norm_layer_eps: float = 1e-6,
+        mlp_layer: Callable[..., nn.Module] = FFN,
+        rope_style: RoPEStyleType = "default",
+        rope_rot_type: RoPERotationType = "standard",
+    ) -> None:
+        super().__init__()
+        mlp_dim = hidden_dim * 4
+        self.rope = RoPE(
+            hidden_dim // num_heads,
+            temperature=rope_temperature,
+            grid_size=grid_size,
+            grid_indexing=rope_grid_indexing,
+            grid_offset=rope_grid_offset,
+            rope_style=rope_style,
+            rope_rot_type=rope_rot_type,
+        )
+
+        # Attention block
+        self.norm1 = norm_layer(hidden_dim, eps=norm_layer_eps)
+        self.attn = RoPEAttention(
+            hidden_dim,
+            num_heads,
+            attn_drop=0.0,
+            proj_drop=0.0,
+            num_special_tokens=num_special_tokens,
+            rope_rot_type=rope_rot_type,
+        )
+        if layer_scale_init_value is not None:
+            self.layer_scale_1 = LayerScale(hidden_dim, layer_scale_init_value)
+        else:
+            self.layer_scale_1 = nn.Identity()
+
+        # MLP block
+        self.norm2 = norm_layer(hidden_dim, eps=norm_layer_eps)
+        self.mlp = mlp_layer(hidden_dim, mlp_dim, act_layer=activation_layer, dropout=0.0)
+        if layer_scale_init_value is not None:
+            self.layer_scale_2 = LayerScale(hidden_dim, layer_scale_init_value)
+        else:
+            self.layer_scale_2 = nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.layer_scale_1(self.attn(self.norm1(x), self.rope.pos_embed))
+        x = x + self.layer_scale_2(self.mlp(self.norm2(x)))
+
+        return x
+
+
+class RoPE_ViT(DetectorBackbone, PreTrainEncoder, MaskedTokenOmissionMixin, MaskedTokenRetentionMixin):
+    block_group_regex = r"encoder\.block\.(\d+)"
+
+    def __init__(
+        self,
+        input_channels: int,
+        num_classes: int,
+        *,
+        config: Optional[dict[str, Any]] = None,
+        size: Optional[tuple[int, int]] = None,
+    ) -> None:
+        super().__init__(input_channels, num_classes, config=config, size=size)
+        assert self.config is not None, "must set config"
+
+        image_size = self.size
+        abs_pos_embed: bool = self.config.get("abs_pos_embed", True)
+        pos_embed_special_tokens: bool = self.config.get("pos_embed_special_tokens", True)
+        pos_embed_interpolation_mode: Literal["bilinear", "bicubic"] = self.config.get(
+            "pos_embed_interpolation_mode", "bicubic"
+        )
+        pos_embed_antialias: bool = self.config.get("pos_embed_antialias", False)  # Controls forward pass only
+        patch_size: int = self.config["patch_size"]
+        stem_type: Literal["patchify", "hmlp"] = self.config.get("stem_type", "patchify")
+        stem_norm_layer_type: Optional[Literal["BatchNorm2d", "LayerNorm2d"]] = self.config.get(
+            "stem_norm_layer_type", None
+        )
+        num_layers: int = self.config["num_layers"]
+        num_heads: int = self.config["num_heads"]
+        hidden_dim: int = self.config["hidden_dim"]
+        mlp_dim: int = self.config["mlp_dim"]
+        layer_scale_init_value: Optional[float] = self.config.get("layer_scale_init_value", None)
+        pre_norm: bool = self.config.get("pre_norm", False)
+        post_norm: bool = self.config.get("post_norm", True)
+        norm_after_pool: bool = self.config.get("norm_after_pool", False)
+        qkv_bias: bool = self.config.get("qkv_bias", True)
+        qk_norm: bool = self.config.get("qk_norm", False)
+        attn_norm: bool = self.config.get("attn_norm", False)
+        num_reg_tokens: int = self.config.get("num_reg_tokens", 0)
+        class_token: bool = self.config.get("class_token", True)
+        attn_pool_head: bool = self.config.get("attn_pool_head", False)
+        attn_pool_type: str = self.config.get("attn_pool_type", "MultiHeadAttentionPool")
+        attn_pool_num_heads: Optional[int] = self.config.get("attn_pool_num_heads", None)
+        attn_pool_special_tokens: bool = self.config.get("attn_pool_special_tokens", False)
+        attn_pool_norm_eps: float = self.config.get("attn_pool_norm_eps", 1e-5)
+        attn_pool_act_layer_type: str = self.config.get("attn_pool_act_layer_type", "gelu")
+        norm_layer_type: str = self.config.get("norm_layer_type", "LayerNorm")
+        norm_layer_eps: float = self.config.get("norm_layer_eps", 1e-6)
+        mlp_layer_type: str = self.config.get("mlp_layer_type", "FFN")
+        soft_moe_num_experts: Optional[int] = self.config.get("soft_moe_num_experts", None)
+        soft_moe_num_slots: int = self.config.get("soft_moe_num_slots", 1)
+        act_layer_type: Optional[str] = self.config.get("act_layer_type", None)  # Default according to mlp type
+        out_indices: Optional[list[int]] = self.config.get("out_indices", None)
+        rope_style: RoPEStyleType = self.config.get("rope_style", "default")
+        rope_rot_type: RoPERotationType = self.config.get("rope_rot_type", "standard")
+        rope_grid_indexing: Literal["ij", "xy"] = self.config.get("rope_grid_indexing", "ij")
+        rope_grid_offset: int = self.config.get("rope_grid_offset", 0)
+        rope_temperature: float = self.config.get("rope_temperature", 100.0)
+        rope_shift_coords: Optional[float] = self.config.get("rope_shift_coords", None)
+        rope_jitter_coords: Optional[float] = self.config.get("rope_jitter_coords", None)
+        rope_rescale_coords: Optional[float] = self.config.get("rope_rescale_coords", None)
+        pt_grid_size: Optional[tuple[int, int]] = self.config.get("pt_grid_size", None)
+        dropout: float = self.config.get("dropout", 0.0)
+        attention_dropout: float = self.config.get("attention_dropout", 0.0)
+        projection_dropout: float = self.config.get("projection_dropout", 0.0)
+        drop_path_rate: float = self.config["drop_path_rate"]
+        drop_path_uniform: bool = self.config.get("drop_path_uniform", False)
+
+        if pos_embed_interpolation_mode not in ("bilinear", "bicubic"):
+            raise ValueError(f"Unknown pos_embed_interpolation_mode '{pos_embed_interpolation_mode}'")
+
+        if stem_type == "patchify":
+            if stem_norm_layer_type is not None:
+                raise ValueError("stem_norm_layer_type is only supported with stem_type='hmlp'")
+
+            self.conv_proj = nn.Conv2d(
+                self.input_channels,
+                hidden_dim,
+                kernel_size=(patch_size, patch_size),
+                stride=(patch_size, patch_size),
+                padding=(0, 0),
+                bias=not pre_norm,
+            )
+        elif stem_type == "hmlp":
+            assert patch_size == 16, "The hMLP stem requires patch_size=16"
+
+            if stem_norm_layer_type is None:
+                self.conv_proj = hMLPStem(self.input_channels, hidden_dim)
+            elif stem_norm_layer_type == "BatchNorm2d":
+                self.conv_proj = hMLPStem(self.input_channels, hidden_dim, norm_layer=nn.BatchNorm2d)
+            elif stem_norm_layer_type == "LayerNorm2d":
+                self.conv_proj = hMLPStem(self.input_channels, hidden_dim, norm_layer=LayerNorm2d)
+            else:
+                raise ValueError(f"Unknown stem_norm_layer_type '{stem_norm_layer_type}'")
+        else:
+            raise ValueError(f"Unknown stem_type '{stem_type}'")
+
+        if norm_layer_type == "LayerNorm":
+            norm_layer = nn.LayerNorm
+        elif norm_layer_type == "RMSNorm":
+            norm_layer = nn.RMSNorm
+        else:
+            raise ValueError(f"Unknown norm_layer_type '{norm_layer_type}'")
+
+        if mlp_layer_type == "FFN":
+            mlp_layer = FFN
+            act_layer = nn.GELU
+        elif mlp_layer_type == "SwiGLU_FFN":
+            mlp_layer = SwiGLU_FFN
+            act_layer = nn.SiLU
+        elif mlp_layer_type == "Norm_SwiGLU_FFN":
+            mlp_layer = partial(SwiGLU_FFN, norm_layer=norm_layer, norm_eps=norm_layer_eps)  # type: ignore[assignment]
+            act_layer = nn.SiLU
+        elif mlp_layer_type == "SoftMoE_FFN":
+            if soft_moe_num_experts is None:
+                raise ValueError("soft_moe_num_experts must be set when mlp_layer_type is 'SoftMoE_FFN'")
+
+            mlp_layer = SoftMoE_FFN
+            act_layer = nn.GELU
+        else:
+            raise ValueError(f"Unknown mlp_layer_type '{mlp_layer_type}'")
+
+        if act_layer_type is not None:
+            act_layer = get_activation_module(act_layer_type)
+
+        torch._assert(image_size[0] % patch_size == 0, "Input shape indivisible by patch size!")
+        torch._assert(image_size[1] % patch_size == 0, "Input shape indivisible by patch size!")
+        torch._assert(hidden_dim % num_heads == 0, "Hidden dim indivisible by num heads!")
+        self.abs_pos_embed = abs_pos_embed
+        self.pos_embed_special_tokens = pos_embed_special_tokens
+        self.pos_embed_interpolation_mode = pos_embed_interpolation_mode
+        self.pos_embed_antialias = pos_embed_antialias
+        self.patch_size = patch_size
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.hidden_dim = hidden_dim
+        self.layer_scale_init_value = layer_scale_init_value
+        self.num_reg_tokens = num_reg_tokens
+        self.attn_pool_special_tokens = attn_pool_special_tokens
+        self.norm_layer = norm_layer
+        self.norm_layer_eps = norm_layer_eps
+        self.decoder_mlp_layer = FFN if mlp_layer_type == "SoftMoE_FFN" else mlp_layer
+        self.act_layer = act_layer
+        self.out_indices = normalize_out_indices(out_indices, num_layers)
+        self.rope_rot_type = rope_rot_type
+        self.rope_style = rope_style
+        self.rope_grid_indexing = rope_grid_indexing
+        self.rope_grid_offset = rope_grid_offset
+        self.rope_temperature = rope_temperature
+
+        # Cast in case config was loaded from a json (no tuples),
+        # TorchScript does not accept a list when tuple expected
+        if isinstance(pt_grid_size, list):
+            pt_grid_size = tuple(pt_grid_size)  # type: ignore[unreachable]
+
+        self.pt_grid_size = pt_grid_size
+        dpr = stochastic_depth_rates(drop_path_rate, num_layers, constant=drop_path_uniform)
+
+        self.patch_embed = PatchEmbed()
+
+        seq_length = (image_size[0] // patch_size) * (image_size[1] // patch_size)
+        self.num_special_tokens = 0
+
+        # Add a class token
+        if class_token is True:
+            self.class_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+            self.num_special_tokens += 1
+            if pos_embed_special_tokens is True:
+                seq_length += 1
+        else:
+            self.class_token = None
+
+        # Add optional register tokens
+        if self.num_reg_tokens > 0:
+            self.reg_tokens = nn.Parameter(torch.zeros(1, self.num_reg_tokens, hidden_dim))
+            self.num_special_tokens += self.num_reg_tokens
+            if pos_embed_special_tokens is True:
+                seq_length += self.num_reg_tokens
+        else:
+            self.reg_tokens = None
+
+        # Add positional embedding
+        if self.abs_pos_embed is True:
+            self.pos_embedding = nn.Parameter(torch.empty(1, seq_length, hidden_dim).normal_(std=0.02))
+        else:
+            self.pos_embedding = None
+
+        # RoPE
+        self.rope = RoPE(
+            hidden_dim // num_heads,
+            temperature=self.rope_temperature,
+            grid_size=(image_size[0] // patch_size, image_size[1] // patch_size),
+            grid_indexing=rope_grid_indexing,
+            grid_offset=rope_grid_offset,
+            pt_grid_size=self.pt_grid_size,
+            rope_style=rope_style,
+            rope_rot_type=rope_rot_type,
+            shift_coords=rope_shift_coords,
+            jitter_coords=rope_jitter_coords,
+            rescale_coords=rope_rescale_coords,
+        )
+
+        # Encoder
+        self.encoder = Encoder(
+            num_layers,
+            num_heads,
+            hidden_dim,
+            mlp_dim,
+            self.num_special_tokens,
+            dropout,
+            attention_dropout,
+            projection_dropout,
+            dpr,
+            pre_norm=pre_norm,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            attn_norm=attn_norm,
+            activation_layer=act_layer,
+            layer_scale_init_value=layer_scale_init_value,
+            norm_layer=norm_layer,
+            norm_layer_eps=norm_layer_eps,
+            mlp_layer=mlp_layer,
+            rope_rot_type=rope_rot_type,
+            soft_moe_num_experts=soft_moe_num_experts,
+            soft_moe_num_slots=soft_moe_num_slots,
+        )
+
+        if post_norm is True and norm_after_pool is False:
+            self.norm = norm_layer(hidden_dim, eps=norm_layer_eps)
+        else:
+            self.norm = nn.Identity()
+
+        if post_norm is True and norm_after_pool is True:
+            self.embedding_norm = norm_layer(hidden_dim, eps=norm_layer_eps)
+        else:
+            self.embedding_norm = nn.Identity()
+
+        if attn_pool_head is False:
+            self.attn_pool = None
+        else:
+            if attn_pool_type == "MultiHeadAttentionPool":
+                attn_pool = MultiHeadAttentionPool
+                if attn_pool_num_heads is None:
+                    attn_pool_num_heads = num_heads
+            elif attn_pool_type == "EfficientProbing":
+                attn_pool = EfficientProbing
+                if attn_pool_num_heads is None:
+                    attn_pool_num_heads = 1
+            else:
+                raise ValueError(f"Unknown attn_pool_type '{attn_pool_type}'")
+
+            self.attn_pool = attn_pool(
+                hidden_dim,
+                attn_pool_num_heads,
+                mlp_dim,
+                qkv_bias=True,
+                norm_eps=attn_pool_norm_eps,
+                activation_layer=get_activation_module(attn_pool_act_layer_type),
+            )
+
+        num_return_stages = len(self.out_indices) if self.out_indices is not None else 1
+        self.return_stages = [f"stage{stage_idx + 1}" for stage_idx in range(num_return_stages)]
+        self.return_channels = [hidden_dim] * num_return_stages
+        self.embedding_size = hidden_dim
+        self.classifier = self.create_classifier()
+
+        self.max_stride = patch_size
+        self.stem_stride = patch_size
+        self.stem_width = hidden_dim
+        self.feature_dim = hidden_dim
+        self.decoder_block = partial(
+            MAEDecoderBlock,
+            16,
+            num_special_tokens=self.num_special_tokens,
+            activation_layer=act_layer,
+            grid_size=(image_size[0] // patch_size, image_size[1] // patch_size),
+            rope_grid_indexing=rope_grid_indexing,
+            rope_grid_offset=rope_grid_offset,
+            rope_temperature=rope_temperature,
+            layer_scale_init_value=layer_scale_init_value,
+            norm_layer=norm_layer,
+            norm_layer_eps=norm_layer_eps,
+            mlp_layer=self.decoder_mlp_layer,
+            rope_style=rope_style,
+            rope_rot_type=rope_rot_type,
+        )
+
+        # Weight initialization
+        if isinstance(self.conv_proj, nn.Conv2d):
+            # Init the patchify stem
+            fan_in = self.conv_proj.in_channels * self.conv_proj.kernel_size[0] * self.conv_proj.kernel_size[1]
+            nn.init.trunc_normal_(self.conv_proj.weight, std=math.sqrt(1 / fan_in))
+            if self.conv_proj.bias is not None:
+                nn.init.zeros_(self.conv_proj.bias)
+
+        if isinstance(self.classifier, nn.Linear):
+            nn.init.zeros_(self.classifier.weight)
+            if self.classifier.bias is not None:
+                nn.init.zeros_(self.classifier.bias)
+
+    def _get_input_conv(self) -> nn.Conv2d:
+        if isinstance(self.conv_proj, nn.Conv2d):
+            return self.conv_proj
+
+        conv = self.conv_proj[0]
+        return conv
+
+    def _get_pos_embed(self, H: int, W: int) -> Optional[torch.Tensor]:
+        if self.pos_embedding is None:
+            return None
+
+        if self.dynamic_size is False:
+            return self.pos_embedding
+
+        if H == self.size[0] and W == self.size[1]:
+            return self.pos_embedding
+
+        return adjust_position_embedding(
+            self.pos_embedding,
+            (self.size[0] // self.patch_size, self.size[1] // self.patch_size),
+            (H // self.patch_size, W // self.patch_size),
+            self.num_special_tokens if self.pos_embed_special_tokens is True else 0,
+            interpolation_mode=self.pos_embed_interpolation_mode,
+            antialias=self.pos_embed_antialias,
+        )
+
+    def _get_rope_embed(self, H: int, W: int) -> torch.Tensor:
+        if self.dynamic_size is False:
+            return self.rope.get_pos_embed(self.rope.grid_size)
+
+        return self.rope.get_pos_embed((H // self.patch_size, W // self.patch_size))
+
+    def freeze(self, freeze_classifier: bool = True, unfreeze_features: bool = False) -> None:
+        for param in self.parameters():
+            param.requires_grad_(False)
+
+        if freeze_classifier is False:
+            for param in self.classifier.parameters():
+                param.requires_grad_(True)
+
+        if unfreeze_features is True:
+            for param in self.norm.parameters():
+                param.requires_grad_(True)
+            for param in self.embedding_norm.parameters():
+                param.requires_grad_(True)
+            if self.attn_pool is not None:
+                for param in self.attn_pool.parameters():
+                    param.requires_grad_(True)
+
+    def set_grad_checkpointing(
+        self,
+        enable: bool = True,
+        *,
+        segments: Optional[int] = None,
+        preserve_rng_state: bool = True,
+        use_reentrant: bool = False,
+    ) -> None:
+        self.encoder.set_grad_checkpointing(
+            enable=enable,
+            segments=segments,
+            preserve_rng_state=preserve_rng_state,
+            use_reentrant=use_reentrant,
+        )
+
+    def set_causal_attention(self, is_causal: bool = True) -> None:
+        self.encoder.set_causal_attention(is_causal)
+
+    def strip_for_forward_features(self) -> None:
+        super().strip_for_forward_features()
+        self.embedding_norm = nn.Identity()
+        self.attn_pool = None
+
+    def strip_for_detection_features(self) -> None:
+        super().strip_for_detection_features()
+        self.norm = nn.Identity()
+        self.embedding_norm = nn.Identity()
+        self.attn_pool = None
+
+    def _pool(self, x: torch.Tensor) -> torch.Tensor:
+        if self.attn_pool is not None:
+            if self.attn_pool_special_tokens is False:
+                x = x[:, self.num_special_tokens :]
+
+            x = self.attn_pool(x)
+            return x[:, 0]
+
+        if self.class_token is None:
+            x = x[:, self.num_special_tokens :]
+            return x.mean(dim=1)
+
+        # Classifier "token" as used by standard language architectures
+        return x[:, self.num_reg_tokens]
+
+    def detection_features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        H, W = x.shape[-2:]
+        x = self.conv_proj(x)
+        x = self.patch_embed(x)
+        pos_embedding = self._get_pos_embed(H, W)
+
+        if pos_embedding is not None and self.pos_embed_special_tokens is False:
+            x = x + pos_embedding
+
+        # Expand special tokens to batch size and prepend in order [REG..., CLS, PATCH...]
+        special_tokens: list[torch.Tensor] = []
+        if self.reg_tokens is not None:
+            special_tokens.append(self.reg_tokens.expand(x.size(0), -1, -1))
+        if self.class_token is not None:
+            special_tokens.append(self.class_token.expand(x.size(0), -1, -1))
+        if len(special_tokens) > 0:
+            x = torch.concat(special_tokens + [x], dim=1)
+
+        if pos_embedding is not None and self.pos_embed_special_tokens is True:
+            x = x + pos_embedding
+
+        rope = self._get_rope_embed(H, W)
+        if self.out_indices is None:
+            xs = [self.encoder(x, rope)]
+        else:
+            xs = self.encoder.forward_features(x, rope, out_indices=self.out_indices)
+
+        out: dict[str, torch.Tensor] = {}
+        for stage_name, stage_x in zip(self.return_stages, xs, strict=True):
+            stage_x = stage_x[:, self.num_special_tokens :]
+            stage_x = stage_x.permute(0, 2, 1)
+            B, C, _ = stage_x.size()
+            stage_x = stage_x.reshape(B, C, H // self.patch_size, W // self.patch_size)
+            out[stage_name] = stage_x
+
+        return out
+
+    def freeze_stages(self, up_to_stage: int) -> None:
+        for param in self.conv_proj.parameters():
+            param.requires_grad_(False)
+
+        if self.pos_embedding is not None:
+            self.pos_embedding.requires_grad_(False)
+
+        if up_to_stage <= 0:
+            return
+
+        for param in self.encoder.pre_block.parameters():
+            param.requires_grad_(False)
+
+        if self.out_indices is None:
+            stage_boundaries = [self.num_layers - 1]
+        else:
+            stage_boundaries = sorted(set(self.out_indices))
+
+        last_block = stage_boundaries[min(up_to_stage, len(stage_boundaries)) - 1]
+        for block in self.encoder.block[: last_block + 1]:
+            for param in block.parameters():
+                param.requires_grad_(False)
+
+    def masked_encoding_omission(
+        self,
+        x: torch.Tensor,
+        ids_keep: Optional[torch.Tensor] = None,
+        return_all_features: bool = False,
+        return_keys: Literal["all", "tokens", "embedding"] = "tokens",
+    ) -> TokenOmissionResultType:
+        H, W = x.shape[-2:]
+
+        # Reshape and permute the input tensor
+        x = self.conv_proj(x)
+        x = self.patch_embed(x)
+
+        # Add pos embedding without special tokens
+        pos_embedding = self._get_pos_embed(H, W)
+        if pos_embedding is not None:
+            if self.pos_embed_special_tokens is True:
+                x = x + pos_embedding[:, self.num_special_tokens :, :]
+            else:
+                x = x + pos_embedding
+
+        rope = self._get_rope_embed(H, W)
+
+        # Mask tokens
+        if ids_keep is not None:
+            x = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, x.size(2)))
+
+            rope_dim = rope.size(1)
+            rope = rope.unsqueeze(0).expand(x.size(0), -1, -1)
+            rope_masked = torch.gather(rope, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, rope_dim))
+        else:
+            rope_masked = rope
+
+        # Expand special tokens to batch size and prepend in order [REG..., CLS, PATCH...]
+        special_tokens: list[torch.Tensor] = []
+        if self.reg_tokens is not None:
+            if pos_embedding is not None and self.pos_embed_special_tokens is True:
+                reg_tokens = self.reg_tokens + pos_embedding[:, 0 : self.num_reg_tokens, :]
+            else:
+                reg_tokens = self.reg_tokens
+
+            special_tokens.append(reg_tokens.expand(x.size(0), -1, -1))
+
+        if self.class_token is not None:
+            if pos_embedding is not None and self.pos_embed_special_tokens is True:
+                cls_token = self.class_token + pos_embedding[:, self.num_reg_tokens : self.num_reg_tokens + 1, :]
+            else:
+                cls_token = self.class_token
+
+            special_tokens.append(cls_token.expand(x.size(0), -1, -1))
+
+        if len(special_tokens) > 0:
+            x = torch.concat(special_tokens + [x], dim=1)
+
+        # Apply transformer
+        if return_all_features is True:
+            xs = self.encoder.forward_features(x, rope_masked)
+            xs[-1] = self.norm(xs[-1])
+            x = torch.stack(xs, dim=-1)
+        else:
+            x = self.encoder(x, rope_masked)
+            x = self.norm(x)
+
+        result: TokenOmissionResultType = {}
+        if return_keys in ("all", "tokens"):
+            result["tokens"] = x
+
+        if return_keys in ("all", "embedding"):
+            if return_all_features is True:
+                x = x[..., -1]
+
+            result["embedding"] = self.embedding_from_features(x)
+
+        return result
+
+    def masked_encoding_retention(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        mask_token: Optional[torch.Tensor] = None,
+        return_keys: Literal["all", "features", "embedding"] = "features",
+    ) -> TokenRetentionResultType:
+        H, W = x.shape[-2:]
+
+        x = self.conv_proj(x)
+        x = mask_tensor(x, mask, mask_token=mask_token, patch_factor=self.max_stride // self.stem_stride)
+
+        # Reshape and permute the input tensor
+        x = self.patch_embed(x)
+        pos_embedding = self._get_pos_embed(H, W)
+
+        if pos_embedding is not None and self.pos_embed_special_tokens is False:
+            x = x + pos_embedding
+
+        # Expand special tokens to batch size and prepend in order [REG..., CLS, PATCH...]
+        special_tokens: list[torch.Tensor] = []
+        if self.reg_tokens is not None:
+            special_tokens.append(self.reg_tokens.expand(x.size(0), -1, -1))
+        if self.class_token is not None:
+            special_tokens.append(self.class_token.expand(x.size(0), -1, -1))
+        if len(special_tokens) > 0:
+            x = torch.concat(special_tokens + [x], dim=1)
+
+        if pos_embedding is not None and self.pos_embed_special_tokens is True:
+            x = x + pos_embedding
+
+        x = self.encoder(x, self._get_rope_embed(H, W))
+        x = self.norm(x)
+
+        result: TokenRetentionResultType = {}
+        if return_keys in ("all", "features"):
+            features = x[:, self.num_special_tokens :]
+            features = features.permute(0, 2, 1)
+            B, C, _ = features.size()
+            features = features.reshape(B, C, H // self.patch_size, W // self.patch_size)
+            result["features"] = features
+
+        if return_keys in ("all", "embedding"):
+            result["embedding"] = self.embedding_from_features(x)
+
+        return result
+
+    def forward_features(
+        self, x: torch.Tensor, return_input_embedding: bool = False, attn_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        H, W = x.shape[-2:]
+
+        # Reshape and permute the input tensor
+        x = self.conv_proj(x)
+        x = self.patch_embed(x)
+
+        patch_embedding = x
+        pos_embedding = self._get_pos_embed(H, W)
+
+        if pos_embedding is not None and self.pos_embed_special_tokens is False:
+            x = x + pos_embedding
+
+        # Expand special tokens to batch size and prepend in order [REG..., CLS, PATCH...]
+        special_tokens: list[torch.Tensor] = []
+        if self.reg_tokens is not None:
+            special_tokens.append(self.reg_tokens.expand(x.size(0), -1, -1))
+        if self.class_token is not None:
+            special_tokens.append(self.class_token.expand(x.size(0), -1, -1))
+        if len(special_tokens) > 0:
+            x = torch.concat(special_tokens + [x], dim=1)
+
+        if return_input_embedding is True:
+            if len(special_tokens) > 0:
+                input_embedding = torch.concat(special_tokens + [patch_embedding], dim=1)
+            else:
+                input_embedding = patch_embedding
+        else:
+            input_embedding = None  # For TorchScript compatibility
+
+        if pos_embedding is not None and self.pos_embed_special_tokens is True:
+            x = x + pos_embedding
+
+        x = self.encoder(x, self._get_rope_embed(H, W), attn_mask=attn_mask)
+        x = self.norm(x)
+
+        if return_input_embedding is True and input_embedding is not None:
+            return torch.stack([input_embedding, x], dim=-1)
+
+        return x
+
+    def flatten_features(self, features: torch.Tensor, include_special_tokens: bool = True) -> torch.Tensor:
+        if include_special_tokens is False:
+            return features[:, self.num_special_tokens :]
+
+        return features
+
+    def embedding_from_features(self, features: torch.Tensor) -> torch.Tensor:
+        return self.embedding_norm(self._pool(features))
+
+    def adjust_size(self, new_size: tuple[int, int]) -> None:
+        if new_size == self.size:
+            return
+
+        assert new_size[0] % self.patch_size == 0, "Input shape indivisible by patch size!"
+        assert new_size[1] % self.patch_size == 0, "Input shape indivisible by patch size!"
+
+        old_size = self.size
+        super().adjust_size(new_size)
+
+        if self.pos_embedding is not None:
+            if self.pos_embed_special_tokens is True:
+                num_prefix_tokens = self.num_special_tokens
+            else:
+                num_prefix_tokens = 0
+
+            # Add back class tokens
+            with torch.no_grad():
+                pos_embedding = adjust_position_embedding(
+                    self.pos_embedding,
+                    (old_size[0] // self.patch_size, old_size[1] // self.patch_size),
+                    (new_size[0] // self.patch_size, new_size[1] // self.patch_size),
+                    num_prefix_tokens,
+                    interpolation_mode=self.pos_embed_interpolation_mode,
+                )
+
+            self.pos_embedding = nn.Parameter(pos_embedding, requires_grad=self.pos_embedding.requires_grad)
+
+        grid_size = (new_size[0] // self.patch_size, new_size[1] // self.patch_size)
+        self.rope.set_grid_size(grid_size)
+
+        # Define adjusted decoder block
+        self.decoder_block = partial(
+            MAEDecoderBlock,
+            16,
+            num_special_tokens=self.num_special_tokens,
+            activation_layer=self.act_layer,
+            grid_size=grid_size,
+            rope_grid_indexing=self.rope_grid_indexing,
+            rope_grid_offset=self.rope_grid_offset,
+            rope_temperature=self.rope_temperature,
+            layer_scale_init_value=self.layer_scale_init_value,
+            norm_layer=self.norm_layer,
+            norm_layer_eps=self.norm_layer_eps,
+            mlp_layer=self.decoder_mlp_layer,
+            rope_style=self.rope_style,
+            rope_rot_type=self.rope_rot_type,
+        )
+
+
+# Register model configs (side effects)
+register_rope_vit_configs(RoPE_ViT)
+
+registry.register_weights(
+    "rope_vit_s14_swiglu_avg_eva-bio",
+    {
+        "url": "https://huggingface.co/birder-project/rope_vit_s14_swiglu_avg_eva-bio/resolve/main",
+        "description": (
+            "RoPE ViT S/14 image encoder with average pooling, pretrained using EVA MIM distillation from a BioCLIP "
+            "v2 teacher on natural biological images. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 109.6,
+                "sha256": "b9b6618cc5b41fc07ccca7b371144a31d4f486947f2ecbd1e672608c3afc8bd4",
+            }
+        },
+        "net": {"network": "rope_vit_s14_swiglu_avg", "tag": "eva-bio"},
+    },
+)
+registry.register_weights(
+    "rope_vit_m14_swiglu_avg_eva-bio",
+    {
+        "url": "https://huggingface.co/birder-project/rope_vit_m14_swiglu_avg_eva-bio/resolve/main",
+        "description": (
+            "RoPE ViT M/14 image encoder with average pooling, pretrained using EVA MIM distillation from a BioCLIP "
+            "v2.5 teacher on natural biological images. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 194.1,
+                "sha256": "df43c9e4cc8d5e94ba6e65358de07e9315ff040673b7c81be0beab8dfaf31cad",
+            }
+        },
+        "net": {"network": "rope_vit_m14_swiglu_avg", "tag": "eva-bio"},
+    },
+)
+registry.register_weights(
+    "rope_vit_reg4_b14_capi",
+    {
+        "url": "https://huggingface.co/birder-project/rope_vit_reg4_b14_capi/resolve/main",
+        "description": (
+            "RoPE ViT Reg4 B/14 image encoder pretrained using CAPI. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 327.0,
+                "sha256": "175378d81734649567bfe82aac9557f9b0bf48dbd562f26e338b1958fa057472",
+            }
+        },
+        "net": {"network": "rope_vit_reg4_b14", "tag": "capi"},
+    },
+)
+registry.register_weights(
+    "rope_vit_reg4_b14_capi-places365",
+    {
+        "url": "https://huggingface.co/birder-project/rope_vit_reg4_b14_capi-places365/resolve/main",
+        "description": "RoPE ViT Reg4 B/14 model pretrained using CAPI, then fine-tuned on the Places365 dataset",
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 328.1,
+                "sha256": "4d3ef700eb0d454c9406e9b5c11f70106b46ed4a6ca24c1d89a60097ad78ea9a",
+            }
+        },
+        "net": {"network": "rope_vit_reg4_b14", "tag": "capi-places365"},
+    },
+)
+registry.register_weights(
+    "rope_vit_reg4_b14_capi-inat21-224px",
+    {
+        "url": "https://huggingface.co/birder-project/rope_vit_reg4_b14_capi-inat21/resolve/main",
+        "description": (
+            "RoPE ViT Reg4 B/14 model pretrained using CAPI, then fine-tuned on the iNaturalist 2021 dataset"
+        ),
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 357.2,
+                "sha256": "fb98a4f29a1c6e552a4e22eaf614b0f2d2adedefe2d510fa7e69309208dc0f9f",
+            }
+        },
+        "net": {"network": "rope_vit_reg4_b14", "tag": "capi-inat21-224px"},
+    },
+)
+registry.register_weights(
+    "rope_vit_reg4_b14_capi-inat21",
+    {
+        "url": "https://huggingface.co/birder-project/rope_vit_reg4_b14_capi-inat21/resolve/main",
+        "description": (
+            "RoPE ViT Reg4 B/14 model pretrained using CAPI, then fine-tuned on the iNaturalist 2021 dataset"
+        ),
+        "resolution": (336, 336),
+        "formats": {
+            "pt": {
+                "file_size": 358.2,
+                "sha256": "25befb5a460cc80a5a7961db61e747916461bf6967f3d39d9294ee474bd31304",
+            }
+        },
+        "net": {"network": "rope_vit_reg4_b14", "tag": "capi-inat21"},
+    },
+)
+registry.register_weights(
+    "rope_vit_reg4_b14_capi-imagenet21k",
+    {
+        "url": "https://huggingface.co/birder-project/rope_vit_reg4_b14_capi-imagenet21k/resolve/main",
+        "description": "RoPE ViT Reg4 B/14 model pretrained using CAPI, then fine-tuned on the ImageNet 21K dataset",
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 383.7,
+                "sha256": "1325f35f0d8dff3270d6ce645f81865e9b8de7bacf17f94a9f5e2ef0cd66f56d",
+            }
+        },
+        "net": {"network": "rope_vit_reg4_b14", "tag": "capi-imagenet21k"},
+    },
+)
+registry.register_weights(
+    "rope_vit_reg4_b14_capi-intermediate-eu-common",
+    {
+        "url": "https://huggingface.co/birder-project/rope_vit_reg4_b14_capi-intermediate-eu-common/resolve/main",
+        "description": (
+            "RoPE ViT Reg4 B/14 model pretrained using CAPI and intermediate training, then fine-tuned on the "
+            "eu-common dataset"
+        ),
+        "resolution": (336, 336),
+        "formats": {
+            "pt": {
+                "file_size": 330.1,
+                "sha256": "5f9529dbb354ac755ee7c584fdc9227f469233ca35a09998ddf57afa54199e44",
+            }
+        },
+        "net": {"network": "rope_vit_reg4_b14", "tag": "capi-intermediate-eu-common"},
+    },
+)
+registry.register_weights(
+    "rope_vit_reg8_b14_nps_avg_capi-dino-bio",
+    {
+        "url": "https://huggingface.co/birder-project/rope_vit_reg8_b14_nps_avg_capi-dino-bio/resolve/main",
+        "description": (
+            "RoPE ViT Reg8 B/14 image encoder with average pooling, pretrained using CAPI-DINO on natural "
+            "biological images. It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 327.0,
+                "sha256": "69f3055c05133061bfd12ade1dccf0bccb9947bd583c6f979c3c2c0662b8cf0e",
+            }
+        },
+        "net": {"network": "rope_vit_reg8_b14_nps_avg", "tag": "capi-dino-bio"},
+    },
+)
+registry.register_weights(
+    "rope_vit_reg8_so150m_p14_swiglu_rms_avg_capi",
+    {
+        "url": "https://huggingface.co/birder-project/rope_vit_reg8_so150m_p14_swiglu_rms_avg_capi/resolve/main",
+        "description": (
+            "RoPE SoViT Reg8 150M/14 image encoder with average pooling, pretrained using CAPI. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 652.5,
+                "sha256": "84808bdb7a46c70eb13a67a766c2c3c9a4a9a37a90679e03fd75619aa5517e80",
+            }
+        },
+        "net": {"network": "rope_vit_reg8_so150m_p14_swiglu_rms_avg", "tag": "capi"},
+    },
+)
+registry.register_weights(
+    "rope_vit_reg8_so150m_p14_swiglu_rms_ap_rotnet-capi",
+    {
+        "url": "https://huggingface.co/birder-project/rope_vit_reg8_so150m_p14_swiglu_rms_ap_rotnet-capi/resolve/main",
+        "description": (
+            "RoPE SoViT Reg8 150M/14 model with attention pooling and CAPI pretraining, then trained to estimate "
+            "image orientation"
+        ),
+        "resolution": (252, 252),
+        "formats": {
+            "pt": {
+                "file_size": 680.9,
+                "sha256": "57465120826faa1e61accfb0e51b529c6ae431cc1f6960e4cdd5278d8dbd1edf",
+            }
+        },
+        "net": {"network": "rope_vit_reg8_so150m_p14_swiglu_rms_ap", "tag": "rotnet-capi"},
+    },
+)
+
+# EVA-CLIP: Improved Training Techniques for CLIP at Scale
+# https://arxiv.org/abs/2303.15389
+registry.register_weights(
+    "rope_i_vit_l14_nf_swiglu_c1_eva02-clip",
+    {
+        "url": "https://huggingface.co/birder-project/rope_i_vit_l14_nf_swiglu_c1_eva02-clip/resolve/main",
+        "description": (
+            "RoPEi ViT L/14 image encoder pretrained by BAAI-Vision using CLIP. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (336, 336),
+        "formats": {
+            "pt": {
+                "file_size": 1161.6,
+                "sha256": "4b4bf864c6efa9f3d9e1d22bfe2b614828ab34d0c0389f739a6a0e0ca0bf8af7",
+            },
+        },
+        "net": {"network": "rope_i_vit_l14_nf_swiglu_c1", "tag": "eva02-clip"},
+    },
+)
+
+# Perception Encoder: The best visual embeddings are not at the output of the network, by Meta FAIR
+# https://arxiv.org/abs/2504.13181
+registry.register_weights(
+    "rope_i_vit_reg1_t16_pn_npn_avg_c1_pe-spatial",
+    {
+        "url": "https://huggingface.co/birder-project/rope_i_vit_reg1_t16_pn_npn_avg_c1_pe-spatial/resolve/main",
+        "description": (
+            "RoPEi ViT Reg1 T/16 image encoder with average pooling, pretrained by Meta FAIR using CLIP. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (512, 512),
+        "formats": {
+            "pt": {
+                "file_size": 21.7,
+                "sha256": "f7c7968f31eccbc5593b28217f2ad0a5a28e416838188c5b0c7602d3d58155b3",
+            },
+        },
+        "net": {"network": "rope_i_vit_reg1_t16_pn_npn_avg_c1", "tag": "pe-spatial"},
+    },
+)
+registry.register_weights(
+    "rope_i_vit_s16_pn_aps_c1_pe-core",
+    {
+        "url": "https://huggingface.co/birder-project/rope_i_vit_s16_pn_aps_c1_pe-core/resolve/main",
+        "description": (
+            "RoPEi ViT S/16 image encoder with attention pooling, pretrained by Meta FAIR using CLIP. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (384, 384),
+        "formats": {
+            "pt": {
+                "file_size": 90.0,
+                "sha256": "e4429b0bafb9f827698dde73c882c70deb994329ea0dd169f68e76ad256bbb74",
+            },
+        },
+        "net": {"network": "rope_i_vit_s16_pn_aps_c1", "tag": "pe-core"},
+    },
+)
+registry.register_weights(
+    "rope_i_vit_reg1_s16_pn_npn_avg_c1_pe-spatial",
+    {
+        "url": "https://huggingface.co/birder-project/rope_i_vit_reg1_s16_pn_npn_avg_c1_pe-spatial/resolve/main",
+        "description": (
+            "RoPEi ViT Reg1 S/16 image encoder with average pooling, pretrained by Meta FAIR using CLIP. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (512, 512),
+        "formats": {
+            "pt": {
+                "file_size": 83.9,
+                "sha256": "4e65e500f2a7d2b11fc28aaa0b1ad4921692780507de014ebc5659e757327fde",
+            },
+        },
+        "net": {"network": "rope_i_vit_reg1_s16_pn_npn_avg_c1", "tag": "pe-spatial"},
+    },
+)
+registry.register_weights(
+    "rope_i_vit_b16_pn_aps_c1_pe-core",
+    {
+        "url": "https://huggingface.co/birder-project/rope_i_vit_b16_pn_aps_c1_pe-core/resolve/main",
+        "description": (
+            "RoPEi ViT B/16 image encoder with attention pooling, pretrained by Meta FAIR using CLIP. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (224, 224),
+        "formats": {
+            "pt": {
+                "file_size": 354.4,
+                "sha256": "d1c1ba1e8c841f495ff3c0e5e6963a39c8d1ae07dea30d3b82422017a4062d97",
+            },
+        },
+        "net": {"network": "rope_i_vit_b16_pn_aps_c1", "tag": "pe-core"},
+    },
+)
+registry.register_weights(
+    "rope_i_vit_reg1_b16_pn_npn_avg_c1_pe-spatial",
+    {
+        "url": "https://huggingface.co/birder-project/rope_i_vit_reg1_b16_pn_npn_avg_c1_pe-spatial/resolve/main",
+        "description": (
+            "RoPEi ViT Reg1 B/16 image encoder with average pooling, pretrained by Meta FAIR using CLIP. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (512, 512),
+        "formats": {
+            "pt": {
+                "file_size": 329.8,
+                "sha256": "f1ad844e3e28d52f15d8edf9ebdb1dbc0d333f81edd5c4fddd8602ae55e0f2a7",
+            },
+        },
+        "net": {"network": "rope_i_vit_reg1_b16_pn_npn_avg_c1", "tag": "pe-spatial"},
+    },
+)
+registry.register_weights(
+    "rope_i_vit_l14_pn_aps_c1_pe-core",
+    {
+        "url": "https://huggingface.co/birder-project/rope_i_vit_l14_pn_aps_c1_pe-core/resolve/main",
+        "description": (
+            "RoPEi ViT L/14 image encoder with attention pooling, pretrained by Meta FAIR using CLIP. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (336, 336),
+        "formats": {
+            "pt": {
+                "file_size": 1206.0,
+                "sha256": "26c2188116cb254d2870c23cc3ab7d60d9ee0606c803b8dbe359e5716498b5c4",
+            },
+        },
+        "net": {"network": "rope_i_vit_l14_pn_aps_c1", "tag": "pe-core"},
+    },
+)
+
+# DeiT III
+registry.register_weights(
+    "rope_deit3_reg4_t16_il-common",
+    {
+        "description": "RoPE DeiT3 Reg4 T/16 model trained on the il-common dataset",
+        "resolution": (256, 256),
+        "formats": {
+            "pt": {
+                "file_size": 21.5,
+                "sha256": "3c0e1500d062d75f1b3c5f1aae5015c48b0736521c5289d039da133eefc3519f",
+            }
+        },
+        "net": {"network": "rope_deit3_reg4_t16", "tag": "il-common"},
+    },
+)
+registry.register_weights(
+    "rope_deit3_reg4_m14_arabian-peninsula",
+    {
+        "url": "https://huggingface.co/birder-project/rope_deit3_reg4_m14_arabian-peninsula/resolve/main",
+        "description": "RoPE DeiT3 Reg4 M/14 model trained on the arabian-peninsula dataset",
+        "resolution": (252, 252),
+        "formats": {
+            "pt": {
+                "file_size": 147.7,
+                "sha256": "596223dde050561e2045352d4c0816ef874b9e8ccc6e5157f9e112cecfa9fb8c",
+            }
+        },
+        "net": {"network": "rope_deit3_reg4_m14", "tag": "arabian-peninsula"},
+    },
+)
+
+# BIO-DINO
+registry.register_weights(
+    "rope_deit3_m14_dino-v2-dist-bio",
+    {
+        "url": "https://huggingface.co/birder-project/rope_deit3_m14_dino-v2-dist-bio/resolve/main",
+        "description": (
+            "RoPE DeiT3 M/14 image encoder pretrained using DINO v2 distillation on natural biological images. "
+            "It has not been fine-tuned for a specific classification task"
+        ),
+        "resolution": (252, 252),
+        "formats": {
+            "pt": {
+                "file_size": 146.2,
+                "sha256": "0600611934dd31081eec28f8da0e8e19728377fdee71196431ead94aa4373db6",
+            },
+        },
+        "net": {"network": "rope_deit3_m14", "tag": "dino-v2-dist-bio"},
+    },
+)

@@ -1,0 +1,2 @@
+# Optional Ultralytics integration; see its AGPL-3.0 / Enterprise licensing terms.
+ultralytics>=8.4.0,<9

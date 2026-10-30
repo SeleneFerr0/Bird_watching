@@ -1,0 +1,621 @@
+"""
+Swin Transformer, adapted from
+https://github.com/pytorch/vision/blob/main/torchvision/models/swin_transformer.py
+
+Paper "Swin Transformer: Hierarchical Vision Transformer using Shifted Windows",
+https://arxiv.org/abs/2103.14030
+
+Changes from original:
+* Window size based on image size (image size // 32)
+"""
+
+# Reference license: BSD 3-Clause
+
+import logging
+import math
+from collections import OrderedDict
+from typing import Any
+from typing import Literal
+from typing import Optional
+
+import torch
+import torch.fx
+import torch.nn.functional as F
+from scipy import interpolate
+from torch import nn
+from torch.utils.checkpoint import checkpoint_sequential
+from torchvision.ops import MLP
+from torchvision.ops import Permute
+from torchvision.ops import StochasticDepth
+
+from birder.common.masking import mask_tensor
+from birder.model_registry import registry
+from birder.net.base import DetectorBackbone
+from birder.net.base import MaskedTokenRetentionMixin
+from birder.net.base import PreTrainEncoder
+from birder.net.base import TokenRetentionResultType
+from birder.net.base import stochastic_depth_rates
+
+logger = logging.getLogger(__name__)
+
+
+def patch_merging_pad(x: torch.Tensor) -> torch.Tensor:
+    H, W, _ = x.shape[-3:]
+    x = F.pad(x, (0, 0, 0, W % 2, 0, H % 2))
+    x0 = x[..., 0::2, 0::2, :]  # ... H/2 W/2 C
+    x1 = x[..., 1::2, 0::2, :]  # ... H/2 W/2 C
+    x2 = x[..., 0::2, 1::2, :]  # ... H/2 W/2 C
+    x3 = x[..., 1::2, 1::2, :]  # ... H/2 W/2 C
+    x = torch.concat([x0, x1, x2, x3], dim=-1)  # ... H/2 W/2 4*C
+
+    return x
+
+
+torch.fx.wrap("patch_merging_pad")
+
+
+def get_relative_position_bias(
+    relative_position_bias_table: torch.Tensor,
+    relative_position_index: torch.Tensor,
+    window_size: tuple[int, int],
+) -> torch.Tensor:
+    N = window_size[0] * window_size[1]
+    relative_position_bias = relative_position_bias_table[relative_position_index]
+    relative_position_bias = relative_position_bias.view(N, N, -1)
+    relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous().unsqueeze(0)
+
+    return relative_position_bias
+
+
+torch.fx.wrap("get_relative_position_bias")
+
+
+def shifted_window_attention(
+    x: torch.Tensor,
+    qkv_weight: torch.Tensor,
+    proj_weight: torch.Tensor,
+    relative_position_bias: torch.Tensor,
+    window_size: tuple[int, int],
+    num_heads: int,
+    shift_size: tuple[int, int],
+    qkv_bias: Optional[torch.Tensor] = None,
+    proj_bias: Optional[torch.Tensor] = None,
+    logit_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    B, H, W, C = x.size()
+
+    # Pad feature maps to multiples of window size
+    pad_b = (window_size[0] - H % window_size[0]) % window_size[0]
+    pad_r = (window_size[1] - W % window_size[1]) % window_size[1]
+    x = F.pad(x, (0, 0, 0, pad_r, 0, pad_b))
+    _, pad_h, pad_w, _ = x.size()
+
+    # If window size is larger than feature size, there is no need to shift window
+    shift_size_h = shift_size[0]
+    shift_size_w = shift_size[1]
+    if window_size[0] >= pad_h:
+        shift_size_h = 0
+    if window_size[1] >= pad_w:
+        shift_size_w = 0
+
+    shift_size = (shift_size_h, shift_size_w)
+
+    # Cyclic shift
+    if sum(shift_size) > 0:
+        x = torch.roll(x, shifts=(-shift_size[0], -shift_size[1]), dims=(1, 2))
+
+    # Partition windows
+    num_windows = (pad_h // window_size[0]) * (pad_w // window_size[1])
+    x = x.view(B, pad_h // window_size[0], window_size[0], pad_w // window_size[1], window_size[1], C)
+    x = x.permute(0, 1, 3, 2, 4, 5).reshape(B * num_windows, window_size[0] * window_size[1], C)  # B*nW, Ws*Ws, C
+
+    # Multi-head attention
+    if logit_scale is not None and qkv_bias is not None:
+        qkv_bias = qkv_bias.clone()
+        length = qkv_bias.numel() // 3
+        qkv_bias[length : 2 * length].zero_()
+
+    qkv = F.linear(x, qkv_weight, qkv_bias)
+    qkv = qkv.reshape(x.size(0), x.size(1), 3, num_heads, C // num_heads).permute(2, 0, 3, 1, 4)
+    q = qkv[0]
+    k = qkv[1]
+    v = qkv[2]
+    if logit_scale is not None:
+        # Cosine attention
+        attn = F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).transpose(-2, -1)
+        logit_scale = torch.clamp(logit_scale, max=math.log(100.0)).exp()
+        attn = attn * logit_scale
+
+    else:
+        q = q * (C // num_heads) ** -0.5
+        attn = q.matmul(k.transpose(-2, -1))
+
+    # Add relative position bias
+    attn = attn + relative_position_bias
+
+    if sum(shift_size) > 0:
+        # Generate attention mask
+        attn_mask = x.new_zeros((pad_h, pad_w))
+        h_slices = ((0, -window_size[0]), (-window_size[0], -shift_size[0]), (-shift_size[0], None))
+        w_slices = ((0, -window_size[1]), (-window_size[1], -shift_size[1]), (-shift_size[1], None))
+        count = 0
+        for h in h_slices:
+            for w in w_slices:
+                attn_mask[h[0] : h[1], w[0] : w[1]] = count
+                count += 1
+
+        attn_mask = attn_mask.view(pad_h // window_size[0], window_size[0], pad_w // window_size[1], window_size[1])
+        attn_mask = attn_mask.permute(0, 2, 1, 3).reshape(num_windows, window_size[0] * window_size[1])
+        attn_mask = attn_mask.unsqueeze(1) - attn_mask.unsqueeze(2)
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+        attn = attn.view(x.size(0) // num_windows, num_windows, num_heads, x.size(1), x.size(1))
+        attn = attn + attn_mask.unsqueeze(1).unsqueeze(0)
+        attn = attn.view(-1, num_heads, x.size(1), x.size(1))
+
+    attn = F.softmax(attn, dim=-1)
+
+    x = attn.matmul(v).transpose(1, 2).reshape(x.size(0), x.size(1), C)
+    x = F.linear(x, proj_weight, proj_bias)
+
+    # Reverse windows
+    x = x.view(B, pad_h // window_size[0], pad_w // window_size[1], window_size[0], window_size[1], C)
+    x = x.permute(0, 1, 3, 2, 4, 5).reshape(B, pad_h, pad_w, C)
+
+    # Reverse cyclic shift
+    if sum(shift_size) > 0:
+        x = torch.roll(x, shifts=(shift_size[0], shift_size[1]), dims=(1, 2))
+
+    # Unpad features
+    x = x[:, :H, :W, :].contiguous()
+
+    return x
+
+
+torch.fx.wrap("shifted_window_attention")
+
+
+class PatchMerging(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.dim = dim
+        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
+        self.norm = nn.LayerNorm(4 * dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = patch_merging_pad(x)
+        x = self.norm(x)
+        x = self.reduction(x)  # ... H/2 W/2 2*C
+
+        return x
+
+
+class ShiftedWindowAttention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        window_size: tuple[int, int],
+        shift_size: tuple[int, int],
+        num_heads: int,
+        qkv_bias: bool = True,
+        proj_bias: bool = True,
+    ) -> None:
+        super().__init__()
+        if len(window_size) != 2 or len(shift_size) != 2:
+            raise ValueError("window_size and shift_size must be of length 2")
+
+        self.window_size = window_size
+        self.shift_size = shift_size
+        self.num_heads = num_heads
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.proj = nn.Linear(dim, dim, bias=proj_bias)
+
+        self.define_relative_position_bias_table()
+        self.define_relative_position_index()
+
+    def define_relative_position_bias_table(self) -> None:
+        # Define a parameter table of relative position bias
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * self.window_size[0] - 1) * (2 * self.window_size[1] - 1), self.num_heads)
+        )  # 2*Wh-1 * 2*Ww-1, nH
+        nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
+
+    def define_relative_position_index(self) -> None:
+        # Get pair-wise relative position index for each token inside the window
+        device = self.relative_position_bias_table.device
+        coords_h = torch.arange(self.window_size[0], device=device)
+        coords_w = torch.arange(self.window_size[1], device=device)
+        coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"))  # 2, Wh, Ww
+        coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
+        relative_coords[:, :, 0] += self.window_size[0] - 1  # Shift to start from 0
+        relative_coords[:, :, 1] += self.window_size[1] - 1
+        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
+        relative_position_index = relative_coords.sum(-1).flatten()  # Wh*Ww*Wh*Ww
+        self.relative_position_index = nn.Buffer(relative_position_index)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        relative_position_bias = get_relative_position_bias(
+            self.relative_position_bias_table, self.relative_position_index, self.window_size
+        )
+        return shifted_window_attention(
+            x,
+            self.qkv.weight,
+            self.proj.weight,
+            relative_position_bias,
+            self.window_size,
+            self.num_heads,
+            shift_size=self.shift_size,
+            qkv_bias=self.qkv.bias,
+            proj_bias=self.proj.bias,
+        )
+
+
+class SwinTransformerBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        window_size: tuple[int, int],
+        shift_size: tuple[int, int],
+        mlp_ratio: float,
+        stochastic_depth_prob: float,
+    ) -> None:
+        super().__init__()
+
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = ShiftedWindowAttention(
+            dim,
+            window_size,
+            shift_size,
+            num_heads,
+        )
+        self.stochastic_depth = StochasticDepth(stochastic_depth_prob, "row")
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = MLP(dim, [int(dim * mlp_ratio), dim], activation_layer=nn.GELU, inplace=None)
+
+        for m in self.mlp.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.normal_(m.bias, std=1e-6)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.stochastic_depth(self.attn(self.norm1(x)))
+        x = x + self.stochastic_depth(self.mlp(self.norm2(x)))
+
+        return x
+
+
+class Swin_Transformer_v1(DetectorBackbone, PreTrainEncoder, MaskedTokenRetentionMixin):
+    block_group_regex = r"body\.stage(\d+)\.(\d+)"
+
+    def __init__(
+        self,
+        input_channels: int,
+        num_classes: int,
+        *,
+        config: Optional[dict[str, Any]] = None,
+        size: Optional[tuple[int, int]] = None,
+    ) -> None:
+        super().__init__(input_channels, num_classes, config=config, size=size)
+        assert self.config is not None, "must set config"
+
+        mlp_ratio = 4.0
+        patch_size = 4
+        window_size = (int(self.size[0] / (2**5)), int(self.size[1] / (2**5)))
+        embed_dim: int = self.config["embed_dim"]
+        depths: list[int] = self.config["depths"]
+        num_heads: list[int] = self.config["num_heads"]
+        drop_path_rate: float = self.config["drop_path_rate"]
+        drop_path_uniform: bool = self.config.get("drop_path_uniform", False)
+
+        self.grad_checkpointing = False
+        self.grad_checkpointing_segments: Optional[int] = None
+        self.grad_checkpointing_preserve_rng_state = True
+        self.grad_checkpointing_use_reentrant = False
+        self._grad_checkpointing_blocks = ()
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(
+                self.input_channels,
+                embed_dim,
+                kernel_size=(patch_size, patch_size),
+                stride=(patch_size, patch_size),
+                padding=(0, 0),
+            ),
+            Permute([0, 2, 3, 1]),
+            nn.LayerNorm(embed_dim, eps=1e-5),
+        )
+
+        total_stage_blocks = sum(depths)
+        dpr = stochastic_depth_rates(drop_path_rate, total_stage_blocks, constant=drop_path_uniform)
+        stage_block_id = 0
+        stages: OrderedDict[str, nn.Module] = OrderedDict()
+        return_channels: list[int] = []
+        layers = []
+        for i_stage, depth in enumerate(depths):
+            dim = embed_dim * 2**i_stage
+            for i_layer in range(depth):
+                if i_layer % 2 == 0:
+                    shift_size = (0, 0)
+                else:
+                    shift_size = (window_size[0] // 2, window_size[1] // 2)
+
+                layers.append(
+                    SwinTransformerBlock(
+                        dim,
+                        num_heads[i_stage],
+                        window_size=window_size,
+                        shift_size=shift_size,
+                        mlp_ratio=mlp_ratio,
+                        stochastic_depth_prob=dpr[stage_block_id],
+                    )
+                )
+                stage_block_id += 1
+
+            stages[f"stage{i_stage+1}"] = nn.Sequential(*layers)
+            return_channels.append(dim)
+            layers = []
+
+            # Add patch merging layer
+            if i_stage < (len(depths) - 1):
+                layers.append(PatchMerging(dim))
+
+        num_features = embed_dim * 2 ** (len(depths) - 1)
+        self.body = nn.Sequential(stages)
+        self.features = nn.Sequential(
+            nn.LayerNorm(num_features, eps=1e-5),
+            Permute([0, 3, 1, 2]),  # B H W C -> B C H W
+            nn.AdaptiveAvgPool2d(output_size=(1, 1)),
+            nn.Flatten(1),
+        )
+        self.return_channels = return_channels
+        self.embedding_size = num_features
+        self.classifier = self.create_classifier()
+
+        self.max_stride = 32
+        self.stem_stride = patch_size
+        self.stem_width = embed_dim
+        self.feature_dim = num_features
+
+        # Weight initialization
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def _get_input_conv(self) -> nn.Conv2d:
+        conv = self.stem[0]
+        return conv
+
+    def set_grad_checkpointing(
+        self,
+        enable: bool = True,
+        *,
+        segments: Optional[int] = None,
+        preserve_rng_state: bool = True,
+        use_reentrant: bool = False,
+    ) -> None:
+        if enable is True:
+            logger.debug(
+                f"Enabling gradient checkpointing: segments={segments}, "
+                f"preserve_rng_state={preserve_rng_state}, use_reentrant={use_reentrant}"
+            )
+        else:
+            logger.debug("Disabling gradient checkpointing")
+
+        self.grad_checkpointing = enable
+        self.grad_checkpointing_segments = segments
+        self.grad_checkpointing_preserve_rng_state = preserve_rng_state
+        self.grad_checkpointing_use_reentrant = use_reentrant
+        if enable is True:
+            self._grad_checkpointing_blocks = tuple(block for stage in self.body for block in stage)
+        else:
+            self._grad_checkpointing_blocks = ()
+
+    def detection_features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        x = self.stem(x)
+
+        out = {}
+        for name, module in self.body.named_children():
+            x = module(x)
+            if name in self.return_stages:
+                out[name] = x.permute(0, 3, 1, 2).contiguous()
+
+        return out
+
+    def freeze_stages(self, up_to_stage: int) -> None:
+        for param in self.stem.parameters():
+            param.requires_grad_(False)
+
+        for idx, module in enumerate(self.body.children()):
+            if idx >= up_to_stage:
+                break
+
+            for param in module.parameters():
+                param.requires_grad_(False)
+
+    def masked_encoding_retention(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        mask_token: Optional[torch.Tensor] = None,
+        return_keys: Literal["all", "features", "embedding"] = "features",
+    ) -> TokenRetentionResultType:
+        x = self.stem(x)
+        x = mask_tensor(
+            x, mask, channels_last=True, patch_factor=self.max_stride // self.stem_stride, mask_token=mask_token
+        )
+        if self.grad_checkpointing is True and torch.is_grad_enabled() is True and not torch.jit.is_scripting():
+            if self.grad_checkpointing_segments is None:
+                segments = len(self._grad_checkpointing_blocks)
+            else:
+                segments = min(self.grad_checkpointing_segments, len(self._grad_checkpointing_blocks))
+
+            x = checkpoint_sequential(
+                self._grad_checkpointing_blocks,
+                segments,
+                x,
+                use_reentrant=self.grad_checkpointing_use_reentrant,
+                preserve_rng_state=self.grad_checkpointing_preserve_rng_state,
+            )
+        else:
+            x = self.body(x)
+
+        result: TokenRetentionResultType = {}
+        if return_keys in ("all", "features"):
+            result["features"] = x.permute(0, 3, 1, 2).contiguous()
+        if return_keys in ("all", "embedding"):
+            result["embedding"] = self.features(x)
+
+        return result
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        if self.grad_checkpointing is True and torch.is_grad_enabled() is True and not torch.jit.is_scripting():
+            if self.grad_checkpointing_segments is None:
+                segments = len(self._grad_checkpointing_blocks)
+            else:
+                segments = min(self.grad_checkpointing_segments, len(self._grad_checkpointing_blocks))
+
+            return checkpoint_sequential(
+                self._grad_checkpointing_blocks,
+                segments,
+                x,
+                use_reentrant=self.grad_checkpointing_use_reentrant,
+                preserve_rng_state=self.grad_checkpointing_preserve_rng_state,
+            )
+
+        return self.body(x)
+
+    def flatten_features(self, features: torch.Tensor, include_special_tokens: bool = True) -> torch.Tensor:
+        return features.flatten(1, 2)
+
+    def embedding_from_features(self, features: torch.Tensor) -> torch.Tensor:
+        return self.features(features)
+
+    def adjust_size(self, new_size: tuple[int, int]) -> None:
+        if new_size == self.size:
+            return
+
+        super().adjust_size(new_size)
+
+        with torch.no_grad():
+            for m in self.body.modules():
+                if isinstance(m, SwinTransformerBlock):
+                    old_window_size = m.attn.window_size
+                    new_window_size = (new_size[0] // (2**5), new_size[1] // (2**5))
+                    m.attn.window_size = new_window_size
+                    shift_size_h = m.attn.shift_size[0]
+                    shift_size_w = m.attn.shift_size[1]
+                    if shift_size_h != 0:
+                        shift_size_h = m.attn.window_size[0] // 2
+
+                    if shift_size_w != 0:
+                        shift_size_w = m.attn.window_size[1] // 2
+
+                    m.attn.shift_size = (shift_size_h, shift_size_w)
+
+                    m.attn.define_relative_position_index()
+
+                    # Interpolate relative_position_bias_table, adapted from
+                    # https://github.com/huggingface/pytorch-image-models/blob/main/timm/layers/pos_embed_rel.py
+                    src_size = (2 * old_window_size[0] - 1, 2 * old_window_size[1] - 1)
+                    dst_size = (2 * new_window_size[0] - 1, 2 * new_window_size[1] - 1)
+                    rel_pos_bias = m.attn.relative_position_bias_table.detach()
+                    rel_pos_device = rel_pos_bias.device
+                    rel_pos_dtype = rel_pos_bias.dtype
+                    rel_pos_bias = rel_pos_bias.cpu()
+                    if rel_pos_dtype in (torch.float16, torch.bfloat16):
+                        rel_pos_bias = rel_pos_bias.float()
+
+                    num_attn_heads = rel_pos_bias.size(1)
+
+                    def _calc(src: int, dst: int) -> list[float]:
+                        left, right = 1.01, 1.5
+                        while right - left > 1e-6:
+                            q = (left + right) / 2.0
+                            gp = (1.0 - q ** (src // 2)) / (1.0 - q)  # Geometric progression
+                            if gp > dst // 2:
+                                right = q
+                            else:
+                                left = q
+
+                        dis = []
+                        cur = 1.0
+                        for i in range(src // 2):
+                            dis.append(cur)
+                            cur += q ** (i + 1)
+
+                        r_ids = [-_ for _ in reversed(dis)]
+                        return r_ids + [0] + dis
+
+                    y = _calc(src_size[0], dst_size[0])
+                    x = _calc(src_size[1], dst_size[1])
+
+                    ty = dst_size[0] // 2.0
+                    tx = dst_size[1] // 2.0
+                    dy = torch.arange(-ty, ty + 0.1, 1.0)
+                    dx = torch.arange(-tx, tx + 0.1, 1.0)
+                    dxy = torch.meshgrid(dx, dy, indexing="ij")
+
+                    all_rel_pos_bias = []
+                    for i in range(num_attn_heads):
+                        z = rel_pos_bias[:, i].view(src_size[0], src_size[1])
+                        rgi = interpolate.RegularGridInterpolator(
+                            (x, y), z.numpy().T, method="cubic", bounds_error=False, fill_value=None
+                        )
+                        r = torch.tensor(rgi(dxy), device=rel_pos_device, dtype=rel_pos_dtype).T.contiguous()
+
+                        r = r.view(-1, 1)
+                        all_rel_pos_bias.append(r)
+
+                    rel_pos_bias = torch.concat(all_rel_pos_bias, dim=-1)
+                    m.attn.relative_position_bias_table = nn.Parameter(
+                        rel_pos_bias, requires_grad=m.attn.relative_position_bias_table.requires_grad
+                    )
+
+
+registry.register_model_config(
+    "swin_transformer_v1_t",
+    Swin_Transformer_v1,
+    config={
+        "embed_dim": 96,
+        "depths": [2, 2, 6, 2],
+        "num_heads": [3, 6, 12, 24],
+        "drop_path_rate": 0.2,
+    },
+)
+registry.register_model_config(
+    "swin_transformer_v1_s",
+    Swin_Transformer_v1,
+    config={
+        "embed_dim": 96,
+        "depths": [2, 2, 18, 2],
+        "num_heads": [3, 6, 12, 24],
+        "drop_path_rate": 0.3,
+    },
+)
+registry.register_model_config(
+    "swin_transformer_v1_b",
+    Swin_Transformer_v1,
+    config={
+        "embed_dim": 128,
+        "depths": [2, 2, 18, 2],
+        "num_heads": [4, 8, 16, 32],
+        "drop_path_rate": 0.5,
+    },
+)
+registry.register_model_config(
+    "swin_transformer_v1_l",
+    Swin_Transformer_v1,
+    config={
+        "embed_dim": 192,
+        "depths": [2, 2, 18, 2],
+        "num_heads": [6, 12, 24, 48],
+        "drop_path_rate": 0.5,
+    },
+)

@@ -1,0 +1,79 @@
+# Project data directories
+/data/
+/models/
+/runs/
+/results/
+
+# Project generated documentation
+/public/
+
+# Clustering related logs (Slurm, etc.)
+/logs/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# Virtualenv
+.Python
+pyvenv.cfg
+.venv
+pip-selfcheck.json
+
+# Packaging
+.pypirc
+*.egg-info/
+dist/
+
+# C extensions
+*.so
+
+# System Files
+.DS_Store
+Thumbs.db
+
+# Unit test / coverage reports
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Editor directories and files
+.idea
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+Session.vim
+Sessionx.vim
+
+# VSCode IDE
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/cspell.json
+
+# Profile files
+*.prof
+
+# Jupyter Notebooks
+*.ipynb
+.ipynb_checkpoints
+
+# Vagrant
+.vagrant

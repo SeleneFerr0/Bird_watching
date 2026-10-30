@@ -1,0 +1,96 @@
+import copy
+from typing import Any
+from typing import ClassVar
+from typing import Optional
+from typing import TypedDict
+
+import torch
+from torch import nn
+
+from birder.layers.moe import MoETrainingOutputType
+from birder.model_registry import Task
+from birder.model_registry import registry
+from birder.net.base import BaseNet
+from birder.net.base import DataShapeType
+
+SSLSignatureType = TypedDict(
+    "SSLSignatureType",
+    {
+        "inputs": list[DataShapeType],
+        "outputs": list[DataShapeType],
+    },
+)
+
+
+def get_ssl_signature(input_shape: tuple[int, ...]) -> SSLSignatureType:
+    return {
+        "inputs": [{"data_shape": [0, *input_shape[1:]]}],
+        "outputs": [{"data_shape": [0]}],
+    }
+
+
+def combine_moe_training_outputs(
+    output: Optional[MoETrainingOutputType],
+    additional_output: MoETrainingOutputType,
+    *,
+    additional_loss_weight: float = 1.0,
+) -> MoETrainingOutputType:
+    weighted_output = {
+        key: value if key == "expert_loads" else additional_loss_weight * value
+        for key, value in additional_output.items()
+    }
+    if output is None:
+        return weighted_output
+
+    return {key: output[key] + value for key, value in weighted_output.items()}
+
+
+class SSLBaseNet(nn.Module):
+    auto_register: ClassVar[bool] = True
+    square_only: ClassVar[bool] = False
+    task: ClassVar[str] = str(Task.SELF_SUPERVISED_LEARNING)
+
+    def __init_subclass__(cls) -> None:
+        super().__init_subclass__()
+        if cls.auto_register is False:
+            # Exclude networks with custom config (initialized only with registered configs)
+            return
+
+        registry.register_model(cls.__name__.lower(), cls)
+
+    def __init__(
+        self,
+        backbone: BaseNet,
+        *,
+        config: Optional[dict[str, Any]] = None,
+        size: Optional[tuple[int, int]] = None,
+    ) -> None:
+        super().__init__()
+        self.input_channels = backbone.input_channels
+        self.backbone = backbone
+
+        if hasattr(self, "config") is False:  # Avoid overriding registered configs
+            self.config = config
+        else:
+            if self.config is not None:
+                self.config = copy.deepcopy(self.config)  # Avoid mutating registered configs
+
+        if config is not None:
+            assert self.config is not None
+            self.config.update(config)  # Override with custom config
+
+        if size is not None:
+            self.size = size
+        else:
+            self.size = self.backbone.size
+
+        assert isinstance(self.size, tuple)
+        assert isinstance(self.size[0], int)
+        assert isinstance(self.size[1], int)
+        if self.square_only is True:
+            assert self.size[0] == self.size[1]
+
+        self.backbone.adjust_size(self.size)
+
+    def forward(self, x: torch.Tensor) -> Any:
+        raise NotImplementedError

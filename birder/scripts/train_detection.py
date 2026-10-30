@@ -1,0 +1,1385 @@
+import argparse
+import json
+import logging
+import math
+import os
+import sys
+import time
+import types
+from collections.abc import Iterator
+from contextlib import nullcontext
+from pathlib import Path
+from typing import Any
+from typing import Optional
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.amp
+import torchinfo
+import webdataset as wds
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
+from tqdm import tqdm
+
+from birder.common import cli
+from birder.common import fs_ops
+from birder.common import lib
+from birder.common import training_cli
+from birder.common import training_utils
+from birder.conf import settings
+from birder.data.collators.detection import BatchRandomResizeCollator
+from birder.data.collators.detection import DetectionCollator
+from birder.data.dataloader.webdataset import make_wds_loader
+from birder.data.datasets.coco import CocoMosaicTraining
+from birder.data.datasets.coco import CocoTraining
+from birder.data.datasets.coco import build_label_mapping_indices
+from birder.data.datasets.webdataset import make_wds_detection_dataset
+from birder.data.datasets.webdataset import make_wds_mosaic_detection_dataset
+from birder.data.datasets.webdataset import prepare_wds_args
+from birder.data.datasets.webdataset import wds_args_from_info
+from birder.data.transforms.classification import get_rgb_stats
+from birder.data.transforms.detection import InferenceTransform
+from birder.data.transforms.detection import resolve_multiscale_long_edge_size
+from birder.data.transforms.detection import resolve_multiscale_sizes
+from birder.data.transforms.detection import training_preset
+from birder.model_registry import Task
+from birder.model_registry import registry
+from birder.net.base import DetectorBackbone
+from birder.net.detection.base import get_detection_signature
+
+logger = logging.getLogger(__name__)
+
+
+class VirtualEpochMosaicSampler(torch.utils.data.Sampler[tuple[int, bool]]):
+    """
+    Wrap a sampler and attach a main-process mosaic decision to each sample
+
+    This is intended for virtual-epoch training with a long-lived DataLoader iterator.
+    Calling set_epoch() updates the mosaic probability for subsequently generated samples,
+    but with num_workers > 0 already-prefetched batches may still reflect the previous epoch.
+    """
+
+    def __init__(
+        self,
+        sampler: torch.utils.data.Sampler[int],
+        mosaic_dataset: CocoMosaicTraining,
+    ) -> None:
+        super().__init__()
+        self.sampler = sampler
+        self.mosaic_dataset = mosaic_dataset
+        self.epoch = 1
+
+    def __iter__(self) -> Iterator[tuple[int, bool]]:
+        for index in self.sampler:
+            mosaic_prob = self.mosaic_dataset.mosaic_prob_for_epoch(self.epoch)
+            should_mosaic = bool(torch.rand(()) < mosaic_prob)
+            yield (index, should_mosaic)
+
+    def __len__(self) -> int:
+        return len(self.sampler)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+        if hasattr(self.sampler, "set_epoch") is True:
+            self.sampler.set_epoch(epoch)
+
+
+def _rebind_forward_functions(model: torch.nn.Module) -> None:
+    # EMA deep-copies models that monkey-patch instance forwards (e.g. torch.compiler.disable),
+    # leaving the wrapper bound to the original instance. Rebind to keep eval_model correct.
+    for module in model.modules():
+        if isinstance(module.__dict__.get("forward"), types.FunctionType):
+            module.forward = types.MethodType(type(module).forward, module)
+
+
+def _make_validation_subset(
+    dataset: torch.utils.data.Dataset, subset_size: int, seed: Optional[int]
+) -> torch.utils.data.Dataset:
+    dataset_len = len(dataset)
+    if subset_size >= dataset_len:
+        return dataset
+
+    generator = torch.Generator()
+    generator.manual_seed(0 if seed is None else seed)
+    indices = torch.randperm(dataset_len, generator=generator)[:subset_size].tolist()
+    indices.sort()
+
+    return torch.utils.data.Subset(dataset, indices)
+
+
+def _make_wds_validation_subset(dataset: wds.WebDataset, subset_size: int) -> Any:
+    dataset_len = len(dataset)
+    if subset_size >= dataset_len:
+        return dataset
+
+    return dataset.slice(subset_size).with_length(subset_size, silent=True)
+
+
+def _resolve_wds_labels(
+    class_file: str, binary_mode: bool, binary_class_name: str, label_mapping: Optional[dict[str, str]]
+) -> tuple[dict[str, int], Optional[dict[int, int]]]:
+    source_class_to_idx = lib.detection_class_to_idx(fs_ops.read_class_file(class_file))
+    if binary_mode is True:
+        label_remap = {idx: 1 for idx in source_class_to_idx.values()}
+        return ({binary_class_name: 1}, label_remap)
+
+    if label_mapping is None:
+        return (source_class_to_idx, None)
+
+    class_to_idx, label_remap = build_label_mapping_indices(source_class_to_idx, label_mapping)
+
+    return (class_to_idx, label_remap)
+
+
+def train(args: argparse.Namespace) -> None:
+    #
+    # Initialize
+    #
+    per_image_multiscale = args.multiscale is True or args.aug_type in {"multiscale", "detr"}
+    transform_dynamic_size = per_image_multiscale is True or args.dynamic_size is True or args.max_size is not None
+    model_dynamic_size = transform_dynamic_size or args.batch_multiscale is True
+
+    device, device_id, disable_tqdm = training_utils.init_training(args, logger, cudnn_dynamic_size=model_dynamic_size)
+
+    if args.size is None:
+        args.size = registry.get_default_size(args.network)
+
+    validation_max_size = args.max_size
+    if per_image_multiscale is True:
+        validation_multiscale_sizes = resolve_multiscale_sizes(
+            args.size, args.multiscale_min_size, args.multiscale_max_size, multiscale_step=args.multiscale_step
+        )
+        validation_max_size = resolve_multiscale_long_edge_size(validation_multiscale_sizes, args.max_size)
+
+    if model_dynamic_size is False:
+        logger.info(f"Using size={args.size}")
+    elif args.batch_multiscale is True:
+        logger.info(f"Running with batch multiscale, with base size={args.size}")
+    else:
+        logger.info(f"Running with dynamic size, with base size={args.size}")
+
+    #
+    # Data
+    #
+    rgb_stats = get_rgb_stats(args.rgb_mode, args.rgb_mean, args.rgb_std)
+    logger.debug(f"Using RGB stats: {rgb_stats}")
+    label_mapping: Optional[dict[str, str]] = None
+    if args.label_mapping is not None:
+        with open(args.label_mapping, "r", encoding="utf-8") as handle:
+            label_mapping = json.load(handle)
+
+    train_transform_size = args.size
+    if args.batch_multiscale is True:
+        batch_multiscale_base_size = max(args.size)
+        batch_multiscale_sizes = resolve_multiscale_sizes(
+            (batch_multiscale_base_size, batch_multiscale_base_size),
+            args.multiscale_min_size,
+            args.multiscale_max_size,
+            multiscale_step=args.multiscale_step,
+        )
+        batch_multiscale_max_size = batch_multiscale_sizes[-1]
+        train_transform_size = (batch_multiscale_max_size, batch_multiscale_max_size)
+        logger.info(f"Using batch multiscale transform target size={train_transform_size}")
+
+    transforms = training_preset(
+        train_transform_size,
+        args.aug_type,
+        args.aug_level,
+        rgb_stats,
+        dynamic_size=args.dynamic_size,
+        multiscale=args.multiscale,
+        max_size=args.max_size,
+        multiscale_min_size=args.multiscale_min_size,
+        multiscale_max_size=args.multiscale_max_size,
+        multiscale_step=args.multiscale_step,
+    )
+    mosaic_dataset = None
+    if args.wds is True:
+        training_wds_path: str | list[str]
+        val_wds_path: str | list[str]
+        if args.wds_info is not None:
+            training_wds_path, training_size = wds_args_from_info(args.wds_info, args.wds_training_split)
+            val_wds_path, val_size = wds_args_from_info(args.wds_info, args.wds_val_split)
+            if args.wds_train_size is not None:
+                training_size = args.wds_train_size
+            if args.wds_val_size is not None:
+                val_size = args.wds_val_size
+        else:
+            training_wds_path, training_size = prepare_wds_args(
+                args.data_path, args.wds_train_size, device, select_suffix="json"
+            )
+            val_wds_path, val_size = prepare_wds_args(args.val_path, args.wds_val_size, device, select_suffix="json")
+
+        class_to_idx, label_remap = _resolve_wds_labels(
+            args.wds_class_file, args.binary_mode, args.binary_class_name, label_mapping
+        )
+        if args.mosaic_prob > 0.0:
+            mosaic_transforms = training_preset(
+                train_transform_size,
+                args.aug_type,
+                args.aug_level,
+                rgb_stats,
+                dynamic_size=args.dynamic_size,
+                multiscale=args.multiscale,
+                max_size=args.max_size,
+                multiscale_min_size=args.multiscale_min_size,
+                multiscale_max_size=args.multiscale_max_size,
+                multiscale_step=args.multiscale_step,
+                post_mosaic=True,
+            )
+            if transform_dynamic_size is True:
+                if args.max_size is not None:
+                    mosaic_dim = args.max_size
+                else:
+                    mosaic_dim = min(train_transform_size) * 2
+            else:
+                mosaic_dim = max(train_transform_size) * 2
+
+            training_dataset = make_wds_mosaic_detection_dataset(
+                training_wds_path,
+                dataset_size=training_size,
+                transform=transforms,
+                mosaic_transforms=mosaic_transforms,
+                mosaic_prob=args.mosaic_prob,
+                mosaic_type=args.mosaic_type,
+                output_size=(mosaic_dim, mosaic_dim),
+                fill_value=114,
+                label_remap=label_remap,
+                cache_dir=args.wds_cache_dir,
+            )
+            logger.info(f"WDS mosaic: prob={args.mosaic_prob}, type={args.mosaic_type}")
+        else:
+            training_dataset = make_wds_detection_dataset(
+                training_wds_path,
+                dataset_size=training_size,
+                shuffle=True,
+                transform=transforms,
+                label_remap=label_remap,
+                cache_dir=args.wds_cache_dir,
+            )
+        validation_dataset = make_wds_detection_dataset(
+            val_wds_path,
+            dataset_size=val_size,
+            shuffle=False,
+            transform=InferenceTransform(args.size, rgb_stats, transform_dynamic_size, validation_max_size),
+            label_remap=label_remap,
+            cache_dir=args.wds_cache_dir,
+        )
+
+    else:
+        if args.mosaic_prob > 0.0:
+            mosaic_transforms = training_preset(
+                train_transform_size,
+                args.aug_type,
+                args.aug_level,
+                rgb_stats,
+                dynamic_size=args.dynamic_size,
+                multiscale=args.multiscale,
+                max_size=args.max_size,
+                multiscale_min_size=args.multiscale_min_size,
+                multiscale_max_size=args.multiscale_max_size,
+                multiscale_step=args.multiscale_step,
+                post_mosaic=True,
+            )
+            if transform_dynamic_size is True:
+                # Dynamic/Multiscale: args.size is the short-side target
+                if args.max_size is not None:
+                    mosaic_dim = args.max_size
+                else:
+                    mosaic_dim = min(train_transform_size) * 2
+
+            else:
+                # Fixed size
+                mosaic_dim = max(train_transform_size) * 2
+
+            training_dataset = CocoMosaicTraining(
+                args.data_path,
+                args.coco_json_path,
+                transforms=transforms,
+                mosaic_transforms=mosaic_transforms,
+                output_size=(mosaic_dim, mosaic_dim),
+                fill_value=114,
+                mosaic_prob=args.mosaic_prob,
+                mosaic_type=args.mosaic_type,
+                normalize_empty_targets=True,
+            )
+            mosaic_dataset = training_dataset
+            if args.mosaic_stop_epoch is not None:
+                training_dataset.configure_mosaic_linear_decay(
+                    args.mosaic_prob, args.mosaic_stop_epoch, decay_fraction=0.1
+                )
+                logger.info(
+                    "Mosaic schedule: "
+                    f"base_prob={args.mosaic_prob}, "
+                    f"stop_epoch={args.mosaic_stop_epoch}, "
+                    f"decay_start={training_dataset.mosaic_decay_start}, "
+                    "decay_fraction=0.1"
+                )
+        else:
+            training_dataset = CocoTraining(
+                args.data_path, args.coco_json_path, transforms=transforms, normalize_empty_targets=True
+            )
+
+        validation_dataset = CocoTraining(
+            args.val_path,
+            args.coco_val_json_path,
+            transforms=InferenceTransform(args.size, rgb_stats, transform_dynamic_size, validation_max_size),
+        )
+
+    if args.ignore_file is not None:
+        with open(args.ignore_file, "r", encoding="utf-8") as handle:
+            ignore_list = handle.read().splitlines()
+    else:
+        ignore_list = []
+
+    if args.wds is False:
+        if args.binary_mode is True:
+            training_dataset.convert_to_binary_annotations(args.binary_class_name)
+            validation_dataset.convert_to_binary_annotations(args.binary_class_name)
+            class_to_idx = training_dataset.class_to_idx
+        elif label_mapping is not None:
+            original_num_labels = len(training_dataset.class_to_idx)
+            class_to_idx = training_dataset.convert_annotations_with_label_mapping(label_mapping)
+            validation_dataset.convert_annotations_with_label_mapping(label_mapping, target_class_to_idx=class_to_idx)
+            logger.info(f"Applied label mapping: {original_num_labels} -> {len(class_to_idx)} labels")
+        else:
+            target_class_to_idx = None
+            use_class_file_ids = False
+            if args.class_file is not None:
+                target_class_to_idx = lib.detection_class_to_idx(fs_ops.read_class_file(args.class_file))
+                use_class_file_ids = True
+
+            class_to_idx = training_dataset.normalize_annotations(
+                target_class_to_idx=target_class_to_idx, use_class_file_ids=use_class_file_ids
+            )
+            validation_dataset.normalize_annotations(
+                target_class_to_idx=class_to_idx, use_class_file_ids=use_class_file_ids
+            )
+
+        if args.drop_empty is True:
+            logger.debug("Dropping training images without valid object annotations")
+
+        training_dataset.remove_images_without_annotations(ignore_list, allow_empty=not args.drop_empty)
+
+    full_validation_dataset_len = len(validation_dataset)
+    if args.val_subset_size is not None:
+        if args.wds is True:
+            validation_dataset = _make_wds_validation_subset(validation_dataset, args.val_subset_size)
+        else:
+            validation_dataset = _make_validation_subset(validation_dataset, args.val_subset_size, args.seed)
+
+    logger.info(f"Using device {device}:{device_id}")
+    logger.info(f"Training dataset has {len(training_dataset):,} samples")
+    if len(validation_dataset) == full_validation_dataset_len:
+        logger.info(f"Validation dataset has {len(validation_dataset):,} samples")
+    else:
+        logger.info(
+            f"Validation dataset has {len(validation_dataset):,} samples "
+            f"(subset of {full_validation_dataset_len:,})"
+        )
+
+    num_outputs = len(class_to_idx)  # Does not include background class
+    batch_size: int = args.batch_size
+    grad_accum_steps: int = args.grad_accum_steps
+    model_ema_steps: int = args.model_ema_steps
+    logger.debug(f"Effective batch size = {batch_size * grad_accum_steps * args.world_size}")
+
+    # Data loaders and samplers
+    virtual_epoch_mode = args.steps_per_epoch is not None
+    train_sampler, validation_sampler = training_utils.get_samplers(
+        args, training_dataset, validation_dataset, device=device, infinite=virtual_epoch_mode
+    )
+
+    if args.batch_multiscale is True:
+        train_collate_fn: Any = BatchRandomResizeCollator(
+            0,
+            args.size,
+            size_divisible=args.multiscale_step,
+            multiscale_min_size=args.multiscale_min_size,
+            multiscale_max_size=batch_multiscale_max_size,
+            multiscale_step=args.multiscale_step,
+        )
+    else:
+        train_collate_fn = DetectionCollator(0, size_divisible=args.multiscale_step)
+
+    validation_collate_fn = DetectionCollator(0, size_divisible=args.multiscale_step)
+
+    if args.wds is True:
+        training_loader = make_wds_loader(
+            training_dataset,
+            batch_size,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+            collate_fn=train_collate_fn,
+            world_size=args.world_size,
+            pin_memory=args.pin_memory,
+            drop_last=args.drop_last,
+            persistent_workers=args.persistent_workers,
+            shuffle=False,
+            infinite=virtual_epoch_mode,
+        )
+        validation_loader = make_wds_loader(
+            validation_dataset,
+            batch_size,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+            collate_fn=validation_collate_fn,
+            world_size=args.world_size,
+            pin_memory=args.pin_memory,
+            drop_last=False,
+            persistent_workers=args.persistent_workers,
+        )
+    else:
+        if virtual_epoch_mode is True and mosaic_dataset is not None:
+            train_sampler = VirtualEpochMosaicSampler(train_sampler, mosaic_dataset)
+
+        training_loader = DataLoader(
+            training_dataset,
+            batch_size=batch_size,
+            sampler=train_sampler,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+            collate_fn=train_collate_fn,
+            pin_memory=args.pin_memory,
+            drop_last=args.drop_last,
+            persistent_workers=args.persistent_workers,
+        )
+
+        validation_loader = DataLoader(
+            validation_dataset,
+            batch_size=batch_size,
+            sampler=validation_sampler,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+            collate_fn=validation_collate_fn,
+            pin_memory=args.pin_memory,
+            drop_last=False,
+            persistent_workers=args.persistent_workers,
+        )
+
+    if virtual_epoch_mode is True:
+        optimizer_steps_per_epoch = args.steps_per_epoch
+        epoch_num_batches = args.steps_per_epoch * grad_accum_steps
+        epoch_samples = epoch_num_batches * batch_size * args.world_size
+        logger.debug(f"Virtual epoch has {epoch_samples:,} samples")
+    else:
+        optimizer_steps_per_epoch = math.ceil(len(training_loader) / grad_accum_steps)
+        epoch_num_batches = len(training_loader)
+        epoch_samples = len(training_dataset)
+
+    assert args.model_ema is False or model_ema_steps <= optimizer_steps_per_epoch
+
+    last_batch_idx = epoch_num_batches - 1
+    last_accum_steps = epoch_num_batches % grad_accum_steps
+    if last_accum_steps == 0:
+        last_accum_steps = grad_accum_steps
+
+    last_accum_start_idx = epoch_num_batches - last_accum_steps
+    begin_epoch = 1 if args.resume_epoch is None else args.resume_epoch + 1
+    epochs = args.epochs + 1
+    args.stop_epoch = training_utils.normalize_stop_epoch(epochs, args.stop_epoch)
+
+    logger.debug(
+        f"Epoch has {epoch_num_batches} iterations ({optimizer_steps_per_epoch} steps), "
+        f"virtual mode={virtual_epoch_mode}"
+    )
+    training_epochs = max(0, args.stop_epoch - begin_epoch)
+
+    # Approximate total: does not account for --drop-last or sampler padding
+    logger.info(f"Training will process {epoch_samples * training_epochs:,} samples over {training_epochs} epochs")
+
+    #
+    # Initialize network
+    #
+    model_dtype: torch.dtype = getattr(torch, args.model_dtype)
+    sample_shape = (batch_size, args.channels, *args.size)  # B, C, H, W
+    network_name = lib.get_detection_network_name(
+        args.network, tag=args.tag, backbone=args.backbone, backbone_tag=args.backbone_tag
+    )
+
+    if args.resume_epoch is not None:
+        net, class_to_idx_saved, checkpoint_rgb_stats, training_states = fs_ops.load_detection_checkpoint(
+            device,
+            args.network,
+            config=args.model_config,
+            tag=args.tag,
+            backbone=args.backbone,
+            backbone_config=args.backbone_model_config,
+            backbone_tag=args.backbone_tag,
+            epoch=args.resume_epoch,
+            new_size=args.size,
+            strict=not args.non_strict_weights,
+        )
+        if checkpoint_rgb_stats != rgb_stats:
+            logger.warning(
+                f"Resuming training with RGB stats {rgb_stats}, "
+                f"but checkpoint was saved with {checkpoint_rgb_stats}"
+            )
+        if args.reset_head is True:
+            net.reset_classifier(len(class_to_idx))
+        else:
+            assert class_to_idx == class_to_idx_saved
+
+    elif args.pretrained is True:
+        fs_ops.download_model_by_weights(network_name, progress_bar=training_utils.is_local_primary(args))
+        net, class_to_idx_saved, checkpoint_rgb_stats, training_states = fs_ops.load_detection_checkpoint(
+            device,
+            args.network,
+            config=args.model_config,
+            tag=args.tag,
+            backbone=args.backbone,
+            backbone_config=args.backbone_model_config,
+            backbone_tag=args.backbone_tag,
+            epoch=None,
+            new_size=args.size,
+            strict=not args.non_strict_weights,
+        )
+        if checkpoint_rgb_stats != rgb_stats:
+            logger.warning(
+                f"Training with RGB stats {rgb_stats}, "
+                f"but pretrained checkpoint was saved with {checkpoint_rgb_stats}"
+            )
+        if args.reset_head is True:
+            net.reset_classifier(len(class_to_idx))
+        else:
+            assert class_to_idx == class_to_idx_saved
+
+    else:
+        if args.backbone_epoch is not None:
+            backbone: DetectorBackbone
+            backbone, class_to_idx_saved, checkpoint_rgb_stats, _ = fs_ops.load_checkpoint(
+                device,
+                args.backbone,
+                config=args.backbone_model_config,
+                tag=args.backbone_tag,
+                epoch=args.backbone_epoch,
+                new_size=args.size,
+                strict=not args.non_strict_weights,
+            )
+            if checkpoint_rgb_stats != rgb_stats:
+                logger.warning(
+                    f"Training with RGB stats {rgb_stats}, "
+                    f"but backbone checkpoint was saved with {checkpoint_rgb_stats}"
+                )
+
+        elif args.backbone_pretrained is True:
+            fs_ops.download_model_by_weights(
+                lib.get_network_name(args.backbone, tag=args.backbone_tag),
+                progress_bar=training_utils.is_global_primary(args),
+            )
+            backbone, class_to_idx_saved, checkpoint_rgb_stats, _ = fs_ops.load_checkpoint(
+                device,
+                args.backbone,
+                config=args.backbone_model_config,
+                tag=args.backbone_tag,
+                epoch=None,
+                new_size=args.size,
+                strict=not args.non_strict_weights,
+            )
+            if checkpoint_rgb_stats != rgb_stats:
+                logger.warning(
+                    f"Training with RGB stats {rgb_stats}, "
+                    f"but pretrained backbone checkpoint was saved with {checkpoint_rgb_stats}"
+                )
+
+        else:
+            backbone = registry.net_factory(
+                args.backbone, num_outputs, sample_shape[1], config=args.backbone_model_config, size=args.size
+            )
+
+        net = registry.detection_net_factory(
+            args.network, num_outputs, backbone, config=args.model_config, size=args.size
+        )
+        training_states = fs_ops.TrainingStates.empty()
+
+    net.to(device, dtype=model_dtype)
+    if args.channels_last is True:
+        net = net.to(memory_format=torch.channels_last)
+        logger.debug("Using channels-last memory format")
+
+    if model_dynamic_size is True:
+        net.set_dynamic_size()
+
+    # Freeze
+    if args.freeze_body is True:
+        net.freeze(freeze_classifier=False)
+    elif args.freeze_backbone is True:
+        net.backbone.freeze()
+    elif args.freeze_backbone_stages is not None:
+        net.backbone.freeze_stages(up_to_stage=args.freeze_backbone_stages)
+    elif args.freeze_backbone_layers is not None:
+        frozen_layers = training_utils.freeze_layers_by_block_group_regex(net.backbone, args.freeze_backbone_layers)
+        logger.info(f"Froze {frozen_layers} backbone layers using block_group_regex")
+
+    if args.freeze_modules is not None:
+        training_utils.freeze_modules_by_name(net, args.freeze_modules)
+        logger.info(f"Froze modules: {', '.join(args.freeze_modules)}")
+    if args.freeze_backbone_modules is not None:
+        training_utils.freeze_modules_by_name(net.backbone, args.freeze_backbone_modules)
+        logger.info(f"Froze backbone modules: {', '.join(args.freeze_backbone_modules)}")
+
+    if args.freeze_bn is True:
+        net = training_utils.freeze_batchnorm2d(net)
+    elif args.freeze_backbone_bn is True:
+        net.backbone = training_utils.freeze_batchnorm2d(net.backbone)
+
+    if args.sync_bn is True and args.distributed is True:
+        net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net)
+
+    if args.fast_matmul is True or args.amp is True:
+        torch.set_float32_matmul_precision("high")
+
+    # Compile network
+    if args.compile is True:
+        net = torch.compile(net, fullgraph=args.compile_fullgraph, mode=args.compile_mode)
+    elif args.compile_backbone is True:
+        net.backbone.detection_features = torch.compile(  # type: ignore[method-assign]
+            net.backbone.detection_features, fullgraph=args.compile_fullgraph, mode=args.compile_mode
+        )
+
+    #
+    # Loss criteria, optimizer, learning rate scheduler and training parameter groups
+    #
+
+    # Learning rate scaling
+    lr = training_utils.scale_lr(args)
+
+    # Training parameter groups
+    custom_keys_weight_decay = training_utils.get_wd_custom_keys(args)
+    parameters = training_utils.optimizer_parameter_groups(
+        net,
+        args.wd,
+        base_lr=lr,
+        norm_weight_decay=args.norm_wd,
+        custom_keys_weight_decay=custom_keys_weight_decay,
+        custom_layer_weight_decay=args.custom_layer_wd,
+        layer_decay=args.layer_decay,
+        backbone_layer_decay=args.backbone_layer_decay,
+        layer_decay_min_scale=args.layer_decay_min_scale,
+        layer_decay_no_opt_scale=args.layer_decay_no_opt_scale,
+        bias_lr=args.bias_lr,
+        backbone_lr=args.backbone_lr,
+        custom_layer_lr_scale=args.custom_layer_lr_scale,
+    )
+
+    if args.lr_scheduler_update == "epoch":
+        step_update = False
+        scheduler_steps_per_epoch = 1
+    elif args.lr_scheduler_update == "step":
+        step_update = True
+        scheduler_steps_per_epoch = optimizer_steps_per_epoch
+    else:
+        raise ValueError("Unsupported lr_scheduler_update")
+
+    # Optimizer and learning rate scheduler
+    optimizer = training_utils.get_optimizer(parameters, lr, args)
+    scheduler = training_utils.get_scheduler(optimizer, scheduler_steps_per_epoch, args)
+    if args.compile_opt is True:
+        optimizer.step = torch.compile(optimizer.step, fullgraph=False)
+
+    # Gradient scaler and AMP related tasks
+    scaler, amp_dtype = training_utils.get_amp_scaler(device, args.amp, args.amp_dtype)
+
+    # Load states
+    if args.load_states is True:
+        optimizer.load_state_dict(training_states.optimizer_state)
+        scheduler.load_state_dict(training_states.scheduler_state)
+        if scaler is not None:
+            scaler.load_state_dict(training_states.scaler_state)
+
+    elif args.load_scheduler is True:
+        scheduler.load_state_dict(training_states.scheduler_state)
+        last_lrs = scheduler.get_last_lr()
+        for g, last_lr in zip(optimizer.param_groups, last_lrs):
+            g["lr"] = last_lr
+
+    last_lr = float(max(scheduler.get_last_lr()))
+    if args.plot_lr is True:
+        logger.info("Fast forwarding scheduler...")
+        optimizer.step()
+        lrs = []
+        for _ in range(begin_epoch, epochs):
+            for _ in range(scheduler_steps_per_epoch):
+                lrs.append(float(max(scheduler.get_last_lr())))
+                scheduler.step()
+
+        plt.plot(
+            np.linspace(begin_epoch, epochs, scheduler_steps_per_epoch * (epochs - begin_epoch), endpoint=False),
+            lrs,
+        )
+        plt.show()
+        raise SystemExit(0)
+
+    #
+    # Distributed (DDP) and Model EMA
+    #
+    if args.model_ema_warmup is not None:
+        ema_warmup_steps = args.model_ema_warmup * optimizer_steps_per_epoch
+    elif args.warmup_epochs is not None:
+        ema_warmup_steps = args.warmup_epochs * optimizer_steps_per_epoch
+    elif args.warmup_steps is not None:
+        ema_warmup_steps = args.warmup_steps
+    else:
+        ema_warmup_steps = 0
+
+    if args.model_ema is True:
+        logger.debug(f"EMA warmup steps = {ema_warmup_steps}")
+
+    net_without_ddp = net
+    no_sync_cm = nullcontext
+    if args.distributed is True:
+        net = torch.nn.parallel.DistributedDataParallel(
+            net,
+            device_ids=training_utils.get_ddp_device_ids(device, device_id),
+            find_unused_parameters=args.find_unused_parameters,
+            broadcast_buffers=not args.no_broadcast_buffers,
+        )
+        training_utils.register_ddp_comm_hook(net, args.ddp_comm_dtype)
+        no_sync_cm = net.no_sync
+        net_without_ddp = net.module
+
+    if args.model_ema is True:
+        model_base = net_without_ddp  # Original model without DDP wrapper, will be saved as training state
+        model_ema = training_utils.ema_model(args, net_without_ddp, device=device)
+        if (args.load_states is True or args.load_ema is True) and training_states.ema_model_state is not None:
+            logger.info("Setting model EMA state...")
+            if args.compile is True and hasattr(model_ema.module, "_orig_mod") is True:
+                model_ema.module._orig_mod.load_state_dict(training_states.ema_model_state)
+            else:
+                model_ema.module.load_state_dict(training_states.ema_model_state)
+
+            assert training_states.extra_states is not None
+            model_ema.n_averaged.copy_(training_states.extra_states["ema_state"]["n_averaged"])
+
+        if args.compile is True and hasattr(model_ema.module, "_orig_mod") is True:
+            _rebind_forward_functions(model_ema.module._orig_mod)
+        else:
+            _rebind_forward_functions(model_ema.module)
+
+        model_to_save = model_ema.module  # Save EMA model weights as default weights
+        eval_model = model_ema  # Use EMA for evaluation
+
+    else:
+        model_base = None
+        model_to_save = net_without_ddp
+        eval_model = net
+
+    if args.compile is True and hasattr(model_to_save, "_orig_mod") is True:
+        model_to_save = model_to_save._orig_mod
+    if args.compile is True and hasattr(model_base, "_orig_mod") is True:
+        model_base = model_base._orig_mod  # type: ignore[union-attr]
+
+    #
+    # Misc
+    #
+
+    # Define metrics
+    max_detection_thresholds = settings.MAX_DETECTIONS
+    validation_metrics = MeanAveragePrecision(
+        box_format="xyxy",
+        iou_type="bbox",
+        max_detection_thresholds=max_detection_thresholds,
+        average="macro",
+        backend="faster_coco_eval",
+    ).to(device)
+    metric_list = [
+        "map",
+        "map_small",
+        "map_medium",
+        "map_large",
+        "map_50",
+        "map_75",
+        *[f"mar_{threshold}" for threshold in max_detection_thresholds[:-1]],
+    ]
+
+    # Print network summary
+    net_for_info = net_without_ddp
+    if args.compile is True and hasattr(net_without_ddp, "_orig_mod") is True:
+        net_for_info = net_without_ddp._orig_mod
+
+    if args.no_summary is False:
+        summary = torchinfo.summary(
+            net_for_info,
+            device=device,
+            input_size=sample_shape,
+            dtypes=[model_dtype],
+            col_names=["input_size", "output_size", "kernel_size", "num_params"],
+            depth=4,
+            verbose=0,
+        )
+        if training_utils.is_global_primary(args) is True:
+            # Write to stderr, same as all the logs
+            print(summary, file=sys.stderr)
+
+    # Training logs
+    training_log_path = training_utils.training_log_path(network_name, device, args.experiment)
+    logger.info(f"Logging training run at {training_log_path}")
+    summary_writer = SummaryWriter(training_log_path)
+
+    signature = get_detection_signature(
+        input_shape=sample_shape, num_outputs=num_outputs, dynamic=transform_dynamic_size
+    )
+    file_handler: logging.Handler = logging.NullHandler()
+    if training_utils.is_global_primary(args) is True:
+        summary_writer.flush()
+        fs_ops.write_config(network_name, net_for_info, signature=signature, rgb_stats=rgb_stats)
+        file_handler = training_utils.setup_file_logging(training_log_path.joinpath("training.log"))
+        training_utils.write_training_args_json(training_log_path, args)
+        training_utils.write_training_data_json(
+            training_log_path,
+            {
+                "training_samples": len(training_dataset),
+                "validation_samples": len(validation_dataset),
+                "classes": lib.class_list_from_class_to_idx(class_to_idx),
+            },
+        )
+
+    #
+    # Training loop
+    #
+    optimizer_step = (begin_epoch - 1) * optimizer_steps_per_epoch
+    if virtual_epoch_mode is True:
+        train_iter = iter(training_loader)
+
+    running_loss = training_utils.SmoothedValue()
+    loss_trackers: dict[str, training_utils.SmoothedValue] = {}
+
+    logger.info(f"Starting training with learning rate of {last_lr}")
+    for epoch in range(begin_epoch, args.stop_epoch):
+        tic = time.time()
+        net.train()
+
+        # Clear metrics
+        running_loss.clear()
+        for tracker in loss_trackers.values():
+            tracker.clear()
+
+        validation_metrics.reset()
+
+        if args.distributed is True or virtual_epoch_mode is True:
+            train_sampler.set_epoch(epoch)
+        if mosaic_dataset is not None and not isinstance(train_sampler, VirtualEpochMosaicSampler):
+            mosaic_dataset.update_mosaic_prob(epoch)
+
+        progress = tqdm(
+            desc=f"Epoch {epoch}/{epochs-1}",
+            total=epoch_samples,
+            leave=False,
+            disable=disable_tqdm,
+            unit="samples",
+            initial=0,
+        )
+
+        # Zero the parameter gradients
+        optimizer.zero_grad()
+
+        epoch_start = time.time()
+        start_time = epoch_start
+        last_idx = -1
+        batch_iter: Iterator[tuple[int, Any]]
+        if virtual_epoch_mode is True:
+            batch_iter = ((i, next(train_iter)) for i in range(epoch_num_batches))
+        else:
+            batch_iter = enumerate(training_loader)
+
+        for i, (inputs, targets, masks, image_sizes) in batch_iter:
+            if args.channels_last is True:
+                inputs = inputs.to(device, dtype=model_dtype, non_blocking=True, memory_format=torch.channels_last)
+            else:
+                inputs = inputs.to(device, dtype=model_dtype, non_blocking=True)
+
+            targets = [
+                {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in t.items()}
+                for t in targets
+            ]
+            if masks is not None:
+                masks = masks.to(device, non_blocking=True)
+
+            optimizer_update = (i == last_batch_idx) or ((i + 1) % grad_accum_steps == 0)
+            sync_context = no_sync_cm if optimizer_update is False else nullcontext
+            if i >= last_accum_start_idx:
+                effective_accum_steps = last_accum_steps
+            else:
+                effective_accum_steps = grad_accum_steps
+
+            # Forward and backward
+            with sync_context():
+                with torch.amp.autocast(device.type, enabled=args.amp, dtype=amp_dtype):
+                    _detections, losses = net(inputs, targets, masks, image_sizes)
+                    raw_loss = sum(v for v in losses.values())
+
+                loss = raw_loss / effective_accum_steps
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+
+            if optimizer_update is True:
+                if scaler is not None:
+                    if args.clip_grad_norm is not None:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(net.parameters(), args.clip_grad_norm)
+
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    if args.clip_grad_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(net.parameters(), args.clip_grad_norm)
+
+                    optimizer.step()
+
+                optimizer.zero_grad()
+                if step_update is True:
+                    scheduler.step()
+
+            if optimizer_update is True:
+                optimizer_step += 1
+
+            # Exponential moving average
+            if args.model_ema is True and optimizer_update is True and optimizer_step % model_ema_steps == 0:
+                model_ema.update_parameters(net)
+                if ema_warmup_steps > 0 and optimizer_step <= ema_warmup_steps:
+                    # Reset ema buffer to keep copying weights during warmup period
+                    model_ema.n_averaged.fill_(0)
+
+            # Statistics
+            running_loss.update(raw_loss.detach())
+
+            # Dynamically create trackers on first batch
+            if len(loss_trackers) == 0:
+                for key in losses.keys():
+                    loss_trackers[key] = training_utils.SmoothedValue()
+
+            # Update individual loss trackers
+            for key, value in losses.items():
+                loss_trackers[key].update(value.detach())
+
+            # Write statistics
+            if (i + 1) % args.log_interval == 0 or i == last_batch_idx:
+                time_now = time.time()
+                time_cost = time_now - start_time
+                iters_processed_in_interval = i - last_idx
+                rate = iters_processed_in_interval * (batch_size * args.world_size) / time_cost
+
+                avg_time_per_iter = time_cost / iters_processed_in_interval
+                remaining_iters_in_epoch = last_batch_idx - i
+                estimated_time_to_finish_epoch = remaining_iters_in_epoch * avg_time_per_iter
+
+                start_time = time_now
+                last_idx = i
+                cur_lr = float(max(scheduler.get_last_lr()))
+
+                running_loss.synchronize_between_processes(device)
+                for tracker in loss_trackers.values():
+                    tracker.synchronize_between_processes(device)
+
+                with training_utils.single_handler_logging(logger, file_handler, enabled=not disable_tqdm) as log:
+                    log.info(
+                        f"[Trn] Epoch {epoch}/{epochs-1}, iter {i+1}/{last_batch_idx+1}  "
+                        f"Loss: {running_loss.avg:.4f}  "
+                        f"Elapsed: {lib.format_duration(time_now-epoch_start)}  "
+                        f"ETA: {lib.format_duration(estimated_time_to_finish_epoch)}  "
+                        f"T: {time_cost:.1f}s  "
+                        f"R: {rate:.1f} samples/s  "
+                        f"LR: {cur_lr:.4e}"
+                    )
+
+                if training_utils.is_global_primary(args) is True:
+                    loss_dict = {"training": running_loss.avg}
+                    loss_dict.update({k: v.avg for k, v in loss_trackers.items()})
+                    summary_writer.add_scalars(
+                        "loss",
+                        loss_dict,
+                        ((epoch - 1) * epoch_samples) + ((i + 1) * batch_size * args.world_size),
+                    )
+
+            # Update progress bar
+            progress.update(n=batch_size * args.world_size)
+
+        progress.close()
+
+        # Epoch training metrics
+        logger.info(f"[Trn] Epoch {epoch}/{epochs-1} training_loss: {running_loss.global_avg:.4f}")
+        for key, tracker in loss_trackers.items():
+            logger.info(f"[Trn] Epoch {epoch}/{epochs-1} {key}: {tracker.global_avg:.4f}")
+
+        # Validation
+        eval_model.eval()
+        progress = tqdm(
+            desc=f"Epoch {epoch}/{epochs-1}",
+            total=len(validation_dataset),
+            leave=False,
+            disable=disable_tqdm,
+            unit="samples",
+            initial=0,
+        )
+        with training_utils.single_handler_logging(logger, file_handler, enabled=not disable_tqdm) as log:
+            log.info(f"[Val] Starting validation for epoch {epoch}/{epochs-1}...")
+
+        epoch_start = time.time()
+        with torch.inference_mode():
+            for inputs, targets, masks, image_sizes in validation_loader:
+                if args.channels_last is True:
+                    inputs = inputs.to(device, dtype=model_dtype, non_blocking=True, memory_format=torch.channels_last)
+                else:
+                    inputs = inputs.to(device, dtype=model_dtype, non_blocking=True)
+
+                targets = [
+                    {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in t.items()}
+                    for t in targets
+                ]
+                if masks is not None:
+                    masks = masks.to(device, non_blocking=True)
+
+                with torch.amp.autocast(device.type, enabled=args.amp, dtype=amp_dtype):
+                    detections, losses = eval_model(inputs, masks=masks, image_sizes=image_sizes)
+
+                for target in targets:
+                    # TorchMetrics requires correctly shaped tensors for empty targets
+                    if "boxes" not in target:
+                        target["boxes"] = torch.empty((0, 4), dtype=torch.float, device=device)
+                        target["labels"] = torch.empty((0,), dtype=torch.int64, device=device)
+
+                # Statistics
+                validation_metrics(detections, targets)
+
+                # Update progress bar
+                progress.update(n=batch_size * args.world_size)
+
+        time_now = time.time()
+        rate = len(validation_dataset) / (time_now - epoch_start)
+        with training_utils.single_handler_logging(logger, file_handler, enabled=not disable_tqdm) as log:
+            log.info(
+                f"[Val] Epoch {epoch}/{epochs-1} "
+                f"Elapsed: {lib.format_duration(time_now-epoch_start)}  "
+                f"R: {rate:.1f} samples/s"
+            )
+
+        progress.close()
+
+        validation_metrics_dict = validation_metrics.compute()
+
+        # Write statistics
+        if training_utils.is_global_primary(args) is True:
+            for metric in metric_list:
+                summary_writer.add_scalars(
+                    "performance", {metric: validation_metrics_dict[metric]}, epoch * epoch_samples
+                )
+
+        # Epoch validation metrics
+        for metric in metric_list:
+            logger.info(f"[Val] Epoch {epoch}/{epochs-1} {metric}: {validation_metrics_dict[metric]:.4f}")
+
+        # Learning rate scheduler update
+        if step_update is False:
+            scheduler.step()
+        if last_lr != float(max(scheduler.get_last_lr())):
+            last_lr = float(max(scheduler.get_last_lr()))
+            logger.info(f"Updated learning rate to: {last_lr}")
+
+        # Checkpoint model
+        if epoch % args.save_frequency == 0:
+            extra_states = {}
+            if args.model_ema is True:
+                extra_states["ema_state"] = {"n_averaged": model_ema.n_averaged}
+
+            training_utils.save_training_checkpoint(
+                args,
+                network_name,
+                epoch,
+                model_to_save,
+                signature,
+                class_to_idx,
+                rgb_stats,
+                optimizer,
+                scheduler,
+                scaler,
+                model_base,
+                fsdp_mode=False,
+                **extra_states,
+            )
+            if args.keep_last is not None and training_utils.is_global_primary(args) is True:
+                fs_ops.clean_checkpoints(network_name, args.keep_last)
+
+        # Epoch timing
+        toc = time.time()
+        logger.info(f"Total time: {lib.format_duration(toc - tic)}")
+        logger.info("---")
+
+    summary_writer.close()
+
+    # Checkpoint model
+    extra_states = {}
+    if args.model_ema is True:
+        extra_states["ema_state"] = {"n_averaged": model_ema.n_averaged}
+
+    training_utils.save_training_checkpoint(
+        args,
+        network_name,
+        epoch,
+        model_to_save,
+        signature,
+        class_to_idx,
+        rgb_stats,
+        optimizer,
+        scheduler,
+        scaler,
+        model_base,
+        fsdp_mode=False,
+        **extra_states,
+    )
+
+    training_utils.shutdown_distributed_mode(args)
+
+
+def get_args_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        allow_abbrev=False,
+        description="Train object detection model",
+        epilog=(
+            "Usage examples\n"
+            "==============\n"
+            "A classic Faster-RCNN with EfficientNet v2 backbone:\n"
+            "torchrun --nproc_per_node=2 -m birder.scripts.train_detection \\\n"
+            "    --network faster_rcnn  \\\n"
+            "    --backbone efficientnet_v2_s  \\\n"
+            "    --backbone-epoch 0  \\\n"
+            "    --lr 0.02  \\\n"
+            "    --lr-scheduler multistep  \\\n"
+            "    --lr-steps 16 22  \\\n"
+            "    --lr-step-gamma 0.1  \\\n"
+            "    --freeze-backbone-bn  \\\n"
+            "    --batch-size 16  \\\n"
+            "    --epochs 26  \\\n"
+            "    --wd 0.0001  \\\n"
+            "    --fast-matmul  \\\n"
+            "    --compile\n"
+            "\n"
+            "A more modern Deformable-DETR example:\n"
+            "torchrun --nproc_per_node=2 train_detection.py \\\n"
+            "    --network deformable_detr \\\n"
+            "    --backbone regnet_y_4g \\\n"
+            "    --backbone-epoch 0 \\\n"
+            "    --opt adamw \\\n"
+            "    --lr 0.0002 \\\n"
+            "    --backbone-lr 0.00002 \\\n"
+            "    --lr-scheduler cosine \\\n"
+            "    --freeze-backbone-bn \\\n"
+            "    --batch-size 8 \\\n"
+            "    --epochs 50 \\\n"
+            "    --wd 0.0001 \\\n"
+            "    --clip-grad-norm 1 \\\n"
+            "    --fast-matmul \\\n"
+            "    --compile-backbone \\\n"
+            "    --compile-opt\n"
+            "\n"
+            "YOLO v4 with custom anchors training example (COCO):\n"
+            "python train_detection.py \\\n"
+            "    --network yolo_v4 \\\n"
+            "    --model-config anchors=data/anchors.json \\\n"
+            "    --tag coco \\\n"
+            "    --backbone csp_darknet_53 \\\n"
+            "    --backbone-model-config drop_block=0.1 \\\n"
+            "    --lr 0.001 \\\n"
+            "    --lr-scheduler multistep \\\n"
+            "    --lr-steps 300 350 \\\n"
+            "    --lr-step-gamma 0.1 \\\n"
+            "    --batch-size 32 \\\n"
+            "    --warmup-epochs 5 \\\n"
+            "    --epochs 400 \\\n"
+            "    --wd 0.0005 \\\n"
+            "    --aug-level 5 \\\n"
+            "    --mosaic-prob 0.5 --mosaic-stop-epoch 360 \\\n"
+            "    --batch-multiscale \\\n"
+            "    --amp --amp-dtype float16 \\\n"
+            "    --data-path ~/Datasets/cocodataset/train2017 \\\n"
+            "    --val-path ~/Datasets/cocodataset/val2017 \\\n"
+            "    --coco-json-path ~/Datasets/cocodataset/annotations/instances_train2017.json \\\n"
+            "    --coco-val-json-path ~/Datasets/cocodataset/annotations/instances_val2017.json \\\n"
+            "    --label-mapping public_datasets_metadata/coco-80-label-mapping.json\n"
+            "\n"
+            "A WebDataset detection training example:\n"
+            "torchrun --nproc_per_node=2 -m birder.scripts.train_detection \\\n"
+            "    --network faster_rcnn \\\n"
+            "    --backbone efficientnet_v2_s \\\n"
+            "    --backbone-epoch 0 \\\n"
+            "    --batch-size 8 \\\n"
+            "    --epochs 26 \\\n"
+            "    --wds \\\n"
+            "    --wds-info data/coco_detection_wds/_info.json \\\n"
+            "    --wds-class-file data/coco_detection_wds/classes.txt \\\n"
+            "    --wds-training-split training \\\n"
+            "    --wds-val-split validation\n"
+        ),
+        formatter_class=cli.ArgumentHelpFormatter,
+    )
+    parser.add_argument("-n", "--network", type=str, help="the neural network to use")
+    parser.add_argument("-t", "--tag", type=str, help="add model tag")
+    parser.add_argument(
+        "--model-config",
+        action=cli.FlexibleDictAction,
+        help=(
+            "override the model default configuration, accepts key-value pairs or JSON "
+            "('drop_path_rate=0.2' or '{\"units\": [3, 24, 36, 3], \"dropout\": 0.2}'"
+        ),
+    )
+    parser.add_argument("--backbone", type=str, help="the neural network to used as backbone")
+    parser.add_argument("--backbone-tag", type=str, help="backbone training log tag (loading only)")
+    parser.add_argument(
+        "--backbone-model-config",
+        action=cli.FlexibleDictAction,
+        help=(
+            "override the backbone default configuration, accepts key-value pairs or JSON "
+            "('drop_path_rate=0.2' or '{\"units\": [3, 24, 36, 3], \"dropout\": 0.2}'"
+        ),
+    )
+    parser.add_argument("--backbone-epoch", type=int, help="load backbone weights from selected epoch")
+    parser.add_argument(
+        "--backbone-pretrained",
+        default=False,
+        action="store_true",
+        help="start with pretrained version of specified backbone (will download if not found locally)",
+    )
+    parser.add_argument("--reset-head", default=False, action="store_true", help="reset the classification head")
+    parser.add_argument(
+        "--binary-mode",
+        default=False,
+        action="store_true",
+        help="treat all objects as a single class (binary detection: object vs background)",
+    )
+    parser.add_argument(
+        "--binary-class-name", default="Object", type=str, help="single class name used with --binary-mode"
+    )
+    training_cli.add_freeze_args(parser, model=True, scope_name="backbone")
+    training_cli.add_optimization_args(parser, default_batch_size=16)
+    training_cli.add_lr_wd_args(parser, backbone_lr=True, backbone_layer_decay=True)
+    training_cli.add_lr_scheduler_args(parser)
+    training_cli.add_training_schedule_args(parser)
+    training_cli.add_ema_args(parser, default_ema_steps=1, default_ema_decay=0.9998)
+    training_cli.add_batch_norm_args(parser, backbone_freeze=True)
+    training_cli.add_detection_input_args(parser)
+    training_cli.add_detection_data_aug_args(parser)
+    training_cli.add_dataloader_args(
+        parser,
+        no_img_loader=True,
+        default_num_workers=min(8, max(os.cpu_count() // 8, 2)),  # type: ignore[operator]
+        ra_sampler=True,
+    )
+    training_cli.add_precision_args(parser, channels_last=True)
+    training_cli.add_compile_args(parser, backbone=True)
+    training_cli.add_checkpoint_args(parser, pretrained=True, load_ema=True)
+    training_cli.add_distributed_args(parser)
+    training_cli.add_logging_and_debug_args(parser, default_log_interval=20, fake_data=False)
+    training_cli.add_detection_training_data_args(parser, wds_extra_shuffle=False)
+
+    return parser
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    args.data_path = str(args.data_path)
+    args.val_path = str(args.val_path)
+    args.size = cli.parse_size(args.size)
+
+    # This will capture the common argument mistakes
+    training_cli.common_args_validation(args)
+
+    # Script specific checks
+    if args.backbone is None:
+        raise cli.ValidationError("--backbone is required")
+    if registry.exists(args.network, task=Task.OBJECT_DETECTION) is False:
+        raise cli.ValidationError(f"--network {args.network} not supported, see list-models tool for available options")
+    if registry.exists(args.backbone, net_type=DetectorBackbone) is False:
+        raise cli.ValidationError(
+            f"--backbone {args.backbone} not supported, see list-models tool for available options"
+        )
+
+    active_model_freeze: Optional[str] = None
+    if args.freeze_body is True:
+        active_model_freeze = "--freeze-body"
+
+    active_backbone_freeze: Optional[str] = None
+    if args.freeze_backbone is True:
+        active_backbone_freeze = "--freeze-backbone"
+    elif args.freeze_backbone_stages is not None:
+        active_backbone_freeze = "--freeze-backbone-stages"
+    elif args.freeze_backbone_layers is not None:
+        active_backbone_freeze = "--freeze-backbone-layers"
+
+    if active_model_freeze is not None and active_backbone_freeze is not None:
+        raise cli.ValidationError(f"{active_model_freeze} cannot be used with {active_backbone_freeze}")
+
+    if args.multiscale is True and args.aug_type != "birder":
+        raise cli.ValidationError(f"--multiscale only supported with --aug-type birder, got {args.aug_type}")
+    if args.batch_multiscale is True:
+        if args.dynamic_size is True or args.multiscale is True or args.max_size is not None:
+            raise cli.ValidationError(
+                "--batch-multiscale cannot be used with --dynamic-size, --multiscale or --max-size"
+            )
+        if args.aug_type in {"multiscale", "detr"}:
+            raise cli.ValidationError(
+                f"--batch-multiscale not supported with --aug-type {args.aug_type}, "
+                "use a fixed-size aug type (e.g. birder, ssd, ssdlite, yolo)"
+            )
+    if args.mosaic_stop_epoch is not None:
+        if args.mosaic_stop_epoch <= 0:
+            raise cli.ValidationError("--mosaic-stop-epoch must be positive")
+        if args.mosaic_stop_epoch > args.epochs:
+            raise cli.ValidationError(
+                f"--mosaic-stop-epoch must be <= --epochs ({args.epochs}), got {args.mosaic_stop_epoch}"
+            )
+        if args.persistent_workers is True:
+            raise cli.ValidationError("--mosaic-stop-epoch cannot be used with --persistent-workers")
+    if args.wds is True:
+        if args.mosaic_stop_epoch is not None:
+            raise cli.ValidationError("--mosaic-stop-epoch is not supported with --wds")
+        if args.class_file is not None:
+            raise cli.ValidationError("--class-file cannot be used with --wds, use --wds-class-file")
+        if args.ignore_file is not None:
+            raise cli.ValidationError("--ignore-file is not supported with --wds")
+        if args.drop_empty is True:
+            raise cli.ValidationError("--drop-empty is not supported with --wds")
+    if args.backbone_pretrained is True and args.backbone_epoch is not None:
+        raise cli.ValidationError("--backbone-pretrained cannot be used with --backbone-epoch")
+    if args.label_mapping is not None and args.binary_mode is True:
+        raise cli.ValidationError("--label-mapping cannot be used with --binary-mode")
+    if args.label_mapping is not None and args.class_file is not None:
+        raise cli.ValidationError("--label-mapping cannot be used with --class-file")
+    if args.label_mapping is not None and args.label_mapping.strip() == "":
+        raise cli.ValidationError("--label-mapping cannot be empty")
+
+    if args.model_dtype != "float32":  # NOTE: only float32 supported at this time
+        raise cli.ValidationError(f"Only float32 supported for --model-dtype at this time, got {args.model_dtype}")
+    if args.binary_class_name.strip() == "":
+        raise cli.ValidationError("--binary-class-name cannot be empty")
+
+
+def args_from_dict(**kwargs: Any) -> argparse.Namespace:
+    parser = get_args_parser()
+    parser.set_defaults(**kwargs)
+    args = parser.parse_args([])
+    validate_args(args)
+
+    return args
+
+
+def main() -> None:
+    parser = get_args_parser()
+    args = parser.parse_args()
+    validate_args(args)
+
+    if args.wds_cache_dir is not None and Path(args.wds_cache_dir).exists() is False:
+        logger.info(f"Creating {args.wds_cache_dir} directory...")
+        Path(args.wds_cache_dir).mkdir(parents=True, exist_ok=True)
+
+    if settings.MODELS_DIR.exists() is False:
+        logger.info(f"Creating {settings.MODELS_DIR} directory...")
+        settings.MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+    train(args)
+
+
+if __name__ == "__main__":
+    logger = logging.getLogger(getattr(__spec__, "name", __name__))
+    main()

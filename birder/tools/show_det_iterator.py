@@ -1,0 +1,512 @@
+import argparse
+import json
+import random
+from pathlib import Path
+from typing import Any
+from typing import Optional
+from typing import get_args
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torchvision.transforms.v2.functional as F
+from torch.utils.data import DataLoader
+from torchvision import tv_tensors
+from torchvision.utils import draw_bounding_boxes
+
+from birder.common import cli
+from birder.common import fs_ops
+from birder.common import lib
+from birder.conf import settings
+from birder.data.collators.detection import BatchRandomResizeCollator
+from birder.data.collators.detection import collate_fn
+from birder.data.dataloader.webdataset import make_wds_loader
+from birder.data.datasets.coco import CocoInference
+from birder.data.datasets.coco import CocoMosaicTraining
+from birder.data.datasets.coco import CocoTraining
+from birder.data.datasets.coco import MosaicType
+from birder.data.datasets.coco import build_label_mapping_indices
+from birder.data.datasets.directory import ImageLoaderName
+from birder.data.datasets.directory import get_image_loader
+from birder.data.datasets.webdataset import make_wds_detection_dataset
+from birder.data.datasets.webdataset import make_wds_mosaic_detection_dataset
+from birder.data.datasets.webdataset import prepare_wds_args
+from birder.data.datasets.webdataset import wds_args_from_info
+from birder.data.transforms.classification import get_rgb_stats
+from birder.data.transforms.classification import reverse_preset
+from birder.data.transforms.detection import MULTISCALE_STEP
+from birder.data.transforms.detection import AugType
+from birder.data.transforms.detection import InferenceTransform
+from birder.data.transforms.detection import resolve_multiscale_sizes
+from birder.data.transforms.detection import training_preset
+
+
+def show_det_iterator(args: argparse.Namespace) -> None:
+    reverse_transform = reverse_preset(get_rgb_stats("birder"))
+    root_path = Path(args.data_path)
+    per_image_multiscale = args.multiscale is True or args.aug_type in {"multiscale", "detr"}
+    transform_dynamic_size = per_image_multiscale is True or args.dynamic_size is True or args.max_size is not None
+    train_transform_size = args.size
+    if args.mode == "training" and args.batch_multiscale is True:
+        batch_multiscale_base_size = max(args.size)
+        batch_multiscale_sizes = resolve_multiscale_sizes(
+            (batch_multiscale_base_size, batch_multiscale_base_size),
+            args.multiscale_min_size,
+            args.multiscale_max_size,
+            multiscale_step=args.multiscale_step,
+        )
+        train_transform_size = (batch_multiscale_sizes[-1], batch_multiscale_sizes[-1])
+
+    label_mapping: Optional[dict[str, str]] = None
+    if args.label_mapping is not None:
+        with open(args.label_mapping, "r", encoding="utf-8") as handle:
+            label_mapping = json.load(handle)
+
+    if args.mode == "training":
+        offset = 0
+        transform = training_preset(
+            train_transform_size,
+            args.aug_type,
+            args.aug_level,
+            get_rgb_stats("birder"),
+            dynamic_size=args.dynamic_size,
+            multiscale=args.multiscale,
+            max_size=args.max_size,
+            multiscale_min_size=args.multiscale_min_size,
+            multiscale_max_size=args.multiscale_max_size,
+            multiscale_step=args.multiscale_step,
+        )
+    elif args.mode == "inference":
+        offset = 1
+        transform = InferenceTransform(args.size, get_rgb_stats("birder"), args.dynamic_size, args.max_size)
+    else:
+        raise ValueError(f"Unknown mode={args.mode}")
+
+    if args.wds is True:
+        offset = 0
+        wds_path: str | list[str]
+        if args.wds_info is not None:
+            wds_path, dataset_size = wds_args_from_info(args.wds_info, args.wds_split)
+            if args.wds_size is not None:
+                dataset_size = args.wds_size
+        else:
+            wds_path, dataset_size = prepare_wds_args(
+                args.data_path, args.wds_size, torch.device("cpu"), select_suffix="json"
+            )
+
+        if args.wds_class_file is None:
+            args.wds_class_file = Path(args.data_path).joinpath(settings.CLASS_LIST_NAME)
+
+        class_to_idx = lib.detection_class_to_idx(fs_ops.read_class_file(args.wds_class_file))
+        label_remap: Optional[dict[int, int]] = None
+        if label_mapping is not None:
+            class_to_idx, label_remap = build_label_mapping_indices(class_to_idx, label_mapping)
+
+        if args.mode == "training" and args.mosaic_prob > 0.0:
+            mosaic_transforms = training_preset(
+                train_transform_size,
+                args.aug_type,
+                args.aug_level,
+                get_rgb_stats("birder"),
+                dynamic_size=args.dynamic_size,
+                multiscale=args.multiscale,
+                max_size=args.max_size,
+                multiscale_min_size=args.multiscale_min_size,
+                multiscale_max_size=args.multiscale_max_size,
+                multiscale_step=args.multiscale_step,
+                post_mosaic=True,
+            )
+            if transform_dynamic_size is True:
+                if args.max_size is not None:
+                    mosaic_dim = args.max_size
+                else:
+                    mosaic_dim = min(train_transform_size) * 2
+            else:
+                mosaic_dim = max(train_transform_size) * 2
+
+            dataset = make_wds_mosaic_detection_dataset(
+                wds_path,
+                dataset_size=dataset_size,
+                transform=transform,
+                mosaic_transforms=mosaic_transforms,
+                mosaic_prob=args.mosaic_prob,
+                mosaic_type=args.mosaic_type,
+                output_size=(mosaic_dim, mosaic_dim),
+                fill_value=114,
+                label_remap=label_remap,
+            )
+        else:
+            dataset = make_wds_detection_dataset(
+                wds_path, dataset_size=dataset_size, shuffle=True, transform=transform, label_remap=label_remap
+            )
+
+    else:
+        if args.mode == "training":
+            mosaic_transforms = training_preset(
+                train_transform_size,
+                args.aug_type,
+                args.aug_level,
+                get_rgb_stats("birder"),
+                dynamic_size=args.dynamic_size,
+                multiscale=args.multiscale,
+                max_size=args.max_size,
+                multiscale_min_size=args.multiscale_min_size,
+                multiscale_max_size=args.multiscale_max_size,
+                multiscale_step=args.multiscale_step,
+                post_mosaic=True,
+            )
+            if args.mosaic_prob > 0.0:
+                if transform_dynamic_size is True:
+                    # Dynamic/Multiscale: args.size is the short-side target
+                    if args.max_size is not None:
+                        mosaic_dim = args.max_size
+                    else:
+                        mosaic_dim = min(train_transform_size) * 2
+
+                else:
+                    # Fixed size
+                    mosaic_dim = max(train_transform_size) * 2
+
+                dataset = CocoMosaicTraining(
+                    args.data_path,
+                    args.coco_json_path,
+                    transforms=transform,
+                    mosaic_transforms=mosaic_transforms,
+                    output_size=(mosaic_dim, mosaic_dim),
+                    fill_value=114,
+                    mosaic_prob=args.mosaic_prob,
+                    mosaic_type=args.mosaic_type,
+                    normalize_empty_targets=True,
+                )
+            else:
+                dataset = CocoTraining(
+                    args.data_path, args.coco_json_path, transforms=transform, normalize_empty_targets=True
+                )
+        else:
+            dataset = CocoInference(args.data_path, args.coco_json_path, transforms=transform)
+
+        if label_mapping is not None:
+            class_to_idx = dataset.convert_annotations_with_label_mapping(label_mapping)
+        elif args.class_file is not None:
+            target_class_to_idx = lib.detection_class_to_idx(fs_ops.read_class_file(args.class_file))
+            class_to_idx = dataset.normalize_annotations(
+                target_class_to_idx=target_class_to_idx,
+                use_class_file_ids=True,
+            )
+        else:
+            class_to_idx = dataset.normalize_annotations()
+
+    class_list = ["Background", *lib.class_list_from_class_to_idx(class_to_idx)]
+    color_list = np.arange(0, len(class_list))
+
+    batch_size = 2
+    no_iterations = 6
+    if args.batch is False:
+        samples = random.sample(dataset.dataset.ids, no_iterations)
+        cols = 2
+        rows = 2
+        for coco_id in samples:
+            img_path = dataset.dataset.coco.loadImgs(coco_id)[0]["file_name"]
+            img = F.to_image(get_image_loader(args.img_loader, args.channels)(str(root_path.joinpath(img_path))))
+            targets = dataset.dataset.coco.loadAnns(dataset.dataset.coco.getAnnIds(coco_id))
+
+            if len(targets) > 0:
+                # Roughly what the "wrap_dataset_for_transforms_v2" does
+                canvas_size = tuple(F.get_size(img))
+                boxes = F.convert_bounding_box_format(
+                    tv_tensors.BoundingBoxes(
+                        [target["bbox"] for target in targets],
+                        format=tv_tensors.BoundingBoxFormat.XYWH,
+                        canvas_size=canvas_size,
+                    ),
+                    new_format=tv_tensors.BoundingBoxFormat.XYXY,
+                )
+
+                label_ids = [target["category_id"] for target in targets]
+                labels = [class_list[label_id] for label_id in label_ids]
+                colors = [color_list[label_id].item() for label_id in label_ids]
+
+                img = draw_bounding_boxes(img, boxes, labels=labels, colors=colors)
+
+            transformed_img = F.to_pil_image(img)
+
+            fig = plt.figure(constrained_layout=True)
+            fig.suptitle(img_path)
+            grid_spec = fig.add_gridspec(ncols=cols, nrows=rows)
+
+            # Show original
+            ax = fig.add_subplot(grid_spec[0, 0:cols])
+            ax.imshow(transformed_img)
+            ax.set_title(f"Original, aug type: {args.aug_type}")
+
+            # Show transformed
+            counter = 0
+            for i in range(cols):
+                for j in range(1, rows):
+                    idx = dataset.dataset.ids.index(coco_id)
+                    data = dataset[idx]
+                    img = data[offset]
+                    targets = data[offset + 1]
+                    label_ids = targets["labels"]
+                    labels = [class_list[label_id] for label_id in label_ids]
+                    colors = [color_list[label_id].item() for label_id in label_ids]
+
+                    annotated_img = draw_bounding_boxes(
+                        reverse_transform(img), targets["boxes"], labels=labels, colors=colors
+                    )
+                    transformed_img = F.to_pil_image(annotated_img)
+
+                    ax = fig.add_subplot(grid_spec[j, i])
+                    ax.imshow(np.asarray(transformed_img))
+                    ax.set_title(f"#{counter}")
+                    counter += 1
+
+            plt.show()
+
+    else:
+        if args.batch_multiscale is True:
+            data_collate_fn: Any = BatchRandomResizeCollator(
+                offset,
+                args.size,
+                size_divisible=args.multiscale_step,
+                multiscale_min_size=args.multiscale_min_size,
+                multiscale_max_size=args.multiscale_max_size,
+                multiscale_step=args.multiscale_step,
+            )
+        else:
+            data_collate_fn = collate_fn
+
+        if args.wds is True:
+            data_loader = make_wds_loader(
+                dataset,
+                batch_size,
+                num_workers=1,
+                prefetch_factor=1,
+                collate_fn=data_collate_fn,
+                world_size=1,
+                pin_memory=False,
+                shuffle=args.wds_extra_shuffle,
+            )
+        else:
+            data_loader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                collate_fn=data_collate_fn,
+            )
+
+        cols = 2
+        rows = 1
+        for k, data in enumerate(data_loader):
+            if k >= no_iterations:
+                break
+
+            inputs = data[offset]
+            targets = data[offset + 1]
+            if offset > 0:
+                sample_paths = data[offset - 1]
+            else:
+                sample_paths = list(range(cols * rows))
+
+            fig = plt.figure(constrained_layout=True)
+            grid_spec = fig.add_gridspec(ncols=cols, nrows=rows)
+
+            # Show transformed
+            counter = 0
+            for i in range(cols):
+                for j in range(rows):
+                    img = inputs[i + cols * j]
+                    img = reverse_transform(img)
+                    boxes = targets[i + cols * j]["boxes"]
+                    label_ids = targets[i + cols * j]["labels"]
+                    labels = [class_list[label_id] for label_id in label_ids]
+                    colors = [color_list[label_id].item() for label_id in label_ids]
+
+                    annotated_img = draw_bounding_boxes(img, boxes, labels=labels, colors=colors)
+                    transformed_img = F.to_pil_image(annotated_img)
+                    ax = fig.add_subplot(grid_spec[j, i])
+                    ax.imshow(np.asarray(transformed_img))
+                    ax.set_title(f"#{counter}: {sample_paths[i+cols*j]}")
+                    counter += 1
+
+            plt.show()
+
+
+def set_parser(subparsers: Any) -> None:
+    subparser = subparsers.add_parser(
+        "show-det-iterator",
+        allow_abbrev=False,
+        help="show training / inference detection iterator output vs input",
+        description="show training / inference detection iterator output vs input",
+        epilog=(
+            "Usage examples:\n"
+            "python -m birder.tools show-det-iterator --aug-level 0\n"
+            "python -m birder.tools show-det-iterator --mode training --size 512 --aug-level 2\n"
+            "python -m birder.tools show-det-iterator --mode inference --size 640\n"
+            "python -m birder.tools show-det-iterator --mode inference --coco-json-path "
+            "~/Datasets/Objects365-2020/val/zhiyuan_objv2_val.json --data-path ~/Datasets/Objects365-2020/val\n"
+            "python -m birder.tools show-det-iterator --aug-type ssd --dynamic-size --coco-json-path "
+            "~/Datasets/cocodataset/annotations/instances_val2017.json --data-path "
+            "~/Datasets/cocodataset/val2017 --class-file public_datasets_metadata/coco-classes.txt\n"
+            "python -m birder.tools show-det-iterator --mode training --aug-level 4 --multiscale "
+            "--coco-json-path ~/Datasets/cocodataset/annotations/instances_val2017.json "
+            "--data-path ~/Datasets/cocodataset/val2017 --class-file public_datasets_metadata/coco-classes.txt\n"
+            "python -m birder.tools show-det-iterator --mode inference --size 640 --aug-level 5 --batch "
+            "--wds --wds-info ~/Datasets/cocodataset/val2017_packed/_info.json "
+            "--wds-split validation --wds-class-file ~/Datasets/cocodataset/val2017_packed/classes.txt\n"
+        ),
+        formatter_class=cli.ArgumentHelpFormatter,
+    )
+    subparser.add_argument(
+        "--mode", type=str, choices=["training", "inference"], default="training", help="iterator mode"
+    )
+    subparser.add_argument(
+        "--batch", default=False, action="store_true", help="show a batch instead of a single sample"
+    )
+    subparser.add_argument(
+        "--size",
+        type=int,
+        nargs="+",
+        default=[512],
+        metavar=("H", "W"),
+        help=(
+            "target image size as [height, width], if --dynamic-size is enabled, "
+            "uses the smaller dimension as target size while preserving aspect ratio (defaults to model's signature)"
+        ),
+    )
+    subparser.add_argument(
+        "--max-size",
+        type=int,
+        help="maximum size for the longer edge of resized images, when specified, enables dynamic sizing",
+    )
+    subparser.add_argument(
+        "--dynamic-size",
+        default=False,
+        action="store_true",
+        help="allow variable image sizes while preserving aspect ratios",
+    )
+    subparser.add_argument(
+        "--multiscale",
+        default=False,
+        action="store_true",
+        help="enable target-relative random short-edge scaling per image",
+    )
+    subparser.add_argument(
+        "--batch-multiscale",
+        default=False,
+        action="store_true",
+        help="enable target-relative random square resizing once per batch, centered on max(--size) (batch mode only)",
+    )
+    subparser.add_argument(
+        "--multiscale-step",
+        type=int,
+        default=MULTISCALE_STEP,
+        help="step size for multiscale size lists and collator padding divisibility (size_divisible)",
+    )
+    subparser.add_argument(
+        "--multiscale-min-size",
+        type=int,
+        help=(
+            "minimum short-edge size for multiscale lists, when omitted, derived from --size by the selected "
+            "multiscale policy (rounded up to the nearest multiple of --multiscale-step)"
+        ),
+    )
+    subparser.add_argument(
+        "--multiscale-max-size",
+        type=int,
+        help=(
+            "maximum short-edge size for multiscale lists, when omitted, derived from --size by the selected "
+            "multiscale policy (rounded down to the nearest multiple of --multiscale-step)"
+        ),
+    )
+    subparser.add_argument(
+        "--aug-type",
+        type=str,
+        choices=list(get_args(AugType)),
+        default="birder",
+        help="augmentation type",
+    )
+    subparser.add_argument(
+        "--aug-level",
+        type=int,
+        choices=list(range(10 + 1)),
+        default=4,
+        help="magnitude of birder augmentations (0 off -> 10 highest)",
+    )
+    subparser.add_argument(
+        "--data-path",
+        type=str,
+        default=str(settings.DETECTION_DATA_PATH),
+        help="image directory path",
+    )
+    subparser.add_argument(
+        "--img-loader",
+        type=str,
+        choices=get_args(ImageLoaderName),
+        default="tv",
+        help="backend to load and decode original images",
+    )
+    subparser.add_argument(
+        "--channels",
+        type=int,
+        default=settings.DEFAULT_NUM_CHANNELS,
+        metavar="N",
+        help="no. of image channels for original image loading",
+    )
+    subparser.add_argument(
+        "--coco-json-path",
+        type=str,
+        default=f"{settings.TRAINING_DETECTION_ANNOTATIONS_PATH}_coco.json",
+        help="training COCO json path",
+    )
+    subparser.add_argument("--class-file", type=str, metavar="FILE", help="class list file, overrides json categories")
+    subparser.add_argument(
+        "--label-mapping", type=str, metavar="FILE", help="JSON mapping of source labels to target labels"
+    )
+    subparser.add_argument("--mosaic-prob", type=float, default=0.0, help="mosaic augmentation probability")
+    subparser.add_argument(
+        "--mosaic-type", type=str, choices=get_args(MosaicType), default="fixed_grid", help="mosaic augmentation type"
+    )
+    subparser.add_argument("--wds", default=False, action="store_true", help="use webdataset")
+    subparser.add_argument(
+        "--wds-info", type=str, action="append", metavar="FILE", help="one or more wds info file paths"
+    )
+    subparser.add_argument("--wds-class-file", type=str, metavar="FILE", help="class list file")
+    subparser.add_argument("--wds-size", type=int, metavar="N", help="size of the wds directory")
+    subparser.add_argument(
+        "--wds-split", type=str, default="training", metavar="NAME", help="wds dataset split to load"
+    )
+    subparser.add_argument(
+        "--wds-extra-shuffle",
+        default=False,
+        action="store_true",
+        help="enable cross-worker batch shuffling after batching",
+    )
+    subparser.set_defaults(func=main)
+
+
+def main(args: argparse.Namespace) -> None:
+    args.size = cli.parse_size(args.size)
+
+    if args.wds is True and args.batch is False:
+        raise cli.ValidationError("--wds requires --batch to be set")
+    if args.label_mapping is not None and args.class_file is not None:
+        raise cli.ValidationError("--label-mapping cannot be used with --class-file")
+    if args.label_mapping is not None and args.label_mapping.strip() == "":
+        raise cli.ValidationError("--label-mapping cannot be empty")
+    if args.multiscale is True and args.aug_type != "birder":
+        raise cli.ValidationError(f"--multiscale only supported with --aug-type birder, got {args.aug_type}")
+    if args.batch_multiscale is True:
+        if args.batch is False:
+            raise cli.ValidationError("--batch-multiscale requires --batch")
+        if args.dynamic_size is True or args.multiscale is True or args.max_size is not None:
+            raise cli.ValidationError(
+                "--batch-multiscale cannot be used with --dynamic-size, --multiscale or --max-size"
+            )
+        if args.aug_type in {"multiscale", "detr"}:
+            raise cli.ValidationError(
+                f"--batch-multiscale not supported with --aug-type {args.aug_type}, "
+                "use a fixed-size aug type (e.g. birder, ssd, ssdlite, yolo)"
+            )
+
+    show_det_iterator(args)
